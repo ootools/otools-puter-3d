@@ -1,0 +1,41 @@
+MIT License
+
+本仓库包含两部分，分别归属不同的版权人：
+
+1. 移植层（`shell/`、`scripts/`、`plugin.json`、`logo.svg`、以及本仓库的文档）
+   Copyright (c) 2026 otools-video contributors
+
+2. 上游快照（`upstream/`，来自 https://github.com/HeyPuter/everything 的 src/video-studio）
+   Copyright (c) 2026 Puter Technologies Inc.
+   原样保留，未作修改；上游的 README 与许可声明一并保留在 upstream/ 内。
+
+两部分的许可条款相同，均为 MIT：
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+第三方组件（由上游带入，各自保留其许可）：
+
+- Lucide 图标 — ISC
+- Mediabunny（解码 / 编码）— MPL-2.0
+- MediaPipe 模型与运行时（人体分割 / 人脸关键点 / 姿态关键点 / 头发分割）— Apache-2.0
+- 字体（@fontsource 打包的 13 款）— SIL OFL 或 Apache-2.0
+
+上游的 `upstream/tools/check-licenses.mjs`（`npm run check:licenses`）可以复核依赖许可。

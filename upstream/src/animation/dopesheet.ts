@@ -1,0 +1,452 @@
+// Dope Sheet editor (modes: Dope Sheet, Action Editor, Shape Key Editor).
+import { h, type Child } from '../ui/h';
+import { icon } from '../ui/icons';
+import { app } from '../app/app';
+import { registerEditor, type Area } from '../ui/screen';
+import { openMenu, type MenuItem } from '../ui/menu';
+import { numberField } from '../ui/widgets';
+import type { ShapeKey } from '../data/types';
+import { AnimEditor, RULER_H, menuButton, hdrToggle, markerMenu } from './animeditor';
+import type { Channel, SpaceKind } from './channels';
+import { C, drawKey, shapeFor } from './theme';
+import { aggregate } from './aggregate';
+import { setKeySelected, selectAll, selectColumns, keyBounds } from './keyedit';
+import { startKeyTransform, type KeyTransformHost, type KeyTransformMode } from './transformkeys';
+import { playbackFooter } from './footer';
+import { actionSelector } from './actionui';
+import { viewMenuCommon, selectMenu, channelMenu, keyMenu } from './menus';
+
+export type DopeSheetMode = 'DOPESHEET' | 'ACTION' | 'SHAPEKEY';
+
+const MODES: {
+  value: DopeSheetMode;
+  label: string;
+  icon: string;
+  description: string;
+}[] = [
+  {
+    value: 'DOPESHEET',
+    label: 'Dope Sheet',
+    icon: 'action',
+    description: 'Edit all keyframes in scene',
+  },
+  {
+    value: 'ACTION',
+    label: 'Action Editor',
+    icon: 'action',
+    description: 'Edit keyframes in active object’s Object-level action',
+  },
+  {
+    value: 'SHAPEKEY',
+    label: 'Shape Key Editor',
+    icon: 'shapekey_data',
+    description: 'Edit keyframes in active object’s Shape Keys action',
+  },
+];
+
+/** Mode list of the header dropdown (modules may append modes, e.g. Grease Pencil). */
+export const DOPESHEET_MODES = MODES as { value: string; label: string; icon: string; description: string }[];
+
+export class DopeSheet extends AnimEditor {
+  keymaps = ['Animation Channels', 'Dopesheet', 'Animation'];
+  prefix = 'action' as const;
+  mode: DopeSheetMode = 'DOPESHEET';
+  showHandlesInterp = true;
+  showSummary = true;
+
+  constructor(area: Area, state?: unknown) {
+    super(area, state);
+    const s = (state ?? {}) as Record<string, unknown>;
+    if (s.mode === 'ACTION' || s.mode === 'SHAPEKEY' || s.mode === 'DOPESHEET') this.mode = s.mode;
+    if (typeof s.showHandlesInterp === 'boolean') this.showHandlesInterp = s.showHandlesInterp;
+  }
+
+  protected serializeExtra() {
+    return { mode: this.mode, showHandlesInterp: this.showHandlesInterp };
+  }
+
+  space(): SpaceKind {
+    return this.mode;
+  }
+
+  setMode(m: DopeSheetMode) {
+    this.mode = m;
+    this.scrollY = 0;
+    app.changed('ui');
+    this.refresh();
+  }
+
+  header(): Child {
+    const cur = MODES.find((m) => m.value === this.mode)!;
+    const ob = app.activeObject;
+    return h(
+      'div',
+      { class: 'hdr-row' },
+      h(
+        'button',
+        {
+          key: 'mode',
+          class: 'hdr-mode',
+          'data-tip': 'Mode\nEditing context being displayed',
+          onpointerdown: (e: PointerEvent) => {
+            e.preventDefault();
+            openMenu(
+              MODES.map((m) => ({
+                label: m.label,
+                icon: m.icon,
+                active: m.value === this.mode,
+                description: m.description,
+                action: () => this.setMode(m.value),
+              })),
+              e.currentTarget as HTMLElement,
+            );
+          },
+        },
+        icon(cur.icon),
+        cur.label,
+        icon('down_arrow_hlt', 'tiny'),
+      ),
+      menuButton('View', () => this.viewMenu()),
+      menuButton('Select', () => selectMenu('action')),
+      menuButton('Marker', markerMenu),
+      menuButton('Channel', () => channelMenu('action')),
+      menuButton('Key', () => keyMenu('action')),
+      this.mode === 'ACTION' && ob ? actionSelector(ob) : null,
+      h('div', { class: 'hdr-spacer' }),
+      this.mode === 'DOPESHEET'
+        ? hdrToggle(
+            'only-sel',
+            'restrict_select_off',
+            this.onlySelected,
+            'Only Show Selected\nOnly include channels relating to selected objects and data',
+            () => ((this.onlySelected = !this.onlySelected), this.refresh(), app.changed('ui')),
+          )
+        : null,
+      this.mode === 'DOPESHEET'
+        ? hdrToggle(
+            'show-hidden',
+            'hide_off',
+            this.showHidden,
+            'Show Hidden\nInclude channels from objects/bone that are not visible',
+            () => ((this.showHidden = !this.showHidden), this.refresh(), app.changed('ui')),
+          )
+        : null,
+      hdrToggle(
+        'snap',
+        this.autoSnap ? 'snap_on' : 'snap_off',
+        this.autoSnap,
+        'Snap\nSnap keyframes to whole frames while transforming (Ctrl toggles)',
+        () => ((this.autoSnap = !this.autoSnap), app.changed('ui')),
+      ),
+    );
+  }
+
+  viewMenu(): MenuItem[] {
+    return [
+      {
+        label: 'Show Handles and Interpolation',
+        checked: this.showHandlesInterp,
+        action: () => ((this.showHandlesInterp = !this.showHandlesInterp), this.draw()),
+      },
+      {
+        label: 'Show Markers',
+        checked: this.showMarkers,
+        action: () => ((this.showMarkers = !this.showMarkers), this.refresh()),
+      },
+      ...viewMenuCommon('action', this),
+    ];
+  }
+
+  protected footer(): Child | null {
+    return playbackFooter();
+  }
+
+  // ---------------------------------------------------------------- channels
+
+  protected rowExtra(ch: Channel): Child {
+    if (ch.kind !== 'SHAPEKEY' || !ch.shapeKey) return null;
+    const sk: ShapeKey = ch.shapeKey;
+    return h(
+      'span',
+      { class: 'anim-ch-slider' },
+      numberField({
+        id: `sk-${ch.key}`,
+        value: sk.value,
+        min: sk.slider_min,
+        max: sk.slider_max,
+        slider: true,
+        precision: 3,
+        set: (v, final) => {
+          sk.value = v;
+          app.changed('doc');
+          if (final) app.pushUndo('Shape Key Value');
+        },
+      }),
+    );
+  }
+
+  protected rowToggles(ch: Channel): Child {
+    return this.muteLockToggles(ch);
+  }
+
+  channelContextMenu(): MenuItem[] {
+    return channelMenu('action');
+  }
+
+  protected mainContextMenu(): MenuItem[] {
+    return [
+      { heading: 'Dope Sheet' },
+      { label: 'Copy', op: 'action.copy', shortcut: 'Ctrl C' },
+      { label: 'Paste', op: 'action.paste', shortcut: 'Ctrl V' },
+      {
+        label: 'Paste Flipped',
+        op: 'action.paste',
+        props: { flipped: true },
+        shortcut: 'Shift Ctrl V',
+      },
+      { separator: true },
+      {
+        label: 'Keyframe Type',
+        submenu: () => keyMenu('action').find((i) => i.label === 'Keyframe Type')!.submenu!(),
+      },
+      {
+        label: 'Handle Type',
+        submenu: () => keyMenu('action').find((i) => i.label === 'Handle Type')!.submenu!(),
+      },
+      {
+        label: 'Interpolation Mode',
+        submenu: () => keyMenu('action').find((i) => i.label === 'Interpolation Mode')!.submenu!(),
+      },
+      {
+        label: 'Easing Mode',
+        submenu: () => keyMenu('action').find((i) => i.label === 'Easing Mode')!.submenu!(),
+      },
+      { separator: true },
+      {
+        label: 'Insert Keyframes',
+        op: 'action.keyframe_insert',
+        shortcut: 'I',
+      },
+      { label: 'Duplicate', op: 'action.duplicate_move', shortcut: 'Shift D' },
+      { label: 'Delete Keyframes', op: 'action.delete', shortcut: 'X' },
+      { separator: true },
+      {
+        label: 'Mirror',
+        submenu: () => keyMenu('action').find((i) => i.label === 'Mirror')!.submenu!(),
+      },
+      {
+        label: 'Snap',
+        submenu: () => keyMenu('action').find((i) => i.label === 'Snap')!.submenu!(),
+      },
+    ];
+  }
+
+  // ---------------------------------------------------------------- drawing
+
+  protected drawContent(g: CanvasRenderingContext2D, W: number, H: number) {
+    const v = this.view;
+    const rows = this.list.rows;
+    const rh = this.rowH;
+    const size = Math.round(rh * 0.62);
+    for (let i = 0; i < rows.length; i++) {
+      const y = this.rowTop(i);
+      if (y > H || y + rh < RULER_H) continue;
+      const ch = rows[i];
+      g.fillStyle = rowColor(ch);
+      g.fillRect(0, y, W, rh - 1);
+      if (!ch.curves.length) continue;
+      const agg = aggregate(ch.curves.map((r) => r.fc));
+      const yc = y + rh / 2;
+      const muted = ch.curves.every((r) => r.fc.mute);
+      // holds
+      for (const s of agg.holds) {
+        const x0 = v.fx(s.a),
+          x1 = v.fx(s.b);
+        if (x1 < 0 || x0 > W) continue;
+        g.fillStyle = s.selected ? C.longKeySelected : C.longKey;
+        g.fillRect(x0, yc - rh * 0.17, x1 - x0, rh * 0.34);
+      }
+      if (this.showHandlesInterp)
+        for (const s of agg.interps) {
+          const x0 = v.fx(s.a),
+            x1 = v.fx(s.b);
+          if (x1 < 0 || x0 > W) continue;
+          g.fillStyle = s.interp === 'LINEAR' ? C.interpLinear : s.interp === 'CONSTANT' ? C.interpConstant : C.interpOther;
+          g.globalAlpha = 0.6;
+          g.fillRect(x0, yc - 1.5, x1 - x0, 3);
+          g.globalAlpha = 1;
+        }
+      for (const k of agg.keys) {
+        const x = v.fx(k.frame);
+        if (x < -10 || x > W + 10) continue;
+        const shape = this.showHandlesInterp ? shapeFor(k.handle, k.interp) : 'DIAMOND';
+        drawKey(g, Math.round(x) + 0.5, Math.round(yc) + 0.5, size, k.type, k.selected, shape, muted ? 0.5 : 1);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- picking
+
+  keyAt(x: number, y: number): { ch: Channel; frame: number } | null {
+    const i = this.rowAt(y);
+    const ch = this.list.rows[i];
+    if (!ch || !ch.curves.length) return null;
+    let best: number | null = null,
+      bd = 8;
+    for (const r of ch.curves)
+      for (const k of r.fc.keyframe_points) {
+        const d = Math.abs(this.view.fx(k.co[0]) - x);
+        if (d < bd) {
+          bd = d;
+          best = k.co[0];
+        }
+      }
+    return best === null ? null : { ch, frame: best };
+  }
+
+  private keysAt(ch: Channel, frame: number) {
+    const out = [];
+    for (const r of ch.curves) for (const k of r.fc.keyframe_points) if (Math.abs(k.co[0] - frame) < 1e-3) out.push(k);
+    return out;
+  }
+
+  keyHost(): KeyTransformHost {
+    return {
+      transformCurves: () => this.editCurves(),
+      graph: false,
+      ppf: () => this.view.ppf,
+      ppv: () => 1,
+      toDisp: (_fc, v) => v,
+      fromDisp: (_fc, d) => d,
+      screen: (x) => this.toClient(this.view.fx(x), RULER_H),
+      autoSnap: this.autoSnap,
+      handlesVisible: () => true,
+    };
+  }
+
+  startTransform(mode: KeyTransformMode, start: { x: number; y: number }, releaseConfirm = false, onCancel?: () => void) {
+    return startKeyTransform(this.keyHost(), mode, {
+      start,
+      releaseConfirm,
+      redoIdname: 'action.transform',
+      onCancel,
+    });
+  }
+
+  protected mainDown(e: PointerEvent, x: number, y: number) {
+    const hit = this.keyAt(x, y);
+    const curves = this.list.curves;
+    if (e.altKey && hit) {
+      selectColumns(curves, [hit.frame], e.shiftKey);
+      app.pushUndo('Select Column');
+      app.changed('doc');
+      return;
+    }
+    if (hit) {
+      const keys = this.keysAt(hit.ch, hit.frame);
+      const allSel = keys.every((k) => k.select_control_point);
+      if (e.shiftKey) {
+        keys.forEach((k) => setKeySelected(k, !allSel));
+        app.pushUndo('Select Keyframes');
+        app.changed('doc');
+        return;
+      }
+      if (!allSel) {
+        selectAll(curves, 'DESELECT');
+        keys.forEach((k) => setKeySelected(k, true));
+        this.selectKeyChannel(hit.ch);
+        app.changed('doc');
+      }
+      this.clickOrDrag(
+        e,
+        () => {
+          selectAll(curves, 'DESELECT');
+          keys.forEach((k) => setKeySelected(k, true));
+          this.selectKeyChannel(hit.ch);
+          app.pushUndo('Select Keyframes');
+          app.changed('doc');
+        },
+        (start) => {
+          if (!allSel) app.pushUndo('Select Keyframes');
+          this.startTransform('TIME_TRANSLATE', { x: start.clientX, y: start.clientY }, true);
+        },
+      );
+      return;
+    }
+    this.clickOrDrag(
+      e,
+      () => {
+        if (!e.shiftKey) {
+          selectAll(curves, 'DESELECT');
+          app.pushUndo('Deselect Keyframes');
+          app.changed('doc');
+        }
+      },
+      (start) => this.boxGesture(start, (r, mode) => this.boxSelect(r, mode)),
+    );
+  }
+
+  private selectKeyChannel(ch: Channel) {
+    if (ch.kind !== 'FCURVE' && ch.kind !== 'SHAPEKEY') return;
+    this.deselectChannels();
+    if (ch.fc) ch.fc.select = true;
+  }
+
+  boxSelect(r: { x0: number; y0: number; x1: number; y1: number }, mode: 'SET' | 'ADD' | 'SUB') {
+    const curves = this.list.curves;
+    if (mode === 'SET') selectAll(curves, 'DESELECT');
+    const f0 = this.view.xf(r.x0),
+      f1 = this.view.xf(r.x1);
+    const i0 = this.rowAt(Math.max(RULER_H, r.y0)),
+      i1 = this.rowAt(r.y1);
+    for (let i = Math.max(0, i0); i <= i1 && i < this.list.rows.length; i++) {
+      for (const ref of this.list.rows[i].curves) for (const k of ref.fc.keyframe_points) if (k.co[0] >= f0 && k.co[0] <= f1) setKeySelected(k, mode !== 'SUB');
+    }
+    app.pushUndo('Box Select');
+    app.changed('doc');
+  }
+
+  viewAll() {
+    const b = keyBounds(this.list.curves, false);
+    const s = app.doc.scene;
+    if (b) this.viewFrameRange(b.x0, b.x1);
+    else this.viewFrameRange(s.frame_start, s.frame_end);
+  }
+
+  viewSelected() {
+    const b = keyBounds(this.list.curves, true);
+    if (!b) return this.viewAll();
+    this.viewFrameRange(b.x0, b.x1);
+    // scroll the first row with a selected key into view
+    const i = this.list.rows.findIndex((ch) => ch.curves.some((r) => r.fc.keyframe_points.some((k) => k.select_control_point)));
+    if (i >= 0) {
+      const top = i * this.rowH;
+      const avail = this.contentBottom() - RULER_H;
+      if (top < this.scrollY || top > this.scrollY + avail - this.rowH) this.scrollY = Math.max(0, top - avail / 3);
+      this.refresh();
+    }
+  }
+}
+
+function rowColor(ch: Channel) {
+  switch (ch.kind) {
+    case 'SUMMARY':
+      return C.summary;
+    case 'OBJECT':
+      return C.objectRow;
+    case 'ACTION':
+      return C.actionRow;
+    case 'GROUP':
+      return ch.ob && ch.action ? C.groupRow : C.groupRow;
+    default:
+      return ch.fc?.select ? C.channelRowSel : C.channelRow;
+  }
+}
+
+registerEditor({
+  id: 'DOPESHEET',
+  label: 'Dope Sheet',
+  icon: 'action',
+  group: 'Animation',
+  create: (a, s) => new DopeSheet(a, s),
+});

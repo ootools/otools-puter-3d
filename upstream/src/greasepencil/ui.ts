@@ -1,0 +1,1009 @@
+// Grease Pencil viewport UI: toolbars, tool header settings, header menus, sidebar Tool tab,
+// keymaps and the radial size / strength control.
+import { app, registerOperators } from '../app/app';
+import { activeTools } from '../app/prefs';
+import { addKeys } from '../app/keymap';
+import { h, type Child } from '../ui/h';
+import { icon } from '../ui/icons';
+import { numberField, enumMenu, colorSwatch, panel, checkbox, row } from '../ui/widgets';
+import { openMenu, type MenuItem } from '../ui/menu';
+import { extraToolLists, toolSettingsRenderers, toolsByMode, COMMON_TOOLS, setActiveTool, type ToolDef } from '../editors/view3d/toolbar';
+import { modeMenus } from '../editors/view3d/modemenus';
+import { sidebarTabs } from '../editors/view3d/sidebar';
+import { propertiesTabs } from '../editors/properties/properties';
+import { editModeHooks, viewportExtensions } from '../editors/view3d/hooks';
+import { activeView3D, type View3D } from '../editors/view3d/view3d';
+import { gpTS, gpBrush, gpOf, DRAW_PRESETS, slotStyle } from './data';
+import { cursorRadius } from './paint';
+import type { GPBrush, GPToolSettings } from './types';
+
+// ---------------------------------------------------------------------------
+// toolbars
+
+export const DRAW_TOOLS: (ToolDef | null)[] = [
+  {
+    id: 'builtin.brush.Draw',
+    label: 'Draw',
+    icon: 'gp_draw',
+    description: 'Draw free-hand strokes (Ctrl: erase)',
+  },
+  {
+    id: 'builtin.brush.Erase',
+    label: 'Erase',
+    icon: 'gp_erase',
+    description: 'Erase points or whole strokes',
+  },
+  {
+    id: 'builtin.brush.Fill',
+    label: 'Fill',
+    icon: 'gp_fill',
+    description: 'Fill a closed area with the active material',
+  },
+  {
+    id: 'builtin.brush.Tint',
+    label: 'Tint',
+    icon: 'gp_tint',
+    description: 'Tint the color of strokes and fills',
+  },
+  null,
+  {
+    id: 'builtin.line',
+    label: 'Line',
+    icon: 'gp_line',
+    description: 'Create a line stroke',
+  },
+  {
+    id: 'builtin.polyline',
+    label: 'Polyline',
+    icon: 'gp_polyline',
+    description: 'Create a stroke of straight segments',
+  },
+  {
+    id: 'builtin.arc',
+    label: 'Arc',
+    icon: 'gp_arc',
+    description: 'Create an arc stroke',
+  },
+  {
+    id: 'builtin.box',
+    label: 'Box',
+    icon: 'gp_box',
+    description: 'Create a rectangle stroke',
+  },
+  {
+    id: 'builtin.circle',
+    label: 'Circle',
+    icon: 'gp_circle',
+    description: 'Create a circle stroke',
+  },
+];
+
+export const SCULPT_TOOLS: ToolDef[] = [
+  {
+    id: 'builtin.brush.Smooth',
+    label: 'Smooth',
+    icon: 'gp_sculpt_smooth',
+    description: 'Smooth stroke points',
+  },
+  {
+    id: 'builtin.brush.Thickness',
+    label: 'Thickness',
+    icon: 'gp_sculpt_thickness',
+    description: 'Increase or decrease the stroke thickness (Ctrl: invert)',
+  },
+  {
+    id: 'builtin.brush.Strength',
+    label: 'Strength',
+    icon: 'gp_sculpt_strength',
+    description: 'Increase or decrease the stroke opacity (Ctrl: invert)',
+  },
+  {
+    id: 'builtin.brush.Randomize',
+    label: 'Randomize',
+    icon: 'gp_sculpt_randomize',
+    description: 'Introduce jitter to the stroke points',
+  },
+  {
+    id: 'builtin.brush.Grab',
+    label: 'Grab',
+    icon: 'gp_sculpt_grab',
+    description: 'Drag points around',
+  },
+  {
+    id: 'builtin.brush.Push',
+    label: 'Push',
+    icon: 'gp_sculpt_push',
+    description: 'Push points in the direction of the stroke',
+  },
+  {
+    id: 'builtin.brush.Twist',
+    label: 'Twist',
+    icon: 'gp_sculpt_twist',
+    description: 'Rotate points around the brush center (Ctrl: invert)',
+  },
+  {
+    id: 'builtin.brush.Pinch',
+    label: 'Pinch',
+    icon: 'gp_sculpt_pinch',
+    description: 'Pull points toward the brush center (Ctrl: invert)',
+  },
+];
+
+extraToolLists.PAINT_GREASE_PENCIL = () => DRAW_TOOLS;
+extraToolLists.SCULPT_GREASE_PENCIL = () => SCULPT_TOOLS;
+toolsByMode.EDIT_GREASEPENCIL = [...COMMON_TOOLS];
+
+// ---------------------------------------------------------------------------
+// tool header
+
+function refresh() {
+  app.changed('ui');
+  activeView3D()?.drawSvg();
+}
+
+const field = (w: number, c: Child) => h('div', { style: { width: `${w}px`, flex: 'none' } }, c);
+
+function pressureToggle(b: GPBrush, key: 'use_pressure_size' | 'use_pressure_strength', id: string) {
+  return h(
+    'button',
+    {
+      key: id,
+      class: { 'hdr-toggle': true, on: !!b[key] },
+      'data-tip': key === 'use_pressure_size' ? 'Use Pressure for Size\nThe stylus pressure changes the stroke radius' : 'Use Pressure for Strength\nThe stylus pressure changes the stroke opacity',
+      onclick: () => ((b[key] = !b[key]), refresh()),
+    },
+    icon('gp_pressure'),
+  );
+}
+
+export function sizeField(b: GPBrush, id: string, label = 'Size') {
+  return numberField({
+    id,
+    label,
+    value: b.size,
+    min: 1,
+    max: 2000,
+    softMax: 500,
+    int: true,
+    tip: 'Brush diameter in pixels (F)',
+    set: (x) => ((b.size = Math.round(x)), refresh()),
+  });
+}
+export function strengthField(b: GPBrush, id: string) {
+  return numberField({
+    id,
+    label: 'Strength',
+    value: b.strength,
+    min: 0,
+    max: 1,
+    slider: true,
+    precision: 3,
+    tip: 'Brush strength (Shift F)',
+    set: (x) => ((b.strength = x), refresh()),
+  });
+}
+
+function materialMenu(id: string): Child {
+  const ob = app.activeObject;
+  const gp = gpOf(app.doc, ob);
+  if (!ob || !gp) return null;
+  const items = gp.materials.map((mid, i) => ({
+    value: String(i),
+    label: (mid && app.doc.materials[mid]?.name) || '(empty)',
+    icon: 'material',
+  }));
+  if (!items.length) return h('span', { class: 'th-label' }, 'No material');
+  return field(
+    140,
+    enumMenu(id, items, String(ob.active_material_index), (v) => app.run('grease_pencil.set_active_material', { slot: Number(v) }), { tip: 'Active material: new strokes use it' }),
+  );
+}
+
+function materialSwatch(): Child {
+  const ob = app.activeObject;
+  const gp = gpOf(app.doc, ob);
+  if (!ob || !gp) return null;
+  const st = slotStyle(app.doc, gp, ob.active_material_index);
+  if (!st) return null;
+  const c = st.show_stroke ? st.color : st.fill_color;
+  return h('span', {
+    class: 'gp-swatch',
+    style: {
+      display: 'inline-block',
+      width: '14px',
+      height: '14px',
+      borderRadius: '3px',
+      border: '1px solid #000',
+      background: `rgb(${c
+        .slice(0, 3)
+        .map((x) => Math.round(Math.pow(Math.max(0, Math.min(1, x)), 1 / 2.2) * 255))
+        .join(',')})`,
+    },
+  });
+}
+
+function colorModeRow(b: GPBrush, id: string): Child[] {
+  return [
+    h(
+      'div',
+      {
+        key: `${id}-cm`,
+        class: 'btn-row',
+        style: { display: 'flex', gap: '1px' },
+      },
+      h(
+        'button',
+        {
+          class: { 'hdr-toggle': true, on: b.color_mode !== 'VERTEXCOLOR' },
+          'data-tip': 'Material\nPaint with the material color',
+          onclick: () => ((b.color_mode = 'MATERIAL'), refresh()),
+        },
+        icon('material'),
+      ),
+      h(
+        'button',
+        {
+          class: { 'hdr-toggle': true, on: b.color_mode === 'VERTEXCOLOR' },
+          'data-tip': 'Color Attribute\nPaint with the brush color (vertex color)',
+          onclick: () => ((b.color_mode = 'VERTEXCOLOR'), refresh()),
+        },
+        icon('group_vcol'),
+      ),
+    ),
+    b.color_mode === 'VERTEXCOLOR'
+      ? field(
+          44,
+          colorSwatch(`${id}-col`, b.color ?? [0.5, 0.5, 0.5], (c) => ((b.color = [c[0], c[1], c[2]]), refresh())),
+        )
+      : null,
+  ];
+}
+
+function drawHeader(): Child {
+  const doc = app.doc;
+  const ts = gpTS(doc);
+  const b = gpBrush(doc, 'builtin.brush.Draw');
+  const preset = DRAW_PRESETS.find((p) => p.id === ts.gpencil_draw_brush);
+  return [
+    field(
+      110,
+      enumMenu(
+        'gp-brush',
+        DRAW_PRESETS.map((p) => ({
+          value: p.id,
+          label: p.name,
+          icon: 'gp_draw',
+        })),
+        preset?.id ?? '',
+        (id) => {
+          const p = DRAW_PRESETS.find((x) => x.id === id)!;
+          ts.gpencil_draw_brush = id;
+          Object.assign(b, {
+            size: p.size,
+            strength: p.strength,
+            use_pressure_size: p.use_pressure_size,
+            use_pressure_strength: p.use_pressure_strength,
+            pen_smooth_factor: p.smooth,
+          });
+          refresh();
+        },
+        { tip: 'Brush preset' },
+      ),
+    ),
+    materialSwatch(),
+    materialMenu('gp-mat'),
+    ...colorModeRow(b, 'gp-draw'),
+    field(120, sizeField(b, 'gp-size')),
+    pressureToggle(b, 'use_pressure_size', 'gp-ps'),
+    field(120, strengthField(b, 'gp-str')),
+    pressureToggle(b, 'use_pressure_strength', 'gp-pst'),
+  ];
+}
+
+const ERASE_MODES = [
+  {
+    value: 'SOFT',
+    label: 'Dissolve',
+    description: 'Erase strokes, fading their points strength and thickness',
+  },
+  {
+    value: 'HARD',
+    label: 'Point',
+    description: 'Erase stroke points (cuts strokes at the eraser edge)',
+  },
+  { value: 'STROKE', label: 'Stroke', description: 'Erase entire strokes' },
+];
+
+toolSettingsRenderers['builtin.brush.Draw'] = drawHeader;
+toolSettingsRenderers['builtin.brush.Erase'] = () => {
+  const b = gpBrush(app.doc, 'builtin.brush.Erase');
+  return [
+    field(
+      110,
+      enumMenu('gp-er-mode', ERASE_MODES, b.eraser_mode ?? 'HARD', (v) => ((b.eraser_mode = v as GPBrush['eraser_mode']), refresh()), { tip: 'Eraser mode' }),
+    ),
+    field(120, sizeField(b, 'gp-er-size')),
+    field(120, strengthField(b, 'gp-er-str')),
+    pressureToggle(b, 'use_pressure_strength', 'gp-er-pst'),
+  ];
+};
+toolSettingsRenderers['builtin.brush.Tint'] = () => {
+  const b = gpBrush(app.doc, 'builtin.brush.Tint');
+  return [
+    field(
+      44,
+      colorSwatch('gp-tint-col', b.color ?? [1, 0, 0], (c) => ((b.color = [c[0], c[1], c[2]]), refresh())),
+    ),
+    field(120, sizeField(b, 'gp-tint-size')),
+    field(120, strengthField(b, 'gp-tint-str')),
+    pressureToggle(b, 'use_pressure_strength', 'gp-tint-pst'),
+    field(
+      90,
+      enumMenu(
+        'gp-tint-mode',
+        [
+          { value: 'STROKE', label: 'Stroke' },
+          { value: 'FILL', label: 'Fill' },
+          { value: 'BOTH', label: 'Stroke & Fill' },
+        ],
+        b.vertex_mode ?? 'BOTH',
+        (v) => ((b.vertex_mode = v as GPBrush['vertex_mode']), refresh()),
+        { tip: 'Mode\nTint strokes, fills or both' },
+      ),
+    ),
+  ];
+};
+toolSettingsRenderers['builtin.brush.Fill'] = () => {
+  const b = gpBrush(app.doc, 'builtin.brush.Fill');
+  return [
+    materialSwatch(),
+    materialMenu('gp-fill-mat'),
+    ...colorModeRow(b, 'gp-fill'),
+    field(
+      120,
+      enumMenu(
+        'gp-fill-layers',
+        [
+          { value: 'VISIBLE', label: 'All Visible Layers' },
+          { value: 'ACTIVE', label: 'Active Layer' },
+          { value: 'ABOVE', label: 'Layer Above' },
+          { value: 'BELOW', label: 'Layer Below' },
+          { value: 'ALL_ABOVE', label: 'All Above' },
+          { value: 'ALL_BELOW', label: 'All Below' },
+        ],
+        b.fill_layer_mode ?? 'VISIBLE',
+        (v) => ((b.fill_layer_mode = v as GPBrush['fill_layer_mode']), refresh()),
+        { tip: 'Layers\nLayers used as fill boundaries' },
+      ),
+    ),
+    field(
+      110,
+      numberField({
+        id: 'gp-fill-dilate',
+        label: 'Dilate',
+        value: b.dilate ?? 1,
+        min: 0,
+        max: 20,
+        int: true,
+        tip: 'Grow the fill under the boundary lines (pixels)',
+        set: (x) => ((b.dilate = Math.round(x)), refresh()),
+      }),
+    ),
+    field(110, sizeField(b, 'gp-fill-size', 'Line')),
+  ];
+};
+for (const t of ['builtin.line', 'builtin.polyline', 'builtin.arc', 'builtin.box', 'builtin.circle'])
+  toolSettingsRenderers[t] = () => {
+    const b = gpBrush(app.doc, t);
+    return [
+      materialSwatch(),
+      materialMenu(`gp-prim-mat`),
+      field(120, sizeField(b, `gp-prim-size`)),
+      field(120, strengthField(b, `gp-prim-str`)),
+      field(
+        120,
+        numberField({
+          id: 'gp-prim-sub',
+          label: 'Subdivisions',
+          value: b.subdivision ?? 6,
+          min: 0,
+          max: 128,
+          int: true,
+          tip: 'Number of points per segment',
+          set: (x) => ((b.subdivision = Math.round(x)), refresh()),
+        }),
+      ),
+    ];
+  };
+for (const t of SCULPT_TOOLS)
+  toolSettingsRenderers[t.id] = () => {
+    const b = gpBrush(app.doc, t.id);
+    const dir = ['builtin.brush.Thickness', 'builtin.brush.Strength', 'builtin.brush.Twist', 'builtin.brush.Pinch'].includes(t.id);
+    return [
+      field(120, sizeField(b, 'gp-sc-size')),
+      field(120, strengthField(b, 'gp-sc-str')),
+      pressureToggle(b, 'use_pressure_strength', 'gp-sc-pst'),
+      dir
+        ? h(
+            'div',
+            { key: 'gp-sc-dir', style: { display: 'flex', gap: '1px' } },
+            h(
+              'button',
+              {
+                class: { 'hdr-toggle': true, on: b.direction !== 'SUBTRACT' },
+                'data-tip': 'Add',
+                onclick: () => ((b.direction = 'ADD'), refresh()),
+              },
+              icon('add'),
+            ),
+            h(
+              'button',
+              {
+                class: { 'hdr-toggle': true, on: b.direction === 'SUBTRACT' },
+                'data-tip': 'Subtract',
+                onclick: () => ((b.direction = 'SUBTRACT'), refresh()),
+              },
+              icon('remove'),
+            ),
+          )
+        : null,
+    ];
+  };
+
+cursorRadius.fn = (tool) => {
+  if (tool.startsWith('builtin.brush.') && tool !== 'builtin.brush.Fill') return gpBrush(app.doc, tool).size / 2;
+  return null;
+};
+
+// ---------------------------------------------------------------------------
+// header: placement / drawing plane / onion skins
+
+const PLACEMENTS: {
+  value: GPToolSettings['gpencil_stroke_placement_view3d'];
+  label: string;
+  icon: string;
+  description: string;
+}[] = [
+  {
+    value: 'ORIGIN',
+    label: 'Origin',
+    icon: 'object_datamode',
+    description: 'Draw stroke at Object origin',
+  },
+  {
+    value: 'CURSOR',
+    label: '3D Cursor',
+    icon: 'pivot_cursor',
+    description: 'Draw stroke at 3D cursor location',
+  },
+  {
+    value: 'SURFACE',
+    label: 'Surface',
+    icon: 'snap_face',
+    description: 'Stick stroke to surfaces',
+  },
+  {
+    value: 'STROKE',
+    label: 'Stroke',
+    icon: 'gp_select_strokes',
+    description: 'Stick stroke to other strokes',
+  },
+];
+const PLANES: {
+  value: GPToolSettings['gpencil_lock_axis'];
+  label: string;
+  icon: string;
+  description: string;
+}[] = [
+  {
+    value: 'VIEW',
+    label: 'View',
+    icon: 'orientation_view',
+    description: 'Align strokes to current view plane',
+  },
+  {
+    value: 'AXIS_Y',
+    label: 'Front (X-Z)',
+    icon: 'orientation_global',
+    description: 'Project strokes to plane locked to Y',
+  },
+  {
+    value: 'AXIS_X',
+    label: 'Side (Y-Z)',
+    icon: 'orientation_global',
+    description: 'Project strokes to plane locked to X',
+  },
+  {
+    value: 'AXIS_Z',
+    label: 'Top (X-Y)',
+    icon: 'orientation_global',
+    description: 'Project strokes to plane locked to Z',
+  },
+  {
+    value: 'CURSOR',
+    label: 'Cursor',
+    icon: 'orientation_cursor',
+    description: 'Align strokes to current 3D cursor orientation',
+  },
+];
+
+function layerDropdown(): Child {
+  const gp = gpOf(app.doc, app.activeObject);
+  if (!gp || !gp.layers.length) return null;
+  const items = gp.layers.map((l, i) => ({ value: String(i), label: l.name, icon: 'outliner_data_gp_layer' })).reverse();
+  return field(110, enumMenu('gp-layer', items, String(gp.active_layer_index), (v) => app.run('grease_pencil.layer_active', { layer: Number(v) }), { tip: 'Active Layer' }));
+}
+
+export function placementControls(): Child {
+  const ts = gpTS(app.doc);
+  const v = activeView3D();
+  const onion = v ? ((v.overlay as { use_gpencil_onion_skin?: boolean }).use_gpencil_onion_skin ?? true) : true;
+  return h(
+    'div',
+    {
+      key: 'gp-hdr',
+      class: 'hdr-group',
+      style: { display: 'flex', gap: '4px', alignItems: 'center' },
+    },
+    field(
+      108,
+      enumMenu('gp-place', PLACEMENTS, ts.gpencil_stroke_placement_view3d, (x) => ((ts.gpencil_stroke_placement_view3d = x as typeof ts.gpencil_stroke_placement_view3d), refresh()), {
+        tip: 'Stroke Placement',
+      }),
+    ),
+    field(
+      118,
+      enumMenu('gp-plane', PLANES, ts.gpencil_lock_axis, (x) => ((ts.gpencil_lock_axis = x as typeof ts.gpencil_lock_axis), refresh()), { tip: 'Drawing Plane' }),
+    ),
+    layerDropdown(),
+    app.doc.mode === 'PAINT_GREASE_PENCIL'
+      ? h(
+          'button',
+          {
+            key: 'gp-add',
+            class: { 'hdr-toggle': true, on: ts.use_gpencil_draw_additive },
+            'data-tip': 'Additive Drawing\nWhen creating new frames, the strokes from the previous/active frame are included as the basis for the new one',
+            onclick: () => ((ts.use_gpencil_draw_additive = !ts.use_gpencil_draw_additive), refresh()),
+          },
+          icon('add'),
+        )
+      : null,
+    app.doc.mode === 'EDIT'
+      ? h(
+          'button',
+          {
+            key: 'gp-mf',
+            class: {
+              'hdr-toggle': true,
+              on: ts.use_grease_pencil_multi_frame_editing,
+            },
+            'data-tip': 'Multi-frame Editing\nEdit strokes of the selected keyframes of all layers',
+            onclick: () => ((ts.use_grease_pencil_multi_frame_editing = !ts.use_grease_pencil_multi_frame_editing), app.changed('doc')),
+          },
+          icon('gp_multiframe'),
+        )
+      : null,
+    v
+      ? h(
+          'button',
+          {
+            key: 'gp-onion',
+            class: { 'hdr-toggle': true, on: onion },
+            'data-tip': 'Onion Skins\nShow ghosts of the keyframes before and after the current frame',
+            onclick: () => {
+              (v.overlay as { use_gpencil_onion_skin?: boolean }).use_gpencil_onion_skin = !onion;
+              refresh();
+            },
+          },
+          icon(onion ? 'onionskin_on' : 'onionskin_off'),
+        )
+      : null,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// header menus
+
+export function animationMenu(): MenuItem[] {
+  return [
+    {
+      label: 'Insert Blank Keyframe (Active Layer)',
+      op: 'grease_pencil.insert_blank_frame',
+      props: { all_layers: false },
+    },
+    {
+      label: 'Insert Blank Keyframe (All Layers)',
+      op: 'grease_pencil.insert_blank_frame',
+      props: { all_layers: true },
+    },
+    { separator: true },
+    {
+      label: 'Duplicate Active Keyframe (Active Layer)',
+      op: 'grease_pencil.frame_duplicate',
+      props: { all: false },
+    },
+    {
+      label: 'Duplicate Active Keyframe (All Layers)',
+      op: 'grease_pencil.frame_duplicate',
+      props: { all: true },
+    },
+    { separator: true },
+    {
+      label: 'Delete Active Keyframe (Active Layer)',
+      op: 'grease_pencil.active_frame_delete',
+      props: { all: false },
+    },
+    {
+      label: 'Delete Active Keyframes (All Layers)',
+      op: 'grease_pencil.active_frame_delete',
+      props: { all: true },
+    },
+  ];
+}
+
+export function layerMenu(): MenuItem[] {
+  return [
+    { label: 'Add New Layer', op: 'grease_pencil.layer_add' },
+    { label: 'Duplicate Layer', op: 'grease_pencil.layer_duplicate' },
+    { label: 'Merge Down', op: 'grease_pencil.layer_merge' },
+    {
+      label: 'Move Up',
+      op: 'grease_pencil.layer_move',
+      props: { direction: 'UP' },
+    },
+    {
+      label: 'Move Down',
+      op: 'grease_pencil.layer_move',
+      props: { direction: 'DOWN' },
+    },
+    { label: 'Remove Layer', op: 'grease_pencil.layer_remove' },
+    { separator: true },
+    { label: 'Hide Active Layer', op: 'grease_pencil.layer_hide' },
+    {
+      label: 'Hide Inactive Layers',
+      op: 'grease_pencil.layer_hide',
+      props: { unselected: true },
+    },
+    { label: 'Show All Layers', op: 'grease_pencil.layer_reveal' },
+    { separator: true },
+    {
+      label: 'Lock All Layers',
+      op: 'grease_pencil.layer_lock_all',
+      props: { lock: true },
+    },
+    {
+      label: 'Unlock All Layers',
+      op: 'grease_pencil.layer_lock_all',
+      props: { lock: false },
+    },
+    { separator: true },
+    {
+      label: 'Active Layer',
+      submenu: () =>
+        (gpOf(app.doc, app.activeObject)?.layers ?? [])
+          .map((l, i, all) => ({
+            label: l.name,
+            active: gpOf(app.doc, app.activeObject)?.active_layer_index === i,
+            op: 'grease_pencil.layer_active',
+            props: { layer: i },
+          }))
+          .reverse(),
+    },
+  ];
+}
+
+function drawMenu(): MenuItem[] {
+  return [
+    { label: 'Animation', submenu: animationMenu },
+    { label: 'Layer', submenu: layerMenu },
+    { separator: true },
+    {
+      label: 'Brush Size',
+      op: 'grease_pencil.radial_control',
+      props: { data: 'size' },
+      shortcut: 'F',
+    },
+    {
+      label: 'Brush Strength',
+      op: 'grease_pencil.radial_control',
+      props: { data: 'strength' },
+      shortcut: 'Shift F',
+    },
+  ];
+}
+
+modeMenus.PAINT_GREASE_PENCIL = {
+  header: () => [['Draw', drawMenu]],
+  select: () => [],
+  headerExtra: placementControls,
+};
+modeMenus.SCULPT_GREASE_PENCIL = {
+  header: () => [
+    [
+      'Sculpt',
+      () => [
+        { label: 'Animation', submenu: animationMenu },
+        { label: 'Layer', submenu: layerMenu },
+        { separator: true },
+        {
+          label: 'Brush Size',
+          op: 'grease_pencil.radial_control',
+          props: { data: 'size' },
+          shortcut: 'F',
+        },
+        {
+          label: 'Brush Strength',
+          op: 'grease_pencil.radial_control',
+          props: { data: 'strength' },
+          shortcut: 'Shift F',
+        },
+      ],
+    ],
+  ],
+  select: () => [],
+  headerExtra: placementControls,
+};
+
+// ---------------------------------------------------------------------------
+// sidebar Tool tab
+
+/** Brush / placement panels for the active Draw or Sculpt tool (viewport sidebar and Properties ▸ Tool). */
+export function gpToolPanels(): Child {
+  const mode = app.doc.mode;
+  const tool = activeTools[mode] ?? '';
+  const b = gpBrush(app.doc, tool);
+  const ts = gpTS(app.doc);
+  const list = (mode === 'PAINT_GREASE_PENCIL' ? DRAW_TOOLS : SCULPT_TOOLS).filter((t): t is ToolDef => !!t);
+  return [
+    panel('gp-sb-tool', 'Active Tool', () => [
+      enumMenu(
+        'gp-sb-tools',
+        list.map((t) => ({ value: t.id, label: t.label, icon: t.icon })),
+        tool,
+        (id) => setActiveTool(id),
+      ),
+    ]),
+    panel('gp-sb-brush', 'Brush Settings', () => [
+      row('', sizeField(b, 'gp-sb-size')),
+      row('', strengthField(b, 'gp-sb-str')),
+      checkbox('gp-sb-ps', 'Use Pressure for Size', !!b.use_pressure_size, (x) => ((b.use_pressure_size = x), refresh())),
+      checkbox('gp-sb-pst', 'Use Pressure for Strength', !!b.use_pressure_strength, (x) => ((b.use_pressure_strength = x), refresh())),
+      tool === 'builtin.brush.Draw'
+        ? [
+            row(
+              '',
+              numberField({
+                id: 'gp-sb-smooth',
+                label: 'Smooth',
+                value: b.pen_smooth_factor ?? 0,
+                min: 0,
+                max: 2,
+                slider: true,
+                precision: 3,
+                tip: 'Amount of smoothing applied after finishing the stroke',
+                set: (x) => ((b.pen_smooth_factor = x), refresh()),
+              }),
+            ),
+            row(
+              '',
+              numberField({
+                id: 'gp-sb-steps',
+                label: 'Iterations',
+                value: b.pen_smooth_steps ?? 1,
+                min: 0,
+                max: 100,
+                int: true,
+                tip: 'Number of smoothing iterations after finishing the stroke',
+                set: (x) => ((b.pen_smooth_steps = Math.round(x)), refresh()),
+              }),
+            ),
+          ]
+        : null,
+      tool === 'builtin.brush.Erase'
+        ? row(
+            'Mode',
+            enumMenu('gp-sb-er', ERASE_MODES, b.eraser_mode ?? 'HARD', (x) => ((b.eraser_mode = x as GPBrush['eraser_mode']), refresh())),
+          )
+        : null,
+    ]),
+    mode === 'PAINT_GREASE_PENCIL'
+      ? panel('gp-sb-place', 'Stroke Placement', () => [
+          row(
+            'Placement',
+            enumMenu('gp-sb-pl', PLACEMENTS, ts.gpencil_stroke_placement_view3d, (x) => ((ts.gpencil_stroke_placement_view3d = x as typeof ts.gpencil_stroke_placement_view3d), refresh())),
+          ),
+          ts.gpencil_stroke_placement_view3d === 'SURFACE'
+            ? row(
+                '',
+                numberField({
+                  id: 'gp-sb-off',
+                  label: 'Offset',
+                  value: ts.gpencil_surface_offset,
+                  min: 0,
+                  max: 10,
+                  precision: 3,
+                  set: (x) => ((ts.gpencil_surface_offset = x), refresh()),
+                }),
+              )
+            : null,
+          row(
+            'Drawing Plane',
+            enumMenu('gp-sb-plane', PLANES, ts.gpencil_lock_axis, (x) => ((ts.gpencil_lock_axis = x as typeof ts.gpencil_lock_axis), refresh())),
+          ),
+          checkbox('gp-sb-onback', 'Draw on Back', ts.use_gpencil_draw_onback, (x) => ((ts.use_gpencil_draw_onback = x), refresh())),
+          checkbox('gp-sb-additive', 'Additive Drawing', ts.use_gpencil_draw_additive, (x) => ((ts.use_gpencil_draw_additive = x), refresh())),
+          checkbox('gp-sb-autokey', 'Auto Keying', app.doc.scene.tool_settings.use_keyframe_insert_auto, (x) => ((app.doc.scene.tool_settings.use_keyframe_insert_auto = x), refresh())),
+        ])
+      : null,
+  ];
+}
+
+const toolTab = sidebarTabs.find((t) => t.id === 'Tool');
+if (toolTab) {
+  const orig = toolTab.draw;
+  toolTab.draw = (v: View3D) => (app.doc.mode === 'PAINT_GREASE_PENCIL' || app.doc.mode === 'SCULPT_GREASE_PENCIL' ? gpToolPanels() : orig(v));
+}
+const propsToolTab = propertiesTabs.find((t) => t.id === 'TOOL');
+if (propsToolTab) {
+  const orig = propsToolTab.draw;
+  propsToolTab.draw = (p) => (app.doc.mode === 'PAINT_GREASE_PENCIL' || app.doc.mode === 'SCULPT_GREASE_PENCIL' ? gpToolPanels() : orig(p));
+}
+
+// ---------------------------------------------------------------------------
+// radial control (F / Shift F)
+
+const radial: {
+  cx: number;
+  cy: number;
+  value: number;
+  data: 'size' | 'strength';
+  view: View3D | null;
+} = { cx: 0, cy: 0, value: 0, data: 'size', view: null };
+let radialActive = false;
+const FULL = 200;
+
+registerOperators([
+  {
+    idname: 'grease_pencil.radial_control',
+    label: 'Radial Control',
+    description: 'Set the brush size or strength interactively',
+    props: [
+      {
+        id: 'data',
+        label: 'Data',
+        type: 'enum',
+        default: 'size',
+        items: [
+          ['size', 'Size'],
+          ['strength', 'Strength'],
+        ],
+      },
+    ],
+    poll: () => app.doc.mode === 'PAINT_GREASE_PENCIL' || app.doc.mode === 'SCULPT_GREASE_PENCIL',
+    undo: false,
+    invoke: (ctx, p) => {
+      const v = activeView3D();
+      if (!v) return 'CANCELLED';
+      const tool = activeTools[app.doc.mode] ?? '';
+      const b = gpBrush(app.doc, tool);
+      const data = p.data as 'size' | 'strength';
+      const start = data === 'size' ? b.size : b.strength;
+      const m = v.local({
+        clientX: ctx.event?.x ?? app.pointer.x,
+        clientY: ctx.event?.y ?? app.pointer.y,
+      });
+      const scale = data === 'size' ? 0.5 : 1;
+      radial.data = data;
+      radial.view = v;
+      radial.value = data === 'size' ? start * scale : start;
+      radial.cx = m.x - (data === 'size' ? start * scale : start * FULL);
+      radial.cy = m.y;
+      radialActive = true;
+      v.drawSvg();
+      const apply = (val: number) => {
+        if (data === 'size') b.size = Math.max(1, Math.round(val / scale));
+        else b.strength = Math.max(0, Math.min(1, val));
+      };
+      app.startModal({
+        label: 'Radial Control',
+        onPointerMove: (e) => {
+          const q = v.local(e);
+          const d = Math.hypot(q.x - radial.cx, q.y - radial.cy);
+          radial.value = data === 'size' ? Math.max(1, d) : Math.min(1, d / FULL);
+          apply(radial.value);
+          v.drawSvg();
+          app.changed('ui');
+        },
+        onPointerDown: (e) => (e.button === 2 ? 'CANCELLED' : 'FINISHED'),
+        onKey: (e) => (e.type !== 'keydown' ? true : e.key === 'Escape' ? 'CANCELLED' : e.key === 'Enter' ? 'FINISHED' : true),
+        cancel: () => {
+          apply(data === 'size' ? start * scale : start);
+          radialActive = false;
+          v.drawSvg();
+        },
+        finish: () => {
+          radialActive = false;
+          v.drawSvg();
+        },
+      });
+      return 'RUNNING_MODAL';
+    },
+  },
+]);
+
+editModeHooks.svg.push((v) => {
+  if (!radialActive || radial.view !== v) return null;
+  const r = radial.data === 'size' ? radial.value : FULL;
+  return h(
+    'g',
+    { key: 'gp-radial', 'pointer-events': 'none' },
+    h('circle', {
+      cx: radial.cx,
+      cy: radial.cy,
+      r: Math.max(1, r),
+      fill: 'rgba(255,255,255,0.06)',
+      stroke: '#fff',
+      'stroke-width': 1.5,
+    }),
+    radial.data === 'strength'
+      ? h('circle', {
+          cx: radial.cx,
+          cy: radial.cy,
+          r: Math.max(0.5, radial.value * FULL),
+          fill: 'rgba(255,255,255,0.18)',
+          stroke: '#fff',
+          'stroke-width': 1,
+        })
+      : null,
+    h(
+      'text',
+      {
+        x: radial.cx,
+        y: radial.cy + 4,
+        'text-anchor': 'middle',
+        fill: '#fff',
+        'font-size': 12,
+        style: 'paint-order:stroke;stroke:#000;stroke-width:3px',
+      },
+      radial.data === 'size' ? `${Math.round(radial.value)} px` : radial.value.toFixed(3),
+    ),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// keymap (highest priority in the 3D view while a grease pencil mode is active)
+
+const paint = () => app.doc.mode === 'PAINT_GREASE_PENCIL';
+const sculpt = () => app.doc.mode === 'SCULPT_GREASE_PENCIL';
+const paintOrSculpt = () => paint() || sculpt();
+
+addKeys('Grease Pencil', [
+  {
+    key: 'F',
+    op: 'grease_pencil.radial_control',
+    props: { data: 'size' },
+    when: paintOrSculpt,
+  },
+  {
+    key: 'F',
+    shift: true,
+    op: 'grease_pencil.radial_control',
+    props: { data: 'strength' },
+    when: paintOrSculpt,
+  },
+  {
+    key: 'I',
+    menu: animationMenu,
+    menuTitle: 'Animation',
+    when: paintOrSculpt,
+  },
+  { key: 'X', op: 'grease_pencil.active_frame_delete', when: paint },
+  { key: 'DEL', op: 'grease_pencil.active_frame_delete', when: paint },
+  { key: 'Y', menu: layerMenu, menuTitle: 'Layer', when: paintOrSculpt },
+]);
+
+viewportExtensions.push((v) => {
+  if (!v.keymaps.includes('Grease Pencil')) v.keymaps.unshift('Grease Pencil');
+});
+
+void openMenu;

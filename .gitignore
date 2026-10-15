@@ -1,0 +1,25 @@
+# ---- 构建树与产物 ----
+# .build/ 是 upstream/ + 移植层合成出来的 Vite 工程（见 scripts/tree.mjs），
+# 每次构建重建，不入库。
+.build/
+dist/
+dist-pack/
+
+# ---- 原生编码 cdylib 的源码在 native/，编译产物不入库 ----
+# lib/ 由 scripts/build-native.mjs 生成（宿主按 lib/macOS.dylib 加载）。
+lib/
+native/target/
+
+# ---- 依赖 ----
+node_modules/
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+Thumbs.db
+*.swp
+
+# ---- 本地日志 ----
+*.log
+
+# playwright-cli 本地调试的临时输出
+.playwright-cli/

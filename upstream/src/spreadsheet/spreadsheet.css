@@ -1,0 +1,207 @@
+/* Spreadsheet editor (dark theme like the reference: data set region on the left, table). */
+.ss-editor {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  background: #1d1d1d;
+  color: var(--c-text);
+  font-size: var(--fs);
+  overflow: hidden;
+  outline: none;
+}
+.ss-left {
+  width: 170px;
+  flex: none;
+  background: var(--c-region);
+  border-right: 1px solid var(--c-border);
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.ss-left-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 6px;
+  color: #ccc;
+}
+.ss-left-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 8px 0 6px;
+  cursor: default;
+  border-radius: 3px;
+  margin: 0 4px;
+}
+.ss-left-row.indent {
+  padding-left: 18px;
+}
+.ss-left-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.ss-left-row.active {
+  background: var(--accent);
+  color: #fff;
+}
+.ss-left-row.empty .ss-left-label,
+.ss-left-row.empty .ss-left-count {
+  color: #777;
+}
+.ss-left-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ss-left-count {
+  color: #bbb;
+  font-variant-numeric: tabular-nums;
+}
+.ss-left-row.active .ss-left-count {
+  color: #fff;
+}
+.ss-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: #282828;
+}
+.ss-head {
+  flex: none;
+  display: flex;
+  height: 24px;
+  overflow: hidden;
+  background: #303030;
+  border-bottom: 1px solid #1d1d1d;
+}
+.ss-hcell {
+  flex: none;
+  padding: 0 8px;
+  line-height: 24px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-right: 1px solid #1f1f1f;
+  color: #e6e6e6;
+}
+.ss-hcell.virtual {
+  color: #a8a8a8;
+  font-style: italic;
+}
+.ss-body {
+  flex: 1;
+  position: relative;
+  overflow: auto;
+}
+.ss-spacer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  pointer-events: none;
+}
+.ss-rows {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+.ss-row {
+  position: absolute;
+  left: 0;
+  height: 20px;
+  display: flex;
+  background: #2b2b2b;
+}
+.ss-row.odd {
+  background: #262626;
+}
+.ss-row:hover {
+  background: #353535;
+}
+.ss-cell {
+  flex: none;
+  height: 20px;
+  line-height: 20px;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  border-right: 1px solid #1f1f1f;
+  font-variant-numeric: tabular-nums;
+  box-sizing: border-box;
+}
+.ss-cell.ss-idx,
+.ss-hcell.ss-idx {
+  justify-content: flex-end;
+  color: #8f8f8f;
+  background: #2f2f2f;
+  position: sticky;
+  left: 0;
+  z-index: 1;
+}
+.ss-cell .ss-num {
+  min-width: 52px;
+  text-align: right;
+}
+.ss-cell .ss-str {
+  margin-right: auto;
+}
+.ss-bool {
+  color: #888;
+  margin-right: auto;
+}
+.ss-bool.on {
+  color: #e6e6e6;
+}
+.ss-swatch {
+  width: 22px;
+  height: 12px;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5);
+  flex: none;
+  margin-right: auto;
+}
+.ss-footer {
+  flex: none;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 10px;
+  background: #303030;
+  border-top: 1px solid #1d1d1d;
+  color: #bbb;
+}
+.ss-sep {
+  color: #666;
+}
+.ss-header .ss-state {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.ss-crumbs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 8px;
+  color: #ccc;
+  min-width: 0;
+  overflow: hidden;
+}
+.ss-crumb {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
+.ss-crumb-sep {
+  color: #777;
+}

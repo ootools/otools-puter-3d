@@ -1,0 +1,414 @@
+// Strip properties: the Sequencer sidebar (N) tabs and the Properties editor Strip tabs.
+import { h, type Child } from '../ui/h';
+import { icon } from '../ui/icons';
+import { app } from '../app/app';
+import { num, bool, enumProp, splitRow, oid, type PropOpts } from '../ui/props';
+import { panel, numberField, colorSwatch, checkbox, textField, enumMenu, button, opButton } from '../ui/widgets';
+import { openMenu } from '../ui/menu';
+import type { Strip, StripModifier, ColorBalanceData } from './types';
+import { BLEND_ITEMS, inputCount, isStill, finalStart, finalEnd, finalDuration, setLeftHandle, setRightHandle, translateStrip, isVisual, TRANSITIONS, findStrip, resolveOverlap } from './strips';
+import { activeStrip, afterEdit, seqEditor, seqList, toolSettings, hasEditor, sceneFps } from './context';
+import { stripIcon } from './theme';
+import { restartPlayback } from './audio';
+import { movieCacheStats } from './media';
+
+const edited: PropOpts = { onChange: () => (afterEdit(), restartPlayback()) };
+
+function color(owner: Record<string, unknown>, key: string, label: string, alpha = false) {
+  const v = (owner[key] as number[]) ?? [0, 0, 0, 1];
+  return splitRow(
+    label,
+    colorSwatch(`${oid(owner)}.${key}`, v, (nv, final) => {
+      owner[key] = nv.slice(0, v.length);
+      app.changed('doc');
+      if (final) app.pushUndo(`Change ${label}`);
+    }, { alpha, linear: false }),
+  );
+}
+
+function frameField(id: string, label: string, value: number, set: (v: number) => void, disabled = false) {
+  return splitRow(label, numberField({ id, value, int: true, disabled, set: (v, final) => {
+    set(Math.round(v));
+    afterEdit();
+    app.changed('doc');
+    if (final) {
+      restartPlayback();
+      app.pushUndo(`Change ${label}`);
+    }
+  } }));
+}
+
+/** Header of the strip panels: icon, name (rename) and mute toggle. */
+function stripHeader(s: Strip): Child {
+  return h(
+    'div',
+    { class: 'seq-sb-head' },
+    icon(stripIcon(s.type)),
+    textField(`seq-name-${oid(s)}`, s.name, (v) => rename(s, v)),
+    h(
+      'button',
+      {
+        class: { 'hdr-toggle': true, on: !s.mute },
+        'data-tip': 'Mute\nMute the strip (H)',
+        onclick: () => {
+          s.mute = !s.mute;
+          app.pushUndo(s.mute ? 'Mute Strip' : 'Unmute Strip');
+          app.changed('doc');
+          restartPlayback();
+        },
+      },
+      icon(s.mute ? 'checkbox_dehlt' : 'checkbox_hlt'),
+    ),
+  );
+}
+
+export function rename(s: Strip, name: string) {
+  name = name.trim();
+  if (!name || name === s.name) return;
+  const ed = seqEditor();
+  if (findStrip(ed.strips, name)) {
+    app.report('ERROR', `A strip named "${name}" already exists`);
+    app.changed('ui');
+    return;
+  }
+  const old = s.name;
+  const walk = (l: Strip[]) => {
+    for (const x of l) {
+      if (x.input_1 === old) x.input_1 = name;
+      if (x.input_2 === old) x.input_2 = name;
+      if (x.strips) walk(x.strips);
+    }
+  };
+  walk(ed.strips);
+  ed.meta_stack = ed.meta_stack.map((n) => (n === old ? name : n));
+  if (ed.active_strip === old) ed.active_strip = name;
+  s.name = name;
+  app.pushUndo('Rename Strip');
+  app.changed('doc');
+}
+
+function effectPanel(s: Strip): Child {
+  const rows: Child[] = [];
+  const t = s.type;
+  if (t === 'COLOR') rows.push(color(s as never, 'color', 'Color'));
+  if (t === 'TEXT') {
+    rows.push(
+      h('textarea', {
+        key: `seq-text-${oid(s)}`,
+        class: 'seq-textarea',
+        rows: 3,
+        value: s.text ?? '',
+        spellcheck: 'false',
+        onkeydown: (e: KeyboardEvent) => e.stopPropagation(),
+        oninput: (e: Event) => {
+          s.text = (e.target as HTMLTextAreaElement).value;
+          app.changed('doc');
+        },
+        onchange: () => app.pushUndo('Change Text'),
+      }),
+      num(s, 'wrap_width', 'Wrap Width', { min: 0, softMax: 1, precision: 2, slider: true }),
+    );
+  }
+  if (TRANSITIONS.includes(t)) {
+    if (t === 'WIPE') {
+      rows.push(
+        enumProp(s, 'transition_type', 'Transition', [['SINGLE', 'Single'], ['DOUBLE', 'Double'], ['IRIS', 'Iris'], ['CLOCK', 'Clock']]),
+        enumProp(s, 'direction', 'Direction', [['OUT', 'Out'], ['IN', 'In']]),
+        num(s, 'blur_width', 'Blur Width', { min: 0, max: 1, slider: true, precision: 2 }),
+        num(s, 'angle', 'Angle', { unit: 'angle', min: -Math.PI / 2, max: Math.PI / 2 }),
+      );
+    }
+  }
+  if (inputCount(t) && t !== 'COLORMIX') {
+    rows.push(bool(s, 'use_default_fade', 'Default Fade'), !s.use_default_fade ? num(s, 'effect_fader', 'Effect Fader', { min: 0, max: 1, slider: true, precision: 3 }) : null);
+  }
+  if (t === 'GLOW')
+    rows.push(
+      num(s, 'threshold', 'Threshold', { min: 0, max: 1, slider: true, precision: 3 }),
+      num(s, 'clamp', 'Clamp', { min: 0, max: 1, slider: true, precision: 3 }),
+      num(s, 'boost_factor', 'Boost Factor', { min: 0, max: 10, precision: 3 }),
+      num(s, 'blur_radius', 'Blur Distance', { min: 0.5, max: 20, precision: 2 }),
+      num(s, 'quality', 'Quality', { int: true, min: 1, max: 5 }),
+      bool(s, 'use_only_boost', 'Only Boost'),
+    );
+  if (t === 'GAUSSIAN_BLUR') rows.push(num(s, 'size_x', 'Size X', { min: 0, softMax: 200, precision: 1 }), num(s, 'size_y', 'Y', { min: 0, softMax: 200, precision: 1 }));
+  if (t === 'SPEED') {
+    rows.push(enumProp(s, 'speed_control', 'Speed Control', [['STRETCH', 'Stretch'], ['MULTIPLY', 'Multiply'], ['FRAME_NUMBER', 'Frame Number'], ['LENGTH', 'Length']]));
+    if (s.speed_control === 'MULTIPLY') rows.push(num(s, 'speed_factor', 'Multiply Factor', { min: 0, softMax: 10, precision: 3 }));
+    if (s.speed_control === 'FRAME_NUMBER') rows.push(num(s, 'speed_frame_number', 'Frame Number', { min: 0, precision: 1 }));
+    if (s.speed_control === 'LENGTH') rows.push(num(s, 'speed_length', 'Length', { unit: 'percentage', min: 0, softMax: 200, precision: 1 }));
+  }
+  if (t === 'COLORMIX') rows.push(enumProp(s, 'blend_effect', 'Blending Mode', BLEND_ITEMS.filter(([v]) => !['REPLACE', 'CROSS', 'ALPHA_OVER', 'ALPHA_UNDER', 'GAMMA_CROSS'].includes(v))), num(s, 'factor', 'Blend Factor', { min: 0, max: 1, slider: true, precision: 3 }));
+  if (t === 'TRANSFORM')
+    rows.push(
+      enumProp(s, 'translation_unit', 'Translation Unit', [['PIXELS', 'Pixels'], ['PERCENT', 'Percent']]),
+      num(s, 'translate_start_x', 'Position X', { precision: 1 }),
+      num(s, 'translate_start_y', 'Y', { precision: 1 }),
+      bool(s, 'use_uniform_scale', 'Uniform Scale'),
+      num(s, 'scale_start_x', s.use_uniform_scale ? 'Scale' : 'Scale X', { precision: 3 }),
+      s.use_uniform_scale ? null : num(s, 'scale_start_y', 'Y', { precision: 3 }),
+      num(s, 'rotation_start', 'Rotation', { precision: 2 }),
+    );
+  if (inputCount(t)) {
+    const names = seqList()
+      .filter((x) => x !== s && x.type !== 'SOUND')
+      .map((x) => ({ value: x.name, label: x.name, icon: stripIcon(x.type) }));
+    const setInput = (key: 'input_1' | 'input_2') => (v: string) => {
+      s[key] = v;
+      afterEdit();
+      app.pushUndo('Change Input');
+      app.changed('doc');
+    };
+    rows.push(splitRow('Input 1', enumMenu(`seq-in1-${oid(s)}`, names, s.input_1 ?? '', setInput('input_1'))));
+    if (inputCount(t) > 1) rows.push(splitRow('Input 2', enumMenu(`seq-in2-${oid(s)}`, names, s.input_2 ?? '', setInput('input_2'))));
+  }
+  if (!rows.length) return null;
+  return panel('seq-effect', t === 'TEXT' ? 'Effect Strip' : 'Effect Strip', () => rows);
+}
+
+function textStylePanels(s: Strip): Child {
+  if (s.type !== 'TEXT') return null;
+  return [
+    panel('seq-text-style', 'Style', () => [
+      num(s, 'font_size', 'Size', { min: 0, softMax: 2000, precision: 1 }),
+      splitRow('', h('div', { class: 'row-aligned' }, checkbox(`seq-bold-${oid(s)}`, 'Bold', !!s.use_bold, (v) => ((s.use_bold = v), app.pushUndo('Bold'), app.changed('doc'))), checkbox(`seq-italic-${oid(s)}`, 'Italic', !!s.use_italic, (v) => ((s.use_italic = v), app.pushUndo('Italic'), app.changed('doc'))))),
+      color(s as never, 'color', 'Color', true),
+      panel('seq-text-outline', h('span', null, checkbox(`seq-outl-${oid(s)}`, 'Outline', !!s.use_outline, (v) => ((s.use_outline = v), app.pushUndo('Outline'), app.changed('doc')))), () => [color(s as never, 'outline_color', 'Color', true), num(s, 'outline_width', 'Width', { min: 0, max: 1, slider: true, precision: 3 })], { sub: true, closed: true }),
+      panel('seq-text-shadow', h('span', null, checkbox(`seq-shad-${oid(s)}`, 'Shadow', !!s.use_shadow, (v) => ((s.use_shadow = v), app.pushUndo('Shadow'), app.changed('doc')))), () => [color(s as never, 'shadow_color', 'Color', true), num(s, 'shadow_angle', 'Angle', { unit: 'angle', min: 0, max: Math.PI * 2 }), num(s, 'shadow_offset', 'Offset', { min: 0, max: 1, slider: true, precision: 3 }), num(s, 'shadow_blur', 'Blur', { min: 0, max: 1, slider: true, precision: 3 })], { sub: true, closed: true }),
+      panel('seq-text-box', h('span', null, checkbox(`seq-box-${oid(s)}`, 'Box', !!s.use_box, (v) => ((s.use_box = v), app.pushUndo('Box'), app.changed('doc')))), () => [color(s as never, 'box_color', 'Color', true), num(s, 'box_margin', 'Margin', { min: 0, max: 1, slider: true, precision: 3 }), num(s, 'box_roundness', 'Roundness', { min: 0, max: 1, slider: true, precision: 3 })], { sub: true, closed: true }),
+    ]),
+    panel('seq-text-layout', 'Layout', () => {
+      const loc = s.location ?? [0.5, 0.5];
+      return [
+        splitRow('Location X', numberField({ id: `seq-locx-${oid(s)}`, value: loc[0], precision: 3, set: (v, f) => ((s.location = [v, loc[1]]), app.changed('doc'), f && app.pushUndo('Location')) })),
+        splitRow('Y', numberField({ id: `seq-locy-${oid(s)}`, value: loc[1], precision: 3, set: (v, f) => ((s.location = [loc[0], v]), app.changed('doc'), f && app.pushUndo('Location')) })),
+        enumProp(s, 'alignment_x', 'Alignment X', [['LEFT', 'Left'], ['CENTER', 'Center'], ['RIGHT', 'Right']]),
+        enumProp(s, 'anchor_x', 'Anchor X', [['LEFT', 'Left'], ['CENTER', 'Center'], ['RIGHT', 'Right']]),
+        enumProp(s, 'anchor_y', 'Y', [['BOTTOM', 'Bottom'], ['CENTER', 'Center'], ['TOP', 'Top']]),
+      ];
+    }),
+  ];
+}
+
+function compositingPanel(s: Strip): Child {
+  if (!isVisual(s)) return null;
+  return panel('seq-compositing', 'Compositing', () => [enumProp(s, 'blend_type', 'Blend', BLEND_ITEMS), num(s, 'blend_alpha', 'Opacity', { min: 0, max: 1, slider: true, precision: 3 })]);
+}
+
+function transformPanels(s: Strip): Child {
+  if (!isVisual(s)) return null;
+  const t = s.transform,
+    c = s.crop;
+  return [
+    panel('seq-transform', 'Transform', () => [
+      num(t, 'offset_x', 'Position X', { unit: 'pixel', precision: 0 }),
+      num(t, 'offset_y', 'Y', { unit: 'pixel', precision: 0 }),
+      num(t, 'scale_x', 'Scale X', { precision: 3 }),
+      num(t, 'scale_y', 'Y', { precision: 3 }),
+      num(t, 'rotation', 'Rotation', { unit: 'angle' }),
+      splitRow('Origin X', numberField({ id: `seq-orx-${oid(s)}`, value: t.origin[0], precision: 3, set: (v, f) => ((t.origin = [v, t.origin[1]]), app.changed('doc'), f && app.pushUndo('Origin')) })),
+      splitRow('Y', numberField({ id: `seq-ory-${oid(s)}`, value: t.origin[1], precision: 3, set: (v, f) => ((t.origin = [t.origin[0], v]), app.changed('doc'), f && app.pushUndo('Origin')) })),
+      splitRow('Mirror', h('div', { class: 'row-aligned' }, checkbox(`seq-fx-${oid(s)}`, 'X', s.use_flip_x, (v) => ((s.use_flip_x = v), app.pushUndo('Mirror'), app.changed('doc'))), checkbox(`seq-fy-${oid(s)}`, 'Y', s.use_flip_y, (v) => ((s.use_flip_y = v), app.pushUndo('Mirror'), app.changed('doc'))))),
+      enumProp(t, 'filter', 'Filter', [['AUTO', 'Auto'], ['NEAREST', 'Nearest'], ['BILINEAR', 'Bilinear']]),
+    ]),
+    panel('seq-crop', 'Crop', () => [num(c, 'min_x', 'Left', { int: true, min: 0, unit: 'pixel' }), num(c, 'max_x', 'Right', { int: true, min: 0, unit: 'pixel' }), num(c, 'max_y', 'Top', { int: true, min: 0, unit: 'pixel' }), num(c, 'min_y', 'Bottom', { int: true, min: 0, unit: 'pixel' })], { closed: true }),
+  ];
+}
+
+function videoColorPanels(s: Strip): Child {
+  if (!isVisual(s)) return null;
+  const out: Child[] = [];
+  if (['MOVIE', 'IMAGE', 'SCENE', 'META'].includes(s.type)) out.push(panel('seq-video', 'Video', () => [num(s, 'strobe', 'Strobe', { min: 1, max: 30, precision: 1 }), bool(s, 'use_reverse_frames', 'Reverse Frames')], { closed: true }));
+  out.push(panel('seq-color', 'Color', () => [num(s, 'color_saturation', 'Saturation', { min: 0, max: 20, softMax: 2, precision: 3 }), num(s, 'color_multiply', 'Multiply', { min: 0, max: 20, softMax: 2, precision: 3 }), bool(s, 'multiply_alpha', 'Multiply Alpha')], { closed: true }));
+  return out;
+}
+
+function soundPanel(s: Strip): Child {
+  if (s.type !== 'SOUND' && s.type !== 'SCENE') return null;
+  if (s.type === 'SCENE') return null;
+  return panel('seq-sound', 'Sound', () => [num(s, 'volume', 'Volume', { min: 0, max: 100, softMax: 2, precision: 3, ...edited }), num(s, 'pan', 'Pan', { min: -1, max: 1, slider: true, precision: 3, ...edited }), bool(s, 'show_waveform', 'Display Waveform'), num(s, 'sound_offset', 'Sound Offset', { unit: 'time', precision: 3, ...edited })]);
+}
+
+function sourcePanel(s: Strip): Child {
+  const rows: Child[] = [];
+  if (s.media && (s.type === 'MOVIE' || s.type === 'SOUND' || s.type === 'IMAGE')) rows.push(splitRow('File', h('span', { class: 'seq-src' }, s.media.filepath)), splitRow('Size', h('span', { class: 'seq-src' }, fmtBytes(s.media.bytes.byteLength))));
+  if (s.type === 'IMAGE' && s.elements?.length) {
+    rows.push(splitRow('File', h('span', { class: 'seq-src' }, s.elements.length > 1 ? `${s.elements[0].filename} … (${s.elements.length} images)` : s.elements[0].filename)));
+    rows.push(splitRow('Size', h('span', { class: 'seq-src' }, fmtBytes(s.elements.reduce((n, e) => n + e.bytes.byteLength, 0)))));
+  }
+  if (s.orig_width) rows.push(splitRow('Resolution', h('span', { class: 'seq-src' }, `${s.orig_width} × ${s.orig_height}`)));
+  if (s.type === 'MOVIE') rows.push(splitRow('FPS', h('span', { class: 'seq-src' }, s.fps ? `${+s.fps.toFixed(3)}` : '—')));
+  if (s.type === 'SCENE') {
+    const doc = app.doc;
+    const cams = doc.object_order.map((id) => doc.objects[id]).filter((o) => o?.type === 'CAMERA');
+    rows.push(splitRow('Scene', h('span', { class: 'seq-src' }, s.scene ?? doc.scene.name)));
+    rows.push(
+      splitRow(
+        'Camera',
+        enumMenu(`seq-cam-${oid(s)}`, [{ value: '', label: 'Scene Camera', icon: 'scene_data' }, ...cams.map((c) => ({ value: c.id, label: c.name, icon: 'outliner_ob_camera' }))], s.scene_camera ?? '', (v) => {
+          s.scene_camera = v || null;
+          app.pushUndo('Change Camera');
+          app.changed('doc');
+        }),
+      ),
+    );
+  }
+  if (!rows.length) return null;
+  return panel('seq-source', 'Source', () => rows);
+}
+
+function timePanel(s: Strip): Child {
+  const effectRange = !!inputCount(s.type);
+  return panel('seq-time', 'Time', () => [
+    frameField(`seq-ch-${oid(s)}`, 'Channel', s.channel, (v) => {
+      s.channel = Math.max(1, Math.min(128, v));
+      resolveOverlap(seqList(), [s], toolSettings().overlap_mode);
+    }),
+    frameField(`seq-start-${oid(s)}`, 'Start', finalStart(s), (v) => {
+      translateStrip(s, v - finalStart(s));
+      resolveOverlap(seqList(), [s], toolSettings().overlap_mode);
+    }, effectRange || s.lock),
+    frameField(`seq-dur-${oid(s)}`, 'Duration', finalDuration(s), (v) => setRightHandle(s, finalStart(s) + Math.max(1, v)), effectRange || s.lock),
+    frameField(`seq-end-${oid(s)}`, 'End', finalEnd(s), (v) => setRightHandle(s, v), effectRange || s.lock),
+    isStill(s) || effectRange
+      ? null
+      : [
+          frameField(`seq-os-${oid(s)}`, 'Strip Offset Start', s.frame_offset_start, (v) => setLeftHandle(s, s.frame_start + Math.max(0, v)), s.lock),
+          frameField(`seq-oe-${oid(s)}`, 'End', s.frame_offset_end, (v) => setRightHandle(s, s.frame_start + s.frame_duration - Math.max(0, v)), s.lock),
+          splitRow('Hold Offset Start', h('span', { class: 'seq-src' }, String(s.animation_offset_start))),
+          splitRow('End', h('span', { class: 'seq-src' }, String(s.animation_offset_end))),
+        ],
+    splitRow('Current Frame', h('span', { class: 'seq-src' }, String(app.doc.scene.frame_current - s.frame_start))),
+    splitRow('', checkbox(`seq-lock-${oid(s)}`, 'Lock', s.lock, (v) => ((s.lock = v), app.pushUndo(v ? 'Lock Strip' : 'Unlock Strip'), app.changed('doc')))),
+    splitRow('Length', h('span', { class: 'seq-src' }, `${(finalDuration(s) / sceneFps()).toFixed(2)} s`)),
+  ]);
+}
+
+function fmtBytes(n: number) {
+  return n > 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MiB` : `${Math.ceil(n / 1024)} KiB`;
+}
+
+export function stripTab(): Child {
+  if (!hasEditor()) return h('div', { class: 'sb-empty' }, 'No active strip');
+  const s = activeStrip();
+  if (!s) return h('div', { class: 'sb-empty' }, 'No active strip');
+  return [stripHeader(s), effectPanel(s), textStylePanels(s), compositingPanel(s), transformPanels(s), videoColorPanels(s), soundPanel(s), sourcePanel(s), timePanel(s)];
+}
+
+// ---------------------------------------------------------------------------
+// modifiers
+
+function vec3Rows(owner: ColorBalanceData, key: 'lift' | 'gamma' | 'gain' | 'offset' | 'power' | 'slope', label: string, invKey: keyof ColorBalanceData) {
+  const v = owner[key];
+  return h(
+    'div',
+    { class: 'seq-cb-col' },
+    h('div', { class: 'seq-cb-title' }, label),
+    colorSwatch(`seq-cb-${oid(owner)}-${key}`, v.map((x) => Math.max(0, Math.min(1, x / 2))), (nv, final) => {
+      owner[key] = [nv[0] * 2, nv[1] * 2, nv[2] * 2];
+      app.changed('doc');
+      if (final) app.pushUndo(`Change ${label}`);
+    }, { linear: false }),
+    ...v.map((x, i) =>
+      numberField({
+        id: `seq-cb-${oid(owner)}-${key}-${i}`,
+        label: 'RGB'[i],
+        value: x,
+        min: 0,
+        softMax: 2,
+        precision: 3,
+        set: (nv, final) => {
+          const a = [...owner[key]] as [number, number, number];
+          a[i] = nv;
+          owner[key] = a;
+          app.changed('doc');
+          if (final) app.pushUndo(`Change ${label}`);
+        },
+      }),
+    ),
+    checkbox(`seq-cb-${oid(owner)}-${String(invKey)}`, 'Inverse', !!owner[invKey], (b) => (((owner as unknown as Record<string, boolean>)[invKey as string] = b), app.pushUndo('Invert'), app.changed('doc'))),
+  );
+}
+
+function modifierPanel(s: Strip, m: StripModifier, i: number): Child {
+  const header = h(
+    'span',
+    { class: 'seq-mod-hd' },
+    h('button', { class: { 'hdr-toggle': true, on: !m.mute }, 'data-tip': 'Mute\nMute this modifier', onclick: () => ((m.mute = !m.mute), app.pushUndo('Mute Modifier'), app.changed('doc')) }, icon(m.mute ? 'checkbox_dehlt' : 'checkbox_hlt')),
+    textField(`seq-mod-name-${oid(m)}`, m.name, (v) => {
+      if (!v || s.modifiers.some((x) => x !== m && x.name === v)) return;
+      m.name = v;
+      app.pushUndo('Rename Modifier');
+      app.changed('doc');
+    }),
+    button(`seq-mod-up-${i}`, icon('triangle_up'), () => app.run('sequencer.strip_modifier_move', { name: m.name, direction: 'UP' }), { tip: 'Move Up', disabled: i === 0 }),
+    button(`seq-mod-down-${i}`, icon('triangle_down'), () => app.run('sequencer.strip_modifier_move', { name: m.name, direction: 'DOWN' }), { tip: 'Move Down', disabled: i === s.modifiers.length - 1 }),
+    button(`seq-mod-x-${i}`, icon('x'), () => app.run('sequencer.strip_modifier_remove', { name: m.name }), { tip: 'Remove Modifier' }),
+  );
+  return panel(`seq-mod-${i}-${m.type}`, '', () => {
+    if (m.type === 'BRIGHT_CONTRAST') return [num(m, 'bright', 'Brightness', { precision: 3 }), num(m, 'contrast', 'Contrast', { min: -100, max: 100, precision: 3 })];
+    const cb = m.color_balance!;
+    const lgg = cb.correction_method === 'LIFT_GAMMA_GAIN';
+    return [
+      enumProp(cb, 'correction_method', 'Color Balance', [['LIFT_GAMMA_GAIN', 'Lift/Gamma/Gain'], ['OFFSET_POWER_SLOPE', 'Offset/Power/Slope (ASC-CDL)']]),
+      h(
+        'div',
+        { class: 'seq-cb' },
+        lgg ? [vec3Rows(cb, 'lift', 'Lift', 'invert_lift'), vec3Rows(cb, 'gamma', 'Gamma', 'invert_gamma'), vec3Rows(cb, 'gain', 'Gain', 'invert_gain')] : [vec3Rows(cb, 'offset', 'Offset', 'invert_offset'), vec3Rows(cb, 'power', 'Power', 'invert_power'), vec3Rows(cb, 'slope', 'Slope', 'invert_slope')],
+      ),
+      num(m, 'color_multiply', 'Multiply', { min: 0, max: 20, softMax: 2, precision: 3 }),
+    ];
+  }, { header, className: 'seq-mod-panel' });
+}
+
+export function modifiersTab(): Child {
+  const s = hasEditor() ? activeStrip() : null;
+  if (!s) return h('div', { class: 'sb-empty' }, 'No active strip');
+  if (s.type === 'SOUND') return h('div', { class: 'sb-empty' }, 'Sound strips have no image modifiers');
+  return [
+    stripHeader(s),
+    h(
+      'div',
+      { class: 'seq-mod-add' },
+      h(
+        'button',
+        {
+          class: 'btn seq-add-mod',
+          'data-tip': 'Add Modifier\nAdd a modifier to the active strip',
+          onpointerdown: (e: PointerEvent) => {
+            e.preventDefault();
+            openMenu(
+              [
+                { label: 'Color Balance', icon: 'seq_color', op: 'sequencer.strip_modifier_add', props: { type: 'COLOR_BALANCE' } },
+                { label: 'Brightness/Contrast', icon: 'seq_adjustment', op: 'sequencer.strip_modifier_add', props: { type: 'BRIGHT_CONTRAST' } },
+              ],
+              e.currentTarget as HTMLElement,
+            );
+          },
+        },
+        icon('add'),
+        'Add Modifier',
+        icon('down_arrow_hlt', 'tiny'),
+      ),
+    ),
+    s.modifiers.map((m, i) => modifierPanel(s, m, i)),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// cache
+
+export function cacheTab(info: { previewSize: string; renderMs: number; scale: number }): Child {
+  const st = movieCacheStats();
+  return [
+    panel('seq-cache', 'Cache', () => [
+      splitRow('Movies', h('span', { class: 'seq-src' }, String(st.movies))),
+      splitRow('Cached Frames', h('span', { class: 'seq-src' }, String(st.frames))),
+      splitRow('', opButton('sequencer.refresh_all', 'Clear Cache', {}, { icon: 'file_refresh' })),
+    ]),
+    panel('seq-proxy', 'Preview', () => [
+      splitRow('Preview Size', h('span', { class: 'seq-src' }, info.previewSize === 'AUTO' ? `Automatic (${Math.round(info.scale * 100)}%)` : info.previewSize === 'SCENE' ? 'Scene Size' : `${info.previewSize.slice(6)}%`)),
+      splitRow('Last Render', h('span', { class: 'seq-src' }, `${info.renderMs.toFixed(1)} ms`)),
+    ]),
+  ];
+}

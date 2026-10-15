@@ -1,0 +1,12 @@
+// nodes subsystem entry point: import feature files here for their registration side effects.
+import './common';
+import './shader/defs';
+import './shader/nodegen';
+import './shader/material';
+import './shader/world';
+import './editor/nodes.css';
+import './editor/ops';
+import './editor/rampui';
+import './editor/shaderprovider';
+import './properties';
+export {};

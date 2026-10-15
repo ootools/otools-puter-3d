@@ -1,0 +1,277 @@
+// Preview region: shows the sequencer output at the current frame (GPU composite), with zoom/pan,
+// selection outlines and image transforms of the selected strips.
+import { app } from '../app/app';
+import { withCompositor, SequencerRender, Cancelled } from './render';
+import { renderScenePreview } from './scene';
+import { pauseIdleMovies } from './media';
+import { stripImageCorners, previewStrips, pointInPoly } from './transform';
+import { activeStrip, hasEditor } from './context';
+import { T } from './theme';
+
+export type PreviewSize = 'AUTO' | 'SCENE' | 'PROXY_75' | 'PROXY_50' | 'PROXY_25';
+
+export class PreviewRegion {
+  el: HTMLElement;
+  canvas: HTMLCanvasElement;
+  /** last composited frame */
+  private frame: HTMLCanvasElement;
+  private hasFrame = false;
+  zoom = 1;
+  panX = 0;
+  panY = 0;
+  /** zoom 1 = fit the region */
+  fitted = true;
+  size: PreviewSize = 'AUTO';
+  scale = 1;
+  renderMs = 0;
+  private dirty = true;
+  private busy = false;
+  private gen = 0;
+  private disposed = false;
+  showOverlays = true;
+  boxRect: { x0: number; y0: number; x1: number; y1: number } | null = null;
+
+  constructor(private onRendered: () => void) {
+    this.el = document.createElement('div');
+    this.el.className = 'seq-pv';
+    this.canvas = document.createElement('canvas');
+    this.canvas.className = 'seq-pv-canvas';
+    this.el.append(this.canvas);
+    this.frame = document.createElement('canvas');
+    new ResizeObserver(() => !this.disposed && this.draw()).observe(this.el);
+  }
+
+  dispose() {
+    this.disposed = true;
+    this.gen++;
+  }
+
+  // ------------------------------------------------------------------ geometry
+
+  private res(): [number, number] {
+    const r = app.doc.scene.render;
+    return [Math.max(1, r.resolution_x), Math.max(1, r.resolution_y)];
+  }
+
+  /** Display px per output px and the frame's top-left corner (CSS px, region-local). */
+  layout() {
+    const [W, H] = this.res();
+    const w = this.el.clientWidth,
+      h = this.el.clientHeight;
+    const aspect = (app.doc.scene.render.pixel_aspect_x || 1) / (app.doc.scene.render.pixel_aspect_y || 1);
+    const fit = Math.min((w - 16) / (W * aspect), (h - 16) / H);
+    const s = Math.max(1e-4, fit * this.zoom);
+    const left = (w - W * aspect * s) / 2 + this.panX;
+    const top = (h - H * s) / 2 + this.panY;
+    return { s, sx: s * aspect, left, top, W, H, fit };
+  }
+
+  /** client px → output px (y up) */
+  toFrame(clientX: number, clientY: number): [number, number] {
+    const r = this.el.getBoundingClientRect();
+    const L = this.layout();
+    return [(clientX - r.left - L.left) / L.sx, L.H - (clientY - r.top - L.top) / L.s];
+  }
+
+  toLocal(fx: number, fy: number): [number, number] {
+    const L = this.layout();
+    return [L.left + fx * L.sx, L.top + (L.H - fy) * L.s];
+  }
+
+  fit() {
+    this.zoom = 1;
+    this.panX = this.panY = 0;
+    this.fitted = true;
+    this.draw();
+    this.request();
+  }
+
+  /** zoom ratio relative to 1 output pixel per display pixel */
+  setRatio(r: number) {
+    const L = this.layout();
+    this.zoom = r / L.fit;
+    this.panX = this.panY = 0;
+    this.fitted = false;
+    this.draw();
+    this.request();
+  }
+
+  zoomAt(factor: number, clientX: number, clientY: number) {
+    const r = this.el.getBoundingClientRect();
+    const mx = clientX - r.left - this.el.clientWidth / 2,
+      my = clientY - r.top - this.el.clientHeight / 2;
+    const nz = Math.max(0.05, Math.min(40, this.zoom * factor));
+    const k = nz / this.zoom;
+    this.panX = mx - (mx - this.panX) * k;
+    this.panY = my - (my - this.panY) * k;
+    this.zoom = nz;
+    this.fitted = false;
+    this.draw();
+    this.request();
+  }
+
+  /** composite scale: output px → composited px */
+  private compositeScale(): number {
+    switch (this.size) {
+      case 'SCENE':
+        return 1;
+      case 'PROXY_75':
+        return 0.75;
+      case 'PROXY_50':
+        return 0.5;
+      case 'PROXY_25':
+        return 0.25;
+    }
+    const L = this.layout();
+    const dpr = Math.min(2, devicePixelRatio || 1);
+    const need = L.s * dpr;
+    for (const k of [0.125, 0.25, 0.375, 0.5, 0.75]) if (need <= k) return k;
+    return 1;
+  }
+
+  // ------------------------------------------------------------------ rendering
+
+  request() {
+    this.dirty = true;
+    if (!this.busy) void this.loop();
+  }
+
+  private async loop() {
+    while (this.dirty && !this.disposed) {
+      this.dirty = false;
+      this.busy = true;
+      const my = ++this.gen;
+      const t0 = performance.now();
+      try {
+        await this.renderOnce(my);
+      } catch (e) {
+        if (!(e instanceof Cancelled)) console.error('sequencer preview', e);
+      }
+      this.renderMs = performance.now() - t0;
+      this.busy = false;
+      if (my === this.gen) {
+        this.draw();
+        this.onRendered();
+      }
+      if (app.playing) await new Promise((r) => requestAnimationFrame(r));
+    }
+    pauseIdleMovies();
+  }
+
+  private async renderOnce(my: number) {
+    const ed = app.doc.scene.sequence_editor;
+    const [W, H] = this.res();
+    const k = this.compositeScale();
+    this.scale = k;
+    const s = app.doc.scene;
+    if (!ed || !ed.strips.length) {
+      this.hasFrame = false;
+      return;
+    }
+    const frame = s.frame_current;
+    await withCompositor(async (comp) => {
+      if (my !== this.gen) throw new Cancelled();
+      const sr = new SequencerRender(comp, {
+        W,
+        H,
+        k,
+        live: !!app.playing,
+        fps: s.render.fps / (s.render.fps_base || 1),
+        sceneStart: s.frame_start,
+        sceneImage: renderScenePreview,
+        cancelled: () => my !== this.gen || this.disposed,
+      });
+      const t = await sr.render(ed, frame);
+      comp.present(t);
+      comp.release(t);
+      const f = this.frame;
+      if (f.width !== comp.canvas.width || f.height !== comp.canvas.height) {
+        f.width = comp.canvas.width;
+        f.height = comp.canvas.height;
+      }
+      const g = f.getContext('2d')!;
+      g.clearRect(0, 0, f.width, f.height);
+      g.drawImage(comp.canvas, 0, 0);
+      this.hasFrame = true;
+    });
+  }
+
+  // ------------------------------------------------------------------ display
+
+  draw() {
+    const c = this.canvas;
+    const w = this.el.clientWidth,
+      h = this.el.clientHeight;
+    if (!w || !h) return;
+    const dpr = Math.min(2, devicePixelRatio || 1);
+    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+      c.width = Math.round(w * dpr);
+      c.height = Math.round(h * dpr);
+      c.style.width = `${w}px`;
+      c.style.height = `${h}px`;
+    }
+    const g = c.getContext('2d')!;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.fillStyle = T.previewBack;
+    g.fillRect(0, 0, w, h);
+    const L = this.layout();
+    const fw = L.W * L.sx,
+      fh = L.H * L.s;
+    if (this.hasFrame) {
+      g.imageSmoothingEnabled = L.s < 2;
+      g.imageSmoothingQuality = 'high';
+      g.drawImage(this.frame, L.left, L.top, fw, fh);
+    }
+    // frame border
+    g.strokeStyle = 'rgba(255,255,255,0.12)';
+    g.lineWidth = 1;
+    g.strokeRect(Math.round(L.left) - 0.5, Math.round(L.top) - 0.5, Math.round(fw) + 1, Math.round(fh) + 1);
+    if (this.showOverlays && hasEditor()) this.drawOverlays(g);
+    if (this.boxRect) {
+      const b = this.boxRect;
+      g.fillStyle = 'rgba(255,255,255,0.06)';
+      g.strokeStyle = 'rgba(255,255,255,0.8)';
+      g.setLineDash([4, 3]);
+      g.fillRect(Math.min(b.x0, b.x1), Math.min(b.y0, b.y1), Math.abs(b.x1 - b.x0), Math.abs(b.y1 - b.y0));
+      g.strokeRect(Math.min(b.x0, b.x1) + 0.5, Math.min(b.y0, b.y1) + 0.5, Math.abs(b.x1 - b.x0), Math.abs(b.y1 - b.y0));
+      g.setLineDash([]);
+    }
+  }
+
+  private drawOverlays(g: CanvasRenderingContext2D) {
+    const [W, H] = this.res();
+    const act = activeStrip();
+    for (const s of previewStrips(app.doc.scene.frame_current)) {
+      if (!s.select) continue;
+      const pts = stripImageCorners(s, W, H).map(([x, y]) => this.toLocal(x, y));
+      g.strokeStyle = s === act ? T.active : T.selected;
+      g.lineWidth = s === act ? 2 : 1.5;
+      g.beginPath();
+      pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
+      g.closePath();
+      g.stroke();
+    }
+  }
+
+  /** Topmost visible strip whose image contains the client point. */
+  stripAt(clientX: number, clientY: number) {
+    const [W, H] = this.res();
+    const [fx, fy] = this.toFrame(clientX, clientY);
+    const list = previewStrips(app.doc.scene.frame_current);
+    // selected strips under the cursor win when cycling is not needed
+    for (const s of list) if (pointInPoly(fx, fy, stripImageCorners(s, W, H))) return s;
+    return null;
+  }
+
+  /** Strips whose image centre lies inside a client rectangle. */
+  stripsInRect(x0: number, y0: number, x1: number, y1: number) {
+    const [W, H] = this.res();
+    const r = this.el.getBoundingClientRect();
+    return previewStrips(app.doc.scene.frame_current).filter((s) => {
+      const c = stripImageCorners(s, W, H).map(([x, y]) => this.toLocal(x, y));
+      const cx = c.reduce((a, p) => a + p[0], 0) / 4 + r.left,
+        cy = c.reduce((a, p) => a + p[1], 0) / 4 + r.top;
+      return cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1;
+    });
+  }
+}

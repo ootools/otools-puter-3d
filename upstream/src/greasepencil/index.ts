@@ -1,0 +1,38 @@
+// Grease Pencil: 2D drawing in 3D (layers, keyframes, strokes with fills), Draw / Edit / Sculpt
+// modes, onion skins, dope sheet mode, properties and the 2D Animation workspace.
+// Imported for registration side effects from src/modules.ts.
+import './icons';
+import './ops';
+import './modes';
+import './render';
+import './paint';
+import './ui';
+import './sculpt';
+import './edit';
+import './properties';
+import './dopesheet';
+import './workspace';
+import { addMenuHooks } from '../editors/view3d/menus';
+
+addMenuHooks.push(() => [
+  {
+    label: 'Grease Pencil',
+    icon: 'outliner_ob_greasepencil',
+    submenu: () => [
+      {
+        label: 'Blank',
+        icon: 'greasepencil',
+        op: 'object.grease_pencil_add',
+        props: { type: 'EMPTY' },
+      },
+      {
+        label: 'Stroke',
+        icon: 'gp_draw',
+        op: 'object.grease_pencil_add',
+        props: { type: 'STROKE' },
+      },
+    ],
+  },
+]);
+
+export {};

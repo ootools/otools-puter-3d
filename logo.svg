@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="3D">
+  <defs>
+    <linearGradient id="b3dbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2ec5b6"/>
+      <stop offset="1" stop-color="#0e9384"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#b3dbg)"/>
+  <!-- 等距立方体：顶面 / 左面 / 右面 -->
+  <path d="M128 42l72 42-72 42-72-42z" fill="#ffffff"/>
+  <path d="M56 84v84l72 42v-84z" fill="#0b6f65"/>
+  <path d="M200 84v84l-72 42v-84z" fill="#0a8578"/>
+  <!-- 网格地面 -->
+  <g stroke="#ffffff" stroke-width="5" stroke-linecap="round" opacity="0.55">
+    <path d="M44 206h168"/>
+    <path d="M66 222h124"/>
+  </g>
+</svg>

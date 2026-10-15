@@ -1,0 +1,209 @@
+// Realtime (raster) renderer: HDR scene pass with MSAA, ground-truth ambient occlusion and bloom,
+// producing a scene-linear premultiplied buffer that is colour-managed for display afterwards.
+import { Color, ShaderMaterial, NoBlending, Vector2, MeshBasicMaterial, type Camera, type Scene, type Texture, type WebGLRenderer, type WebGLRenderTarget } from 'three';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import type { RenderSettings } from '../../data/types';
+import { floatTarget, Blit } from './gbuffer';
+import { displayGLSL, VIEW_INDEX, type ViewTransform } from './colormanage';
+
+export interface RasterEffects {
+  gtao: boolean;
+  gtaoDistance: number;
+  bloom: boolean;
+  bloomThreshold: number;
+  bloomIntensity: number;
+  bloomRadius: number;
+  transparent: boolean;
+}
+
+export function effectsFrom(r: RenderSettings): RasterEffects {
+  return {
+    gtao: r.use_gtao,
+    gtaoDistance: r.gtao_distance,
+    bloom: r.use_bloom,
+    bloomThreshold: r.bloom_threshold,
+    bloomIntensity: r.bloom_intensity,
+    bloomRadius: r.bloom_radius,
+    transparent: r.film_transparent,
+  };
+}
+
+/** Map the reference bloom settings onto the bloom pass (strength, radius 0..1). */
+export function bloomParams(intensity: number, radius: number): { strength: number; radius: number } {
+  return { strength: Math.max(0, intensity) * 12, radius: Math.min(1, Math.max(0, radius / 10)) };
+}
+
+export class RasterRenderer {
+  private composer: EffectComposer | null = null;
+  private renderPass: RenderPass | null = null;
+  private gtao: GTAOPass | null = null;
+  private bloom: UnrealBloomPass | null = null;
+  private size = new Vector2();
+
+  constructor(private samples = 4) {}
+
+  private ensure(renderer: WebGLRenderer, scene: Scene, camera: Camera, w: number, h: number) {
+    if (!this.composer) {
+      const rt = floatTarget(w, h, { half: true, linear: true, samples: this.samples });
+      this.composer = new EffectComposer(renderer, rt);
+      this.composer.renderToScreen = false;
+      this.composer.setPixelRatio(1);
+      this.renderPass = new RenderPass(scene, camera);
+      this.composer.addPass(this.renderPass);
+    }
+    if (this.size.x !== w || this.size.y !== h) {
+      this.size.set(w, h);
+      this.composer.setSize(w, h);
+    }
+    this.renderPass!.scene = scene;
+    this.renderPass!.camera = camera;
+  }
+
+  /** Render into the composer and return the linear HDR result texture. */
+  render(renderer: WebGLRenderer, scene: Scene, camera: Camera, w: number, h: number, fx: RasterEffects): Texture {
+    this.ensure(renderer, scene, camera, w, h);
+    const composer = this.composer!;
+    const rp = this.renderPass!;
+    rp.clearColor = new Color(0, 0, 0);
+    rp.clearAlpha = 0;
+    // ambient occlusion
+    if (fx.gtao) {
+      if (!this.gtao) {
+        this.gtao = new GTAOPass(scene, camera, w, h);
+        composer.insertPass(this.gtao, 1);
+      }
+      this.gtao.scene = scene;
+      this.gtao.camera = camera;
+      this.gtao.enabled = true;
+      this.gtao.updateGtaoMaterial({ radius: Math.max(0.01, fx.gtaoDistance) * 2, distanceExponent: 1, thickness: 1, scale: 1, samples: 16 });
+      this.gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 6, rings: 2, samples: 16 });
+      this.gtao.blendIntensity = 1;
+    } else if (this.gtao) this.gtao.enabled = false;
+    // bloom
+    if (fx.bloom) {
+      const p = bloomParams(fx.bloomIntensity, fx.bloomRadius);
+      if (!this.bloom) {
+        this.bloom = new UnrealBloomPass(new Vector2(w, h), p.strength, p.radius, fx.bloomThreshold);
+        composer.addPass(this.bloom);
+      }
+      this.bloom.enabled = true;
+      this.bloom.strength = p.strength;
+      this.bloom.radius = p.radius;
+      this.bloom.threshold = fx.bloomThreshold;
+    } else if (this.bloom) this.bloom.enabled = false;
+    const tm = renderer.toneMapping;
+    const scissor = renderer.getScissorTest();
+    const prev = renderer.getRenderTarget();
+    renderer.setScissorTest(false);
+    renderer.toneMapping = 0; // NoToneMapping: keep scene-linear values
+    composer.render();
+    renderer.toneMapping = tm;
+    renderer.setRenderTarget(prev);
+    renderer.setScissorTest(scissor);
+    return composer.readBuffer.texture;
+  }
+
+  dispose() {
+    this.composer?.dispose();
+    this.gtao?.dispose();
+    this.bloom?.dispose();
+    this.composer = null;
+    this.gtao = null;
+    this.bloom = null;
+    this.size.set(0, 0);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// display (colour management on the GPU) & accumulation
+
+export const displayMaterial = new ShaderMaterial({
+  blending: NoBlending,
+  depthTest: false,
+  depthWrite: false,
+  toneMapped: false,
+  uniforms: {
+    tMap: { value: null as Texture | null },
+    uView: { value: 1 },
+    uExposure: { value: 1 },
+    uInvGamma: { value: 1 },
+    uBg: { value: new Color() },
+    uComposite: { value: 1 },
+  },
+  vertexShader: /* glsl */ `varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tMap; uniform int uView; uniform float uExposure; uniform float uInvGamma; uniform vec3 uBg; uniform float uComposite;
+    varying vec2 vUv;
+    ${displayGLSL}
+    void main() {
+      vec4 p = texture2D(tMap, vUv);
+      if (uComposite > 0.5) { p.rgb += uBg * (1.0 - clamp(p.a, 0.0, 1.0)); p.a = 1.0; }
+      gl_FragColor = cmDisplay(p, uView, uExposure, uInvGamma);
+    }`,
+});
+
+export function setDisplay(view: ViewTransform, exposure: number, gamma: number, bg: Color | null) {
+  const u = displayMaterial.uniforms;
+  u.uView.value = VIEW_INDEX[view] ?? 1;
+  u.uExposure.value = Math.pow(2, exposure);
+  u.uInvGamma.value = gamma > 0 ? 1 / gamma : 1;
+  u.uComposite.value = bg ? 1 : 0;
+  if (bg) u.uBg.value.copy(bg);
+}
+
+const accumMaterial = new ShaderMaterial({
+  blending: NoBlending,
+  depthTest: false,
+  depthWrite: false,
+  uniforms: { tPrev: { value: null }, tNew: { value: null }, uWeight: { value: 1 } },
+  vertexShader: /* glsl */ `varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tPrev; uniform sampler2D tNew; uniform float uWeight; varying vec2 vUv;
+    void main() { gl_FragColor = mix(texture2D(tPrev, vUv), texture2D(tNew, vUv), uWeight); }`,
+});
+
+/** Running average of sample images (ping-pong float targets). */
+export class Accumulator {
+  private a: WebGLRenderTarget | null = null;
+  private b: WebGLRenderTarget | null = null;
+  count = 0;
+  private blit = new Blit();
+
+  reset(w: number, h: number) {
+    for (const k of ['a', 'b'] as const) {
+      const t = this[k];
+      if (!t) this[k] = floatTarget(w, h, { depth: false });
+      else if (t.width !== w || t.height !== h) t.setSize(w, h);
+    }
+    this.count = 0;
+  }
+
+  add(renderer: WebGLRenderer, tex: Texture) {
+    const u = accumMaterial.uniforms;
+    u.tPrev.value = this.a!.texture;
+    u.tNew.value = tex;
+    u.uWeight.value = 1 / (this.count + 1);
+    const scissor = renderer.getScissorTest();
+    renderer.setScissorTest(false);
+    this.blit.draw(renderer, accumMaterial, this.b);
+    renderer.setScissorTest(scissor);
+    [this.a, this.b] = [this.b, this.a];
+    this.count++;
+  }
+
+  get target(): WebGLRenderTarget {
+    return this.a!;
+  }
+
+  dispose() {
+    this.a?.dispose();
+    this.b?.dispose();
+    this.a = this.b = null;
+  }
+}
+
+/** Depth-only material used to give viewport overlays correct occlusion. */
+export const depthOnlyMaterial = new MeshBasicMaterial({ colorWrite: false });

@@ -1,0 +1,12 @@
+{
+  "repo": "HeyPuter/everything",
+  "url": "https://github.com/HeyPuter/everything.git",
+  "subpath": "src/3d",
+  "ref": "main",
+  "commit": "3d9d7244f6a55fbaabfd04b73d417fffb12ef3a8",
+  "commitDate": "2026-10-14T16:30:21-07:00",
+  "fetchedAt": "2026-10-15T00:35:34.509Z",
+  "fileCount": 517,
+  "treeHash": "d6c8a46f49e900548fe9364595d379199752189143363c51b5c7d38541715ce6",
+  "note": "upstream/ 是此提交下 src/3d 的原样快照，不要就地修改；移植改动放 shell/。"
+}

@@ -1,0 +1,29 @@
+{
+  "devUrl": "http://127.0.0.1:5519",
+  "developerName": "jry",
+  "displayName": "3D",
+  "displayNameCN": "3D 建模",
+  "entry": "dist/index.html",
+  "quickDev": true,
+  "hasAd": false,
+  "icon": "🧊",
+  "inPluginPurchase": false,
+  "key": [
+    "3d",
+    "model",
+    "mesh",
+    "gltf",
+    "usd",
+    "sculpt",
+    "建模",
+    "三维",
+    "网格",
+    "渲染"
+  ],
+  "openInBrowser": false,
+  "packid": "otools-puter-3d",
+  "screenshots": [],
+  "summary": "3D（HeyPuter/everything 的浏览器端三维场景编辑器）的 OTools 插件版：建模、雕刻、着色、几何节点、动画与渲染。场景文件是本机目录里的普通文件，不走任何云账号。",
+  "uuid": "otools-puter-3d",
+  "version": "0.1.0"
+}

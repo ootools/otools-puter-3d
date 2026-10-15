@@ -1,0 +1,17 @@
+// Mode modules: mesh edit mode (and other edit modes) register on import.
+import './editmesh/overlay';
+import './editmesh/select';
+import './editmesh/transform';
+import './editmesh/ops-basic';
+import './editmesh/ops-topology';
+import './editmesh/ops-uv';
+import './editmesh/ui';
+import './editmesh/knife';
+import './editmesh/rip';
+import './armature/armature';
+import './armature/boneprops';
+import './armature/tools';
+import './lattice/lattice';
+import './curve/curve';
+import './text/text';
+export {};

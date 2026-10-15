@@ -1,0 +1,51 @@
+/* Compositor editor header extras */
+.nd-header .hdr-toggle.cmp-backdrop {
+  padding: 0 10px;
+  margin: 0 2px;
+  font-size: 12px;
+}
+.nd-header .cmp-errors {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-right: 6px;
+  color: var(--error, #e05656);
+  font-size: 11px;
+}
+.cmp-rl-body {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 0;
+}
+.cmp-rl-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 21px;
+  padding: 0 6px;
+  background: var(--w-menu, #282828);
+  border-radius: 3px;
+  color: #ddd;
+  font-size: 11px;
+}
+.cmp-rl-row span {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cmp-rl-render {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 19px;
+  border-radius: 3px;
+  background: #545454;
+}
+.cmp-rl-render:hover {
+  background: #666;
+}

@@ -1,0 +1,94 @@
+/* Geometry nodes: node body widgets, modifier panel. */
+
+/* "add item" sockets of Capture Attribute look like the group extend sockets */
+.nd-sock[data-sock='in:__item__'],
+.nd-sock[data-sock='out:__item__'] {
+  background: transparent;
+  box-shadow: 0 0 0 1px rgba(200, 200, 200, 0.6);
+}
+
+.gn-id-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 1px 0;
+}
+.gn-id-row .enum-menu {
+  width: 100%;
+}
+.gn-id-row.linked {
+  opacity: 0.5;
+}
+
+.gn-viewer-body {
+  display: flex;
+  padding: 2px 0;
+}
+.gn-viewer-body .btn {
+  flex: 1;
+  gap: 4px;
+  justify-content: center;
+}
+.gn-viewer-body .btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.gn-items {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.gn-item-row {
+  display: grid;
+  grid-template-columns: 1fr 90px 22px;
+  gap: 3px;
+  align-items: center;
+}
+
+/* modifier panel */
+.gn-mod {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.gn-mod > .id-selector {
+  margin-bottom: 4px;
+}
+.gn-input-row {
+  position: relative;
+}
+.gn-input-toggle {
+  position: absolute;
+  right: -2px;
+  top: 0;
+  height: var(--row);
+  display: grid;
+  place-items: center;
+}
+.gn-attr-toggle {
+  width: 20px;
+  height: 18px;
+  border-radius: 3px;
+  display: grid;
+  place-items: center;
+  color: #999;
+  background: transparent;
+}
+.gn-attr-toggle:hover {
+  color: #fff;
+  background: var(--w-regular);
+}
+.gn-attr-toggle.on {
+  color: #fff;
+  background: var(--accent);
+}
+.gn-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 4px;
+}
+.gn-warnings .mod-error {
+  background: rgba(172, 135, 55, 0.25);
+}

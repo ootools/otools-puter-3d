@@ -1,0 +1,118 @@
+// Action data-block selector (browse / name / fake user / new / unlink) and
+// the Push Down / Stash buttons used in the Action Editor header.
+import { h, type Child } from '../ui/h';
+import { icon } from '../ui/icons';
+import { app } from '../app/app';
+import { openMenu } from '../ui/menu';
+import { textField } from '../ui/widgets';
+import type { ObjectData } from '../data/types';
+import { activeAction } from './channels';
+import { ensureAnimData } from './actionops';
+
+export function browseActions(ob: ObjectData, anchor: HTMLElement | { x: number; y: number }, onPick?: (id: string) => void) {
+  const acts = Object.values(app.doc.actions).sort((a, b) => a.name.localeCompare(b.name));
+  if (!acts.length) {
+    openMenu([{ label: 'No actions', disabled: true }], anchor);
+    return;
+  }
+  openMenu(
+    acts.map((a) => ({
+      label: `${a.use_fake_user ? 'F ' : ''}${a.name}`,
+      icon: 'action',
+      active: ob.animation_data?.action === a.id,
+      action: () => {
+        if (onPick) return onPick(a.id);
+        ensureAnimData(ob).action = a.id;
+        app.pushUndo('Assign Action');
+        app.changed('doc');
+      },
+    })),
+    anchor,
+    { title: 'Browse Action' },
+  );
+}
+
+export function actionSelector(ob: ObjectData): Child {
+  const act = activeAction(app.doc, ob);
+  return h(
+    'div',
+    { key: 'action-sel', class: 'anim-idblock' },
+    h(
+      'button',
+      {
+        class: 'anim-id-browse',
+        'data-tip': 'Browse Action\nBrowse Action to be linked',
+        onpointerdown: (e: PointerEvent) => (e.preventDefault(), browseActions(ob, e.currentTarget as HTMLElement)),
+      },
+      icon('action'),
+      icon('down_arrow_hlt', 'tiny'),
+    ),
+    act
+      ? [
+          textField(
+            'action-name',
+            act.name,
+            (v) => {
+              if (!v.trim()) return;
+              act.name = v.trim();
+              app.pushUndo('Rename Action');
+              app.changed('doc');
+            },
+            { className: 'anim-id-name' },
+          ),
+          h(
+            'button',
+            {
+              class: { 'anim-id-btn': true, on: !!act.use_fake_user },
+              'data-tip': 'Fake User\nSave this data-block even if it has no users',
+              onclick: () => ((act.use_fake_user = !act.use_fake_user), app.pushUndo('Fake User'), app.changed('doc')),
+            },
+            icon(act.use_fake_user ? 'fake_user_on' : 'fake_user_off'),
+          ),
+          h(
+            'button',
+            {
+              class: 'anim-id-btn',
+              'data-tip': 'New Action\nCreate new action (copy of the current one)',
+              onclick: () => app.run('action.new'),
+            },
+            icon('duplicate'),
+          ),
+          h(
+            'button',
+            {
+              class: 'anim-id-btn',
+              'data-tip': 'Unlink Action\nUnlink this action from the active action slot',
+              onclick: () => app.run('action.unlink'),
+            },
+            icon('x'),
+          ),
+        ]
+      : h('button', { class: 'anim-id-new', onclick: () => app.run('action.new') }, icon('add'), 'New'),
+    act
+      ? h(
+          'button',
+          {
+            key: 'push',
+            class: 'anim-id-wide',
+            'data-tip': 'Push Down Action\nPush action down onto the top of the NLA stack as a new strip',
+            onclick: () => app.run('action.push_down'),
+          },
+          icon('nla'),
+          'Push Down',
+        )
+      : null,
+    act
+      ? h(
+          'button',
+          {
+            key: 'stash',
+            class: 'anim-id-wide',
+            'data-tip': 'Stash Action\nStore this action in the NLA stack as a non-contributing strip for later use',
+            onclick: () => app.run('action.stash'),
+          },
+          'Stash',
+        )
+      : null,
+  );
+}

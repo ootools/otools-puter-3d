@@ -1,0 +1,39 @@
+// Which node tree a node editor shows. A provider resolves the root tree (material, world,
+// geometry node group, compositor) and draws the tree-specific part of the header; group
+// editing (Tab) is handled generically by the editor through a path of group ids.
+import type { Child } from '../../ui/h';
+import type { NodeTreeData } from '../../data/types';
+import type { TreeType } from '../types';
+import type { EditorTypeId } from '../../ui/screen';
+
+export interface TreeRoot {
+  tree: NodeTreeData;
+  /** stable key for per-tree view state */
+  key: string;
+  /** breadcrumb items: [icon, name] */
+  crumbs: [string, string][];
+}
+
+export interface NodeEditorProvider {
+  id: EditorTypeId;
+  label: string;
+  icon: string;
+  /** tree type of the root (for Add menus and group compatibility) */
+  treeType(ed: { shaderType: 'OBJECT' | 'WORLD' }): TreeType;
+  root(ed: { shaderType: 'OBJECT' | 'WORLD' }): TreeRoot | null;
+  /** header part after the editor-type button and before View/Select/Add/Node */
+  headerLeft?(ed: unknown): Child;
+  /** header part after the menus (data-block selectors etc.) */
+  headerRight?(ed: unknown): Child;
+  /** message shown when there is no tree */
+  emptyMessage?(ed: unknown): string;
+  /** per-entry Add-menu filter */
+  menuPoll?(idname: string, ed: { shaderType: 'OBJECT' | 'WORLD' }): boolean;
+  /** draw behind the links and nodes, over the grid (e.g. the compositor backdrop) */
+  drawBackdrop?(ed: unknown, g: CanvasRenderingContext2D, width: number, height: number): void;
+}
+
+export const providers = new Map<string, NodeEditorProvider>();
+export function registerNodeEditorProvider(p: NodeEditorProvider) {
+  providers.set(p.id, p);
+}

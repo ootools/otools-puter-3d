@@ -1,0 +1,313 @@
+// Lattice Edit Mode: point selection and transforms, resolution changes, Make Regular, Flip.
+import { Matrix3, Matrix4, Vector3, Box3 } from 'three';
+import { app, registerOperators } from '../../app/app';
+import { editModeHooks } from '../../editors/view3d/hooks';
+import { h } from '../../ui/h';
+import type { LatticeData, ObjectData } from '../../data/types';
+import { transformProviders, type TElement } from '../../ops/transform';
+import { setGizmoCenterHook, gizmoCenterHook } from '../../editors/view3d/gizmo';
+import { frameHooks } from '../../ops/view3d';
+import { modeMenus } from '../../editors/view3d/modemenus';
+import { addKeys } from '../../app/keymap';
+import type { MenuItem } from '../../ui/menu';
+
+type LatticeSel = LatticeData & { select?: Uint8Array };
+
+function activeLattice(): { ob: ObjectData; lt: LatticeSel } | null {
+  const ob = app.activeObject;
+  if (!ob || ob.type !== 'LATTICE' || !ob.data) return null;
+  const lt = app.doc.lattices[ob.data] as LatticeSel | undefined;
+  return lt ? { ob, lt } : null;
+}
+const inLatticeEdit = () => app.doc.mode === 'EDIT' && !!activeLattice();
+
+function ensureSel(lt: LatticeSel) {
+  const n = lt.points.length / 3;
+  if (!lt.select || lt.select.length !== n) lt.select = new Uint8Array(n);
+  return lt.select;
+}
+
+const world = (ob: ObjectData) => app.graph.get(ob.id)?.world ?? new Matrix4();
+const pointWorld = (lt: LatticeData, i: number, w: Matrix4) => new Vector3(lt.points[i * 3], lt.points[i * 3 + 1], lt.points[i * 3 + 2]).applyMatrix4(w);
+
+/** Regular grid coordinate along one axis (a single point sits at the centre). */
+const gridCoord = (i: number, n: number) => (n > 1 ? i / (n - 1) - 0.5 : 0);
+
+/** Sample the current point offsets (from the regular grid) trilinearly at normalised coords. */
+function sampleOffset(lt: LatticeData, u: number, v: number, w: number): [number, number, number] {
+  const U = lt.points_u,
+    V = lt.points_v,
+    W = lt.points_w;
+  const idx = (i: number, j: number, k: number) => (k * V + j) * U + i;
+  const cell = (t: number, n: number) => {
+    if (n <= 1) return [0, 0, 0] as const;
+    const x = Math.max(0, Math.min(n - 1, (t + 0.5) * (n - 1)));
+    const i0 = Math.min(n - 2, Math.floor(x));
+    return [i0, i0 + 1, x - i0] as const;
+  };
+  const [i0, i1, fu] = cell(u, U),
+    [j0, j1, fv] = cell(v, V),
+    [k0, k1, fw] = cell(w, W);
+  const out: [number, number, number] = [0, 0, 0];
+  for (const [k, wk] of [[k0, 1 - fw], [k1, fw]] as const)
+    for (const [j, wj] of [[j0, 1 - fv], [j1, fv]] as const)
+      for (const [i, wi] of [[i0, 1 - fu], [i1, fu]] as const) {
+        const wgt = wi * wj * wk;
+        if (!wgt) continue;
+        const p = idx(i, j, k);
+        out[0] += (lt.points[p * 3] - gridCoord(i, U)) * wgt;
+        out[1] += (lt.points[p * 3 + 1] - gridCoord(j, V)) * wgt;
+        out[2] += (lt.points[p * 3 + 2] - gridCoord(k, W)) * wgt;
+      }
+  return out;
+}
+
+/** Change the lattice resolution keeping the current deformation (resampled). */
+export function resizeLattice(lt: LatticeSel, U: number, V: number, W: number) {
+  const pts = new Float32Array(U * V * W * 3);
+  for (let k = 0; k < W; k++)
+    for (let j = 0; j < V; j++)
+      for (let i = 0; i < U; i++) {
+        const u = gridCoord(i, U),
+          v = gridCoord(j, V),
+          w = gridCoord(k, W);
+        const o = sampleOffset(lt, u, v, w);
+        const p = ((k * V + j) * U + i) * 3;
+        pts[p] = u + o[0];
+        pts[p + 1] = v + o[1];
+        pts[p + 2] = w + o[2];
+      }
+  lt.points_u = U;
+  lt.points_v = V;
+  lt.points_w = W;
+  lt.points = pts;
+  lt.select = new Uint8Array(U * V * W);
+}
+
+registerOperators([
+  {
+    idname: 'lattice.resize',
+    label: 'Lattice Resolution',
+    description: 'Apply the lattice resolution (points_u/v/w), resampling the current deformation',
+    poll: () => !!activeLattice(),
+    exec: () => {
+      const { lt } = activeLattice()!;
+      const n = lt.points.length / 3;
+      const U = Math.max(1, Math.round(lt.points_u)),
+        V = Math.max(1, Math.round(lt.points_v)),
+        W = Math.max(1, Math.round(lt.points_w));
+      if (U * V * W === n) return 'CANCELLED';
+      // points_* were already changed by the UI; reconstruct the previous resolution from the point count
+      const prev = guessPrevResolution(lt, n, U, V, W);
+      Object.assign(lt, { points_u: prev[0], points_v: prev[1], points_w: prev[2] });
+      resizeLattice(lt, U, V, W);
+    },
+  },
+  {
+    idname: 'lattice.select_all',
+    label: '(De)select All',
+    props: [{ id: 'action', label: 'Action', type: 'enum', default: 'TOGGLE', items: [['TOGGLE', 'Toggle'], ['SELECT', 'Select'], ['DESELECT', 'Deselect'], ['INVERT', 'Invert']] }],
+    poll: inLatticeEdit,
+    exec: (_ctx, p) => {
+      const sel = ensureSel(activeLattice()!.lt);
+      let a = p.action as string;
+      if (a === 'TOGGLE') a = sel.some((x) => x) ? 'DESELECT' : 'SELECT';
+      for (let i = 0; i < sel.length; i++) sel[i] = a === 'SELECT' ? 1 : a === 'DESELECT' ? 0 : sel[i] ^ 1;
+    },
+    redo: false,
+  },
+  {
+    idname: 'lattice.make_regular',
+    label: 'Make Regular',
+    description: 'Set UVW control points a uniform distance apart',
+    poll: () => !!activeLattice(),
+    exec: () => {
+      const { lt } = activeLattice()!;
+      const { points_u: U, points_v: V, points_w: W } = lt;
+      for (let k = 0; k < W; k++)
+        for (let j = 0; j < V; j++)
+          for (let i = 0; i < U; i++) {
+            const p = ((k * V + j) * U + i) * 3;
+            lt.points[p] = gridCoord(i, U);
+            lt.points[p + 1] = gridCoord(j, V);
+            lt.points[p + 2] = gridCoord(k, W);
+          }
+    },
+  },
+  {
+    idname: 'lattice.flip',
+    label: 'Flip (Distortion)',
+    description: 'Mirror all control points without inverting the lattice deform',
+    props: [{ id: 'axis', label: 'Flip Axis', type: 'enum', default: 'U', items: [['U', 'U (X) Axis'], ['V', 'V (Y) Axis'], ['W', 'W (Z) Axis']] }],
+    poll: inLatticeEdit,
+    exec: (_ctx, p) => {
+      const { lt } = activeLattice()!;
+      const { points_u: U, points_v: V, points_w: W } = lt;
+      const ax = p.axis === 'U' ? 0 : p.axis === 'V' ? 1 : 2;
+      const src = lt.points.slice();
+      for (let k = 0; k < W; k++)
+        for (let j = 0; j < V; j++)
+          for (let i = 0; i < U; i++) {
+            const [mi, mj, mk] = ax === 0 ? [U - 1 - i, j, k] : ax === 1 ? [i, V - 1 - j, k] : [i, j, W - 1 - k];
+            const d = ((k * V + j) * U + i) * 3,
+              s = ((mk * V + mj) * U + mi) * 3;
+            for (let c = 0; c < 3; c++) lt.points[d + c] = c === ax ? -src[s + c] : src[s + c];
+          }
+    },
+  },
+]);
+
+function guessPrevResolution(lt: LatticeData, n: number, U: number, V: number, W: number): [number, number, number] {
+  // exactly one axis changes per edit; find which one keeps the product equal to the point count
+  if ((n / (V * W)) % 1 === 0 && n / (V * W) !== U) return [n / (V * W), V, W];
+  if ((n / (U * W)) % 1 === 0 && n / (U * W) !== V) return [U, n / (U * W), W];
+  if ((n / (U * V)) % 1 === 0 && n / (U * V) !== W) return [U, V, n / (U * V)];
+  const c = Math.round(Math.cbrt(n));
+  return [c, c, c];
+  void lt;
+}
+
+// ---------------------------------------------------------------------------
+// selection, overlay, transforms
+
+editModeHooks.pick.push((v, x, y, o) => {
+  const a = inLatticeEdit() ? activeLattice() : null;
+  if (!a) return false;
+  const sel = ensureSel(a.lt);
+  const w = world(a.ob);
+  let best = -1,
+    bd = 12;
+  for (let i = 0; i < sel.length; i++) {
+    const p = v.project(pointWorld(a.lt, i, w));
+    const d = Math.hypot(p.x - x, p.y - y);
+    if (d < bd) {
+      bd = d;
+      best = i;
+    }
+  }
+  if (!o.extend) sel.fill(0);
+  if (best >= 0) sel[best] = o.toggle && sel[best] ? 0 : 1;
+  app.pushUndo('Select');
+  app.changed('select', 'doc');
+  return true;
+});
+
+editModeHooks.box.push((v, x0, y0, x1, y1, mode) => {
+  const a = inLatticeEdit() ? activeLattice() : null;
+  if (!a) return false;
+  const sel = ensureSel(a.lt);
+  const w = world(a.ob);
+  const [lx, hx, ly, hy] = [Math.min(x0, x1), Math.max(x0, x1), Math.min(y0, y1), Math.max(y0, y1)];
+  for (let i = 0; i < sel.length; i++) {
+    const p = v.project(pointWorld(a.lt, i, w));
+    const hit = p.x >= lx && p.x <= hx && p.y >= ly && p.y <= hy ? 1 : 0;
+    const cur = sel[i];
+    sel[i] = mode === 'SET' ? hit : mode === 'ADD' ? cur | hit : mode === 'SUB' ? cur & (hit ^ 1) : mode === 'AND' ? cur & hit : cur ^ hit;
+  }
+  app.pushUndo('Box Select');
+  app.changed('select', 'doc');
+  return true;
+});
+
+editModeHooks.svg.push((v) => {
+  const a = inLatticeEdit() ? activeLattice() : null;
+  if (!a) return null;
+  const sel = ensureSel(a.lt);
+  const w = world(a.ob);
+  const dots = [];
+  for (let i = 0; i < sel.length; i++) {
+    const p = v.project(pointWorld(a.lt, i, w));
+    if (p.z > 1) continue;
+    dots.push(h('circle', { cx: p.x, cy: p.y, r: 3.5, fill: sel[i] ? '#ff8500' : '#000', stroke: sel[i] ? '#ffb15e' : '#666', 'stroke-width': 0.8 }));
+  }
+  return h('g', { class: 'lattice-edit' }, dots);
+});
+
+function selectedPoints() {
+  const a = activeLattice();
+  if (!a) return [];
+  const sel = ensureSel(a.lt);
+  const w = world(a.ob);
+  const out: Vector3[] = [];
+  for (let i = 0; i < sel.length; i++) if (sel[i]) out.push(pointWorld(a.lt, i, w));
+  return out;
+}
+
+transformProviders.push({
+  collect() {
+    const a = inLatticeEdit() ? activeLattice() : null;
+    if (!a) return null;
+    const sel = ensureSel(a.lt);
+    const w = world(a.ob),
+      inv = w.clone().invert();
+    const before = a.lt.points.slice();
+    const lt = a.lt;
+    const els: TElement[] = [];
+    for (let i = 0; i < sel.length; i++) {
+      if (!sel[i]) continue;
+      const p0 = pointWorld(lt, i, w);
+      els.push({
+        center: p0,
+        basis: new Matrix3().setFromMatrix4(w),
+        weight: 1,
+        apply(m: Matrix4) {
+          const p = p0.clone().applyMatrix4(m).applyMatrix4(inv);
+          lt.points[i * 3] = p.x;
+          lt.points[i * 3 + 1] = p.y;
+          lt.points[i * 3 + 2] = p.z;
+        },
+        restore() {
+          lt.points.set(before);
+        },
+      });
+    }
+    if (!els.length) return null;
+    return { elements: els, label: 'Lattice', finish() {}, cancel() {}, onUpdate: () => app.changed('doc') };
+  },
+});
+
+const prevGizmo = gizmoCenterHook;
+setGizmoCenterHook(() => {
+  if (inLatticeEdit()) {
+    const pts = selectedPoints();
+    if (!pts.length) return null;
+    const c = new Vector3();
+    pts.forEach((p) => c.add(p));
+    return { center: c.multiplyScalar(1 / pts.length) };
+  }
+  return prevGizmo?.() ?? null;
+});
+
+frameHooks.unshift(() => {
+  if (!inLatticeEdit()) return null;
+  const pts = selectedPoints();
+  return pts.length ? new Box3().setFromPoints(pts) : null;
+});
+
+// ---------------------------------------------------------------------------
+// menus & keys
+
+function latticeMenu(): MenuItem[] {
+  return [
+    { label: 'Transform', submenu: () => [{ label: 'Move', op: 'transform.translate', shortcut: 'G' }, { label: 'Rotate', op: 'transform.rotate', shortcut: 'R' }, { label: 'Scale', op: 'transform.resize', shortcut: 'S' }] },
+    { separator: true },
+    { label: 'Make Regular', op: 'lattice.make_regular' },
+    { label: 'Flip', submenu: () => (['U', 'V', 'W'] as const).map((a) => ({ label: `${a} (${{ U: 'X', V: 'Y', W: 'Z' }[a]}) Axis`, op: 'lattice.flip', props: { axis: a } })) },
+  ];
+}
+
+const prevEdit = modeMenus.EDIT;
+modeMenus.EDIT = {
+  ...prevEdit,
+  header: () => (inLatticeEdit() ? [['Lattice', latticeMenu]] : prevEdit?.header?.() ?? []),
+  select: () => (inLatticeEdit() ? [{ label: 'All', op: 'lattice.select_all', props: { action: 'SELECT' } }, { label: 'None', op: 'lattice.select_all', props: { action: 'DESELECT' } }, { label: 'Invert', op: 'lattice.select_all', props: { action: 'INVERT' } }] : prevEdit?.select?.() ?? []),
+  add: () => (inLatticeEdit() ? [] : prevEdit?.add?.() ?? []),
+  context: () => (inLatticeEdit() ? latticeMenu() : prevEdit?.context?.() ?? []),
+  headerExtra: () => (inLatticeEdit() ? null : prevEdit?.headerExtra?.() ?? null),
+};
+
+addKeys('Armature', [
+  { key: 'A', op: 'lattice.select_all', props: { action: 'SELECT' }, when: inLatticeEdit },
+  { key: 'A', alt: true, op: 'lattice.select_all', props: { action: 'DESELECT' }, when: inLatticeEdit },
+  { key: 'I', ctrl: true, op: 'lattice.select_all', props: { action: 'INVERT' }, when: inLatticeEdit },
+]);
