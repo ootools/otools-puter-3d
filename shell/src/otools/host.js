@@ -476,7 +476,7 @@ export function install() {
     errorMessage,
     diag,
   };
-  window[APP.bridge] = api;
+  if (typeof window !== 'undefined') window[APP.bridge] = api;
   return api;
 }
 
