@@ -66,6 +66,22 @@ async function main() {
     console.error('入口 HTML 里还有指向 puter.com 的 <script src>——插件不应该加载 Puter SDK。');
     process.exit(1);
   }
+  // 样式自检：这个应用的 29 个 CSS 全靠入口 main.js 里那一行
+  // `import './styles/index.css'` 注入。整文件替换 main.js 时一旦把那行顶掉，
+  // 构建不会报错、verify 也会过，只是静默产出一个「功能齐全但完全没有样式」
+  // 的界面（按钮全是浏览器默认灰底）——比崩掉更难发现，所以在这里挡住。
+  const cssFiles = fs.existsSync(path.join(distDir, 'assets'))
+    ? fs.readdirSync(path.join(distDir, 'assets')).filter((n) => n.endsWith('.css'))
+    : [];
+  if (cssFiles.length === 0) {
+    console.error('构建产物里没有任何 CSS。检查入口 main.js 是否还留着 `import \'./styles/index.css\'`。');
+    process.exit(1);
+  }
+  if (!/<link[^>]+rel=["']stylesheet["']/i.test(html)) {
+    console.error('入口 HTML 没有 <link rel="stylesheet">——CSS 没被引用，界面会没有样式。');
+    process.exit(1);
+  }
+  console.log(`入口自检通过：${cssFiles.length} 个 CSS 已产出并被入口引用。`);
 
   const size = (file) => `${(fs.statSync(file).size / 1048576).toFixed(2)} MB`;
   const total = [];
