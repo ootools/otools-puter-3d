@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const upstreamSrc = path.join(repoRoot, 'upstream', 'src');
 const catalogPath = path.join(repoRoot, 'shell', 'src', 'otools', 'i18n.zh-CN.js');
+const commonPath = path.join(repoRoot, 'shell', 'src', 'otools', 'i18n.common.zh-CN.js');
 
 const has = (name) => process.argv.includes(`--${name}`);
 const arg = (name) => {
@@ -90,13 +91,17 @@ const CONTEXT_RULES = [
   { re: /\bnew Error\(\s*(['"])((?:[^'"\\\n]|\\.){3,160})\1/g, group: 2 },
 ];
 
+/** 源码扩展名：上游有的用 .js、有的用 .ts/.tsx（photo-studio、3d 全是 .ts），
+ *  漏掉任一扩展名都会让那一整类应用的界面文案永远不在报告里。 */
+const SRC_EXTS = new Set(['.js', '.mjs', '.ts', '.tsx', '.jsx', '.vue', '.svelte']);
+
 function walk(dir, out = []) {
   if (!fs.existsSync(dir)) return out;
   for (const name of fs.readdirSync(dir)) {
     const full = path.join(dir, name);
     const stat = fs.statSync(full);
     if (stat.isDirectory()) walk(full, out);
-    else if (name.endsWith('.js')) out.push(full);
+    else if (SRC_EXTS.has(path.extname(name).toLowerCase())) out.push(full);
   }
   return out;
 }
@@ -146,6 +151,25 @@ function readCatalog() {
   return { entries, duplicates };
 }
 
+/**
+ * 读通用词典（与其它插件共用的那一份）。
+ * 运行时项目词典是 `...common` 展开的，所以覆盖率要看合并后的全集——
+ * 否则报告永远显示 0%（通用词明明已经在生效）。
+ */
+function readCommon() {
+  if (!fs.existsSync(commonPath)) return new Map();
+  const source = fs.readFileSync(commonPath, 'utf8');
+  const entries = new Map();
+  const re = /^\s*(?:'((?:[^'\\\n]|\\.)+)'|"((?:[^"\\\n]|\\.)+)"|([A-Za-z_$][\w$]*))\s*:\s*(?:'((?:[^'\\\n]|\\.)*)'|"((?:[^"\\\n]|\\.)*)")\s*,?\s*$/gm;
+  let m;
+  while ((m = re.exec(source))) {
+    const key = m[1] ?? m[2] ?? m[3];
+    const value = m[4] ?? m[5] ?? '';
+    if (!entries.has(key)) entries.set(key, value);
+  }
+  return entries;
+}
+
 function main() {
   const files = walk(upstreamSrc);
   const only = arg('file');
@@ -162,6 +186,8 @@ function main() {
   }
 
   const { entries: catalog, duplicates } = readCatalog();
+  // 把通用词典并进来：运行时项目词典是 ...common 展开的，覆盖率统计要看合并后的全集。
+  for (const [k, v] of readCommon()) if (!catalog.has(k)) catalog.set(k, v);
 
   if (has('list') || has('missing')) {
     const rows = [...total].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
@@ -177,7 +203,7 @@ function main() {
   const coveredOccurrences = covered.reduce((sum, k) => sum + total.get(k), 0);
 
   console.log(`候选文案：${total.size} 条不同文案，共出现 ${occurrences} 次`);
-  console.log(`词典条目：${catalog.size} 条`);
+  console.log(`词典条目（含通用）：${catalog.size} 条`);
   console.log(`已覆盖：${covered.length}/${total.size}（${((covered.length / total.size) * 100).toFixed(1)}%），按出现次数算 ${((coveredOccurrences / occurrences) * 100).toFixed(1)}%`);
   console.log(`未覆盖：${missing.length} 条`);
 
