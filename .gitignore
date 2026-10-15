@@ -7,7 +7,7 @@ dist-pack/
 
 # ---- 原生编码 cdylib 的源码在 native/，编译产物不入库 ----
 # lib/ 由 scripts/build-native.mjs 生成（宿主按 lib/macOS.dylib 加载）。
-lib/
+/lib/
 native/target/
 
 # ---- 依赖 ----
