@@ -176,3 +176,59 @@ describe('书写方向', () => {
     expect(isRTL('en-US')).toBe(false);
   });
 });
+
+/**
+ * 词典文件本身的「可加载性」。
+ *
+ * 这组用例守的是 `scripts/i18n-shards.mjs` 写出词典时踩过的两个坑——
+ * 两次都表现为「`node --check` 语法校验通过，运行时整个插件白屏」：
+ *
+ *   1. **值被写成裸标识符**。键可以省略引号，值不行：`UVs: UV` 里的 `UV`
+ *      被JS 当成变量引用，import 时抛 `UV is not defined`。
+ *   2. **控制字符没转义**。Blender 的 tooltip 原文是 `标题\n说明`（`data-tip`
+ *      属性里就带换行），字面换行落进单引号字符串是语法错误。
+ *
+ * 所以这里直接 import 真实词典，并断言「键值都是字符串、含换行的键能取到」。
+ */
+describe('词典文件可加载', () => {
+  it('每个词条的键和值都是字符串（没有裸标识符）', async () => {
+    const dict = (await import('../src/otools/i18n.zh-CN.js')).default;
+    for (const [k, v] of Object.entries(dict)) {
+      expect(typeof k, `键 ${JSON.stringify(k)}`).toBe('string');
+      expect(typeof v, `${JSON.stringify(k)} 的值`).toBe('string');
+    }
+  });
+
+  it('tooltip 词条保留结构换行（标题\n说明）', async () => {
+    const dict = (await import('../src/otools/i18n.zh-CN.js')).default;
+    const NL = String.fromCharCode(10);
+    const tips = Object.keys(dict).filter((k) => k.includes(NL));
+    expect(tips.length).toBeGreaterThan(0);
+    for (const k of tips) {
+      // 上游 showTip() 按真换行 split 出标题与正文；译文也必须是两段，
+      // 否则整段说明会被塞进 tooltip 标题里。
+      const parts = dict[k].split(NL);
+      expect(parts.length, JSON.stringify(k)).toBe(2);
+      expect(parts[0].trim().length, JSON.stringify(k)).toBeGreaterThan(0);
+      expect(parts[1].trim().length, JSON.stringify(k)).toBeGreaterThan(0);
+    }
+  });
+
+  it('tooltip 词条没有把换行抹成空格的残留键', async () => {
+    const dict = (await import('../src/otools/i18n.zh-CN.js')).default;
+    const NL = String.fromCharCode(10);
+    for (const k of Object.keys(dict)) {
+      if (!k.includes(NL)) continue;
+      const spaced = k.split(NL).join(' ');
+      expect(dict, `残留空格版键：${spaced}`).not.toHaveProperty(spaced);
+    }
+  });
+
+  it('值里的单引号与反斜杠被正确转义', async () => {
+    const dict = (await import('../src/otools/i18n.zh-CN.js')).default;
+    // 译文里出现 `'` 或 `\` 时若没转义，文件本身就是语法错误，
+    // 能 import 成功即证明转义没问题；这里再钉住「原文里的撇号没被吃掉」。
+    const curly = Object.entries(dict).filter(([k]) => k.includes('’'));
+    expect(curly.length).toBeGreaterThan(0);
+  });
+});

@@ -94,7 +94,12 @@ function extractFrom(source) {
     while ((m = re.exec(source))) {
       const raw = m[rule.group];
       if (!raw) continue;
-      const v = raw.replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\n/g, ' ');
+      // `\\n` 必须还原成**真换行**，不能替换成空格。
+      // 上游 tooltip 原文就是 `标题\\n说明`，渲染时按真换行 split
+      // （3d 的 showTip()、presentation 的 tooltip 组件都是）。
+      // 抹成空格的话词典键与 DOM 属性值逐字符不等，**运行时永远匹配不上**——
+      // 提取阶段看不出任何异常，译文也确实写进去了，就是不生效。
+      const v = raw.replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\n/g, '\n');
       if (v.length < 3 || v.length > 120) continue;
       if (!/[A-Za-z一-龥]/.test(v)) continue;
       if (NOT_UI.some((p) => p.test(v))) continue;
@@ -327,13 +332,15 @@ function doApply() {
   // 所以：**先算清楚应有几条，写完再数一遍对不上就中止**，
   // 宁可这次不写，也不能把词典改小。
   const expected = own.size + added.length;
-  appendToCatalog(added, expected);
-
-  console.log(`新增 ${added.length} 条，更新 ${updated.length} 条（更新需手工合并，脚本只追加新增）`);
-  if (updated.length) {
-    console.log('\n以下键词典里已有，脚本未覆盖，请人工确认：');
-    for (const [k, v] of updated.slice(0, 10)) console.log(`  ${k} → ${v}`);
-  }
+  // 串在 .then 里：校验没过就 process.exit 了，这里不会执行，
+  // 也就不会出现「词典其实是坏的，却先打印了『新增 N 条』」这种误导输出。
+  return appendToCatalog(added, expected).then(() => {
+    console.log(`新增 ${added.length} 条，更新 ${updated.length} 条（更新需手工合并，脚本只追加新增）`);
+    if (updated.length) {
+      console.log('\n以下键词典里已有，脚本未覆盖，请人工确认：');
+      for (const [k, v] of updated.slice(0, 10)) console.log(`  ${k} → ${v}`);
+    }
+  });
 }
 
 /**
@@ -374,13 +381,21 @@ function appendToCatalog(entries, expectedTotal) {
 
   const block = [...merged]
     .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([k, v]) => `  ${quoteKey(k)}: ${quoteKey(v)},`)
+    .map(([k, v]) => `  ${quoteLiteral(k, { asKey: true })}: ${quoteLiteral(v)},`)
     .join('\n');
 
   const out = `${body.head}export default {\n  ...common,\n${block}\n};\n${body.tail}`;
+  // 覆盖之前先留一份原件：verifyCatalogSyntax 校验失败时要靠它真正还原，
+  // 否则「已撤销」只是一句话，坏文件还留在原地。
+  const backupPath = `${catalogPath}.bak`;
+  fs.copyFileSync(catalogPath, backupPath);
   fs.writeFileSync(catalogPath, out, 'utf8');
-  verifyCatalogSyntax(expectedTotal);
-  console.log(`已写入 ${path.relative(repoRoot, catalogPath)}（本次新增 ${entries.length} 条）`);
+  // 必须 await：校验是异步 import，不等它落地就删备份、报「已写入」，
+  // 结果是校验失败时备份已经没了，坏文件留在原地——「撤销」根本执行不了。
+  return verifyCatalogSyntax(expectedTotal, backupPath).then(() => {
+    fs.rmSync(backupPath, { force: true });
+    console.log(`已写入 ${path.relative(repoRoot, catalogPath)}（本次新增 ${entries.length} 条）`);
+  });
 }
 
 /**
@@ -439,7 +454,7 @@ function readDictBody(src) {
  *      词典从 2400 条缩到 197 条，而文件**仍是合法 JS**，语法校验照样通过。
  *      所以这里用**独立于 readDict 的方式**数：直接 import 出来的对象键数。
  */
-function verifyCatalogSyntax(expectedTotal) {
+function verifyCatalogSyntax(expectedTotal, backupPath) {
   const fileUrl = pathToFileURL(catalogPath).href;
   return import(`${fileUrl}?t=${Date.now()}`) // 加时间戳绕开 ESM 模块缓存
     .then((m) => {
@@ -456,21 +471,59 @@ function verifyCatalogSyntax(expectedTotal) {
     })
     .catch((e) => {
       console.error(`\n词典写入后无法加载，请立即修复：\n  ${e.message}`);
-      console.error('本次写入已撤销');
+      // 先留坏文件，再把词典**真正还原**。
+      // 「已撤销」这句话必须对应一次真实的还原动作：只留备份却把坏文件留在原地，
+      // 下一次重试就会在坏文件上继续叠加，越救越坏。
       try {
         fs.copyFileSync(catalogPath, catalogPath + '.broken');
-        console.error(`坏文件已留存在 ${path.basename(catalogPath)}.broken`);
-      } catch { /* 留存失败也要报原文 */ }
-      process.exit(1);
+        if (!backupPath) throw new Error('缺少写入前备份，无法自动还原');
+        fs.copyFileSync(backupPath, catalogPath);
+        console.error(`本次写入已撤销（坏文件留存于 ${path.basename(catalogPath)}.broken）`);
+      } catch (restoreErr) {
+        console.error(`自动还原失败：${restoreErr.message}`);
+        console.error(`请手动执行：git checkout -- ${path.relative(repoRoot, catalogPath)}`);
+        process.exit(1);
+      }
+      // 还原后自证：还原出来的那份必须能加载，否则说明备份本身就有问题。
+      return verifyCatalogSyntax(0).then(() => {
+        process.exit(1);
+      });
     });
 }
 
-function quoteKey(s) {
-  return /^[A-Za-z_$][\w$]*$/.test(s) && !/[.…’']/.test(s)
-    ? s
-    : `'${s.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+/**
+ * 把字符串安全地写进JS 字面量。
+ *
+ * 两个坑，都在3d 词典上踩到过：
+ *
+ *1. **控制字符必须转义。** 词典里有 `标题\n提示` 这种 Blender tooltip 形态的键
+ *    （`data-tip` 的原文就是 `标题\n说明`），字面换行落进单引号字符串就是语法错误。
+ *    逐字符走 charCode，不用含字面控制字符的正则——U+2028/2029 在 regex 字面量里非法。
+ *
+ * 2. **值永远要加引号。** 键可以偷懒省略引号（合法标识符），值**不行**：
+ *    `UVs: UV` 里的 `UV` 会被当成变量引用，运行时直接抛 `UV is not defined`，
+ *    而 `node --check` 语法校验却完全通过。所以键和值必须分开处理。
+ *
+ * @param {string} s
+ * @param {{asKey?: boolean}} [opts] asKey=true 时允许合法标识符省略引号
+ * @returns {string}
+ */
+function quoteLiteral(s, { asKey = false } = {}) {
+  if (asKey && /^[A-Za-z_$][\w$]*$/.test(s)) return s;
+  let out = '';
+  for (const ch of s) {
+    const code = ch.codePointAt(0);
+    if (ch === '\\') out += '\\\\';
+    else if (ch === "'") out += "\\'";
+    else if (ch === '\n') out += '\\n';
+    else if (ch === '\r') out += '\\r';
+    else if (ch === '\t') out += '\\t';
+    else if (code < 0x20 || code === 0x7f || code === 0x2028 || code === 0x2029) {
+      out += `\\u${code.toString(16).padStart(4, '0')}`;
+    } else out += ch;
+  }
+  return `'${out}'`;
 }
-
 function doStatus() {
   const { all, own } = loadCatalog();
   const cands = scanCandidates();
