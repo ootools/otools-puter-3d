@@ -23,3 +23,6 @@ Thumbs.db
 
 # playwright-cli 本地调试的临时输出
 .playwright-cli/
+
+# ---- i18n 补词分片（中间产物，译文合并进词典后即可删）----
+.i18n-shards/
