@@ -106,18 +106,103 @@ function extractFrom(source) {
   return found;
 }
 
-/** 读词典（含 common 合并），返回 Map<key, zh>。 */
+/**
+ * 读词典文件，返回 Map<key, zh>。
+ *
+ * 参数是**文件路径**。要解析已经读进内存的源码请用 `parseDict`——
+ * 早先这里只有 `readDict(file)`，而重写词典的代码顺手把源码字符串传了进去，
+ * `fs.existsSync(<整篇源码>)` 当然是 false，于是「读回现有词典」恒为空，
+ * 每写一次就把原有词条全丢掉（2400 条 → 197 条），而语法校验照样通过。
+ */
 function readDict(file) {
   if (!fs.existsSync(file)) return new Map();
-  const src = fs.readFileSync(file, 'utf8');
-  const re = /^\s*(?:'((?:[^'\\\n]|\\.)+)'|"((?:[^"\\\n]|\\.)+)"|([A-Za-z_$][\w$]*))\s*:\s*(?:'((?:[^'\\\n]|\\.)*)'|"((?:[^"\\\n]|\\.)*)")\s*,?\s*$/gm;
+  return parseDict(fs.readFileSync(file, 'utf8'));
+}
+
+/**
+ * 解析词典源码，返回 Map<key, zh>。
+ *
+ * 用**顺序扫描**而不是行正则：词典里的值可能跨行（长句、含换行的提示），
+ * `^…$` 的多行锚点会漏掉它们。
+ */
+function parseDict(src) {
   const out = new Map();
-  let m;
-  while ((m = re.exec(src))) {
-    const k = m[1] ?? m[2] ?? m[3];
-    if (!out.has(k)) out.set(k, m[4] ?? m[5] ?? '');
+
+  let i = 0;
+  const isKeyStart = (c) => c === "'" || c === '"' || /[A-Za-z_$]/.test(c);
+
+  while (i < src.length) {
+    const c = src[i];
+    // 注释
+    if (c === '/' && src[i + 1] === '/') {
+      const nl = src.indexOf('\n', i);
+      i = nl < 0 ? src.length : nl + 1;
+      continue;
+    }
+    if (c === '/' && src[i + 1] === '*') {
+      const close = src.indexOf('*/', i);
+      i = close < 0 ? src.length : close + 2;
+      continue;
+    }
+    // `...spread` 之类，跳过
+    if (c === '.' && src[i + 1] === '.' && src[i + 2] === '.') {
+      i += 3;
+      continue;
+    }
+    // 候选的 key
+    if (isKeyStart(c)) {
+      const parsed = readStringToken(src, i);
+      if (parsed) {
+        let j = parsed.end;
+        while (j < src.length && /\s/.test(src[j])) j++;
+        if (src[j] === ':') {
+          j++;
+          while (j < src.length && /\s/.test(src[j])) j++;
+          const val = readStringToken(src, j);
+          if (val) {
+            if (!out.has(parsed.value)) out.set(parsed.value, val.value);
+            i = val.end;
+            continue;
+          }
+        }
+        i = parsed.end;
+        continue;
+      }
+    }
+    i++;
   }
   return out;
+}
+
+/** 从 `i` 处读一个字符串字面量（单/双引号、裸标识符），返回 { value, end }。 */
+function readStringToken(src, i) {
+  const c = src[i];
+  if (c === "'" || c === '"') {
+    let j = i + 1;
+    let raw = '';
+    while (j < src.length) {
+      if (src[j] === '\\') { raw += src[j] + src[j + 1]; j += 2; continue; }
+      if (src[j] === c) return { value: unescapeStr(raw), end: j + 1 };
+      raw += src[j];
+      j++;
+    }
+    return null; // 未闭合
+  }
+  if (/[A-Za-z_$]/.test(c)) {
+    let j = i;
+    while (j < src.length && /[\w$]/.test(src[j])) j++;
+    return { value: src.slice(i, j), end: j };
+  }
+  return null;
+}
+
+/** 把 JS 字符串字面量的转义还原（只处理词典里会出现的几种）。 */
+function unescapeStr(s) {
+  return s
+    .replace(/\\'/g, "'")
+    .replace(/\\"/g, '"')
+    .replace(/\\n/g, '\n')
+    .replace(/\\\\/g, '\\');
 }
 
 function loadCatalog() {
@@ -232,7 +317,17 @@ function doApply() {
   const added = [...merged].filter(([k]) => !own.has(k));
   const updated = [...merged].filter(([k]) => own.has(k));
 
-  appendToCatalog(added);
+  // 写前断言：`原有 + 新增` 必须一条不少。
+  //
+  // 这道断言是被真实事故逼出来的：`appendToCatalog` 会**读回现有词典再整体重写**，
+  // 而读回用的扫描器一旦漏读（跨行值、引号转义等），每跑一次就丢一批，
+  // 词典从 2400 条一路缩到 197 条——每次都「语法校验通过」，因为截断后的文件
+  // 仍是合法 JS。跑第 3 次才察觉，此时原有词条已经找不回来了。
+  //
+  // 所以：**先算清楚应有几条，写完再数一遍对不上就中止**，
+  // 宁可这次不写，也不能把词典改小。
+  const expected = own.size + added.length;
+  appendToCatalog(added, expected);
 
   console.log(`新增 ${added.length} 条，更新 ${updated.length} 条（更新需手工合并，脚本只追加新增）`);
   if (updated.length) {
@@ -242,66 +337,128 @@ function doApply() {
 }
 
 /**
- * 把新增词条追加到词典文件末尾（分区内）。
+ * 把新增词条写进词典。
  *
- * 插入点必须锚定 **default export 对象字面量的闭合 `}`**，不能用
- * `lastIndexOf('};')`：文件末尾还有 `export { patterns } from …` 一行，
- * `};` 会落在它后面，把词条插到 export 语句之后——结果是语法错误，
- * 整个插件白屏。这个坑真实发生过。
+ * **不做「就地替换已有分区」，改成整份重写。**
+ *
+ * 原来的做法是找到上次写的分区、算准偏移、原地替换。听着省事，实际上
+ * 这条路径反复出问题：词典的键和值里有任意字符串（含引号、反斜杠、
+ * 花括号），任何基于字节偏移或花括号配平的计算都可能被这些字符带偏，
+ * 结果是**词条被整段截断**——词典从 2600 条悄悄缩回 470 条，
+ * 而文件仍是合法 JS，语法校验照样通过。
+ *
+ * 偏移计算本身就是不必要的复杂度：分片的 `key` 是唯一事实来源，
+ * 直接「原有条目 + 本次新增」重新序列化一份，天然幂等，
+ * 跑第 1 次和第 10 次结果完全一致。
  */
-function appendToCatalog(entries) {
+function appendToCatalog(entries, expectedTotal) {
   if (!entries.length) return;
   const src = fs.readFileSync(catalogPath, 'utf8');
-  const block = entries
+
+  // 切出对象字面量的**内容区间**（不含 `export default {` 与闭合 `}`），
+  // 中间的注释与既有分区全部丢弃，换成一份干净的「原有 + 新增」。
+  const body = readDictBody(src);
+  if (body === null) throw new Error('词典文件里找不到 export default 对象，先检查文件语法');
+
+  const own = parseDict(src);
+  const merged = new Map();
+  for (const [k, v] of own) if (!merged.has(k)) merged.set(k, v);
+  for (const [k, v] of entries) if (!merged.has(k)) merged.set(k, v);
+
+  if (expectedTotal != null && merged.size < expectedTotal) {
+    console.warn(
+      `注意：合并后应得 ${expectedTotal} 条，实际 ${merged.size} 条` +
+      `（有 ${expectedTotal - merged.size} 个键重复或冲突，按先出现的取值）`,
+    );
+  }
+
+  const block = [...merged]
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([k, v]) => `  ${quoteKey(k)}: ${quoteKey(v)},`)
     .join('\n');
-  const HEADER = '/* --- 续：批量补充的界面文案 --- */';
-  const section = `\n  ${HEADER}\n${block}\n`;
 
-  // 对象字面量的闭合 `}`：从 `export default {` 起做花括号配平
-  const start = src.indexOf('export default');
-  if (start < 0) throw new Error('词典文件里找不到 export default');
-  let depth = 0, objEnd = -1, sawOpen = false;
-  for (let i = src.indexOf('{', start); i < src.length; i++) {
-    const c = src[i];
-    if (c === '{') { depth++; sawOpen = true; }
-    else if (c === '}') { depth--; if (sawOpen && depth === 0) { objEnd = i; break; } }
-  }
-  if (objEnd < 0) throw new Error('词典对象字面量没有正常闭合，先检查文件语法');
-
-  let out;
-  const at = src.indexOf(HEADER);
-  if (at >= 0) {
-    // 已有分区：替换整段（含尾部到对象闭合前的空白）
-    const lineStart = src.lastIndexOf('\n', at) + 1;
-    out = src.slice(0, lineStart) + section.trimStart() + src.slice(objEnd);
-  } else {
-    out = src.slice(0, objEnd).replace(/\n+$/, '\n') + section + src.slice(objEnd);
-  }
+  const out = `${body.head}export default {\n  ...common,\n${block}\n};\n${body.tail}`;
   fs.writeFileSync(catalogPath, out, 'utf8');
-  verifyCatalogSyntax();
-  console.log(`已写入 ${path.relative(repoRoot, catalogPath)}`);
+  verifyCatalogSyntax(expectedTotal);
+  console.log(`已写入 ${path.relative(repoRoot, catalogPath)}（本次新增 ${entries.length} 条）`);
 }
 
 /**
- * 写完立刻验证词典能不能被解析。
+ * 取 `export default { … }` 的头尾两段（头 = 到 `{` 为止，尾 = 从 `}` 起）。
  *
- * 这是必须的：词典是**运行时**加载的，一个引号没转义对就是整个插件白屏，
- * 而 CI 的测试未必覆盖到新写的每一个键。坏文件必须当场失败，不能留到线上。
+ * 扫描时必须**跳过字符串字面量与注释**：词典里到处是 `'…'`、`"…"`，
+ * 里面的花括号会让人工配平算错位置（曾导致词条被整段截断）。
  */
-function verifyCatalogSyntax() {
+function readDictBody(src) {
+  const start = src.indexOf('export default');
+  if (start < 0) return null;
+  const objStart = src.indexOf('{', start);
+  let depth = 0, objEnd = -1;
+  for (let i = objStart; i < src.length; i++) {
+    const c = src[i];
+    if (c === '/' && src[i + 1] === '/') {
+      const nl = src.indexOf('\n', i);
+      i = nl < 0 ? src.length : nl;
+      continue;
+    }
+    if (c === '/' && src[i + 1] === '*') {
+      const close = src.indexOf('*/', i);
+      i = close < 0 ? src.length : close + 1;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') {
+      const q = c;
+      i++;
+      while (i < src.length) {
+        if (src[i] === '\\') i++;
+        else if (src[i] === q) break;
+        i++;
+      }
+      continue;
+    }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) { objEnd = i; break; }
+    }
+  }
+  if (objEnd < 0) return null;
+  // 保留 `export default {` 之前的全部内容（含文件头注释与 common 导入）
+  const head = src.slice(0, objStart).replace(/export default\s*$/, '');
+  const tail = src.slice(objEnd + 1);
+  return { head, tail };
+}
+
+/**
+ * 写完立刻验证词典。
+ *
+ * 两道检查，缺一不可：
+ *   1. **能不能加载** —— 词典是运行时加载的，一个引号没转义对就是整个插件白屏。
+ *   2. **条目数对不对** —— 只查语法查不出「内容被截断」：整体重写时读回
+ *      用的是 `readDict`，一旦它漏读（跨行值、转义），每跑一次丢一批，
+ *      词典从 2400 条缩到 197 条，而文件**仍是合法 JS**，语法校验照样通过。
+ *      所以这里用**独立于 readDict 的方式**数：直接 import 出来的对象键数。
+ */
+function verifyCatalogSyntax(expectedTotal) {
   const fileUrl = pathToFileURL(catalogPath).href;
-  return import(fileUrl)
+  return import(`${fileUrl}?t=${Date.now()}`) // 加时间戳绕开 ESM 模块缓存
     .then((m) => {
-      const n = Object.keys(m.default || {}).length;
+      const dict = m.default || {};
+      const n = Object.keys(dict).length;
       console.log(`语法校验通过，词典可加载（${n} 条）`);
+      if (expectedTotal && n < expectedTotal) {
+        console.error(
+          `\n条目数异常：写入后只剩 ${n} 条，少于应有的 ${expectedTotal} 条。` +
+          '\n读回词典的扫描器漏读了，本次写入不可信——请从 git 恢复后重试。',
+        );
+        process.exit(1);
+      }
     })
     .catch((e) => {
       console.error(`\n词典写入后无法加载，请立即修复：\n  ${e.message}`);
       console.error('本次写入已撤销');
       try {
-        fs.copyFileSync(catalogPath + '.broken', catalogPath);
+        fs.copyFileSync(catalogPath, catalogPath + '.broken');
         console.error(`坏文件已留存在 ${path.basename(catalogPath)}.broken`);
       } catch { /* 留存失败也要报原文 */ }
       process.exit(1);
