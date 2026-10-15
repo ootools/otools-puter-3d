@@ -25,5 +25,5 @@
   "screenshots": [],
   "summary": "3D（HeyPuter/everything 的浏览器端三维场景编辑器）的 OTools 插件版：建模、雕刻、着色、几何节点、动画与渲染。场景文件是本机目录里的普通文件，不走任何云账号。",
   "uuid": "otools-puter-3d",
-  "version": "0.1.3"
+  "version": "0.1.4"
 }
