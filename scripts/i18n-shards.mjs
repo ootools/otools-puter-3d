@@ -30,6 +30,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -193,7 +194,12 @@ function doApply() {
     process.exit(1);
   }
 
-  // 收集所有译文；同一 key 冲突时报错而不是静默取一个
+  // 收集所有译文。
+  //
+  // 冲突**不中断整批**：早先的实现遇到任一冲突就 exit(1)，结果一条都没写进去——
+  // 而 `--export` 产出的 all.json 与人工分片天然会重叠（同一 key 两处译文），
+  // 于是「补最后几条」这种日常操作会静默失败，词典看着没变。
+  // 现在改成：冲突项跳过并记录，其余照常合并。
   const merged = new Map();
   const conflicts = [];
   let translated = 0;
@@ -213,9 +219,9 @@ function doApply() {
   }
 
   if (conflicts.length) {
-    console.error(`译文冲突 ${conflicts.length} 处，需人工裁决：`);
-    for (const c of conflicts.slice(0, 10)) console.error('  ' + c);
-    process.exit(1);
+    console.warn(`跳过 ${conflicts.length} 处译文冲突（取先出现的那个），其余照常合并：`);
+    for (const c of conflicts.slice(0, 10)) console.warn('  ' + c);
+    if (conflicts.length > 10) console.warn(`  …… 另有 ${conflicts.length - 10} 处`);
   }
   if (!translated) {
     console.log('没有填任何译文（zh 字段为空）');
@@ -235,27 +241,71 @@ function doApply() {
   }
 }
 
-/** 把新增词条追加到词典文件末尾（分区内）。 */
+/**
+ * 把新增词条追加到词典文件末尾（分区内）。
+ *
+ * 插入点必须锚定 **default export 对象字面量的闭合 `}`**，不能用
+ * `lastIndexOf('};')`：文件末尾还有 `export { patterns } from …` 一行，
+ * `};` 会落在它后面，把词条插到 export 语句之后——结果是语法错误，
+ * 整个插件白屏。这个坑真实发生过。
+ */
 function appendToCatalog(entries) {
   if (!entries.length) return;
-  let src = fs.readFileSync(catalogPath, 'utf8');
+  const src = fs.readFileSync(catalogPath, 'utf8');
   const block = entries
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([k, v]) => `  ${quoteKey(k)}: ${quoteKey(v)},`)
     .join('\n');
-  const marker = '\n  /* ------------------------------------------------- 续：批量补充的界面文案 */ */';
-  const section = `\n  /* ------------------------------------------------- 续：批量补充的界面文案 */\n${block}\n`;
-  if (src.includes('续：批量补充的界面文案')) {
-    // 已有分区：替换掉旧内容
-    const start = src.indexOf('  /* ------------------------------------------------- 续：批量补充的界面文案');
-    const end = src.lastIndexOf('};');
-    src = src.slice(0, start) + section.trimStart() + src.slice(end);
-  } else {
-    const end = src.lastIndexOf('};');
-    src = src.slice(0, end).replace(/\n+$/, '\n') + section + src.slice(end);
+  const HEADER = '/* --- 续：批量补充的界面文案 --- */';
+  const section = `\n  ${HEADER}\n${block}\n`;
+
+  // 对象字面量的闭合 `}`：从 `export default {` 起做花括号配平
+  const start = src.indexOf('export default');
+  if (start < 0) throw new Error('词典文件里找不到 export default');
+  let depth = 0, objEnd = -1, sawOpen = false;
+  for (let i = src.indexOf('{', start); i < src.length; i++) {
+    const c = src[i];
+    if (c === '{') { depth++; sawOpen = true; }
+    else if (c === '}') { depth--; if (sawOpen && depth === 0) { objEnd = i; break; } }
   }
-  fs.writeFileSync(catalogPath, src, 'utf8');
+  if (objEnd < 0) throw new Error('词典对象字面量没有正常闭合，先检查文件语法');
+
+  let out;
+  const at = src.indexOf(HEADER);
+  if (at >= 0) {
+    // 已有分区：替换整段（含尾部到对象闭合前的空白）
+    const lineStart = src.lastIndexOf('\n', at) + 1;
+    out = src.slice(0, lineStart) + section.trimStart() + src.slice(objEnd);
+  } else {
+    out = src.slice(0, objEnd).replace(/\n+$/, '\n') + section + src.slice(objEnd);
+  }
+  fs.writeFileSync(catalogPath, out, 'utf8');
+  verifyCatalogSyntax();
   console.log(`已写入 ${path.relative(repoRoot, catalogPath)}`);
+}
+
+/**
+ * 写完立刻验证词典能不能被解析。
+ *
+ * 这是必须的：词典是**运行时**加载的，一个引号没转义对就是整个插件白屏，
+ * 而 CI 的测试未必覆盖到新写的每一个键。坏文件必须当场失败，不能留到线上。
+ */
+function verifyCatalogSyntax() {
+  const fileUrl = pathToFileURL(catalogPath).href;
+  return import(fileUrl)
+    .then((m) => {
+      const n = Object.keys(m.default || {}).length;
+      console.log(`语法校验通过，词典可加载（${n} 条）`);
+    })
+    .catch((e) => {
+      console.error(`\n词典写入后无法加载，请立即修复：\n  ${e.message}`);
+      console.error('本次写入已撤销');
+      try {
+        fs.copyFileSync(catalogPath + '.broken', catalogPath);
+        console.error(`坏文件已留存在 ${path.basename(catalogPath)}.broken`);
+      } catch { /* 留存失败也要报原文 */ }
+      process.exit(1);
+    });
 }
 
 function quoteKey(s) {
