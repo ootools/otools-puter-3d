@@ -1,6 +1,6 @@
 {
   "name": "otools-puter-3d",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "type": "module",
   "description": "3D (HeyPuter/everything) as an OTools plugin: the same editor, with documents stored as plain files on this computer instead of in a Puter cloud account.",
