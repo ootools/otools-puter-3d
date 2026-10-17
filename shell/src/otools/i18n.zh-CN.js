@@ -14,7 +14,10 @@ import common from './i18n.common.zh-CN.js';
 
 export default {
   ...common,
-          '+Y Up': '+Y 轴向上',
+  '(De)select All': '全选/取消全选',
+  '(De)select All Keyframes': '全选/取消全选关键帧',
+  '(De)select All Strokes': '全选/取消全选笔画',
+  '+ New Collection': '+ 新建集合',
   'A collection cannot be moved inside itself or its descendants.': '集合不能移动到它自己或其子级内部。',
   'A color picker': '颜色拾取器',
   'A mesh can have up to eight modifiers.': '一个网格最多可带八个修改器。',
@@ -2744,7 +2747,6 @@ export default {
   'Zoom to Border': '缩放至边框',
   'Zoom View': '缩放视图',
   'Zoom\nZoom in/out in the view (drag)': '缩放\n在视图中放大/缩小（拖动）',
-
 };
 ;
 ;
