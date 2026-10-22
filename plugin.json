@@ -25,5 +25,36 @@
   "screenshots": [],
   "summary": "3D（HeyPuter/everything 的浏览器端三维场景编辑器）的 OTools 插件版：建模、雕刻、着色、几何节点、动画与渲染。场景文件是本机目录里的普通文件，不走任何云账号。",
   "uuid": "otools-puter-3d",
-  "version": "0.1.9"
+  "version": "0.2.0",
+  "mcp": {
+    "enabled": true,
+    "backend": "webview",
+    "namespace": "puter-3d",
+    "expose": [
+      "list_library",
+      "read_file",
+      "write_file",
+      "library_path",
+      "get_scene",
+      "list_objects",
+      "read_object",
+      "rename_object",
+      "set_object_visibility",
+      "delete_object",
+      "select_object"
+    ],
+    "annotations": {
+      "list_library": { "readOnly": true },
+      "read_file": { "readOnly": true },
+      "library_path": { "readOnly": true },
+      "write_file": { "readOnly": false, "destructive": true },
+      "get_scene": { "readOnly": true },
+      "list_objects": { "readOnly": true },
+      "read_object": { "readOnly": true },
+      "rename_object": { "readOnly": false, "destructive": false },
+      "set_object_visibility": { "readOnly": false, "destructive": false },
+      "delete_object": { "readOnly": false, "destructive": true },
+      "select_object": { "readOnly": false, "destructive": false }
+    }
+  }
 }

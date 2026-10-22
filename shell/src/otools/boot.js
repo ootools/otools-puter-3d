@@ -18,6 +18,8 @@ import { installDomTranslation } from './dom-i18n.js';
 import { installThemeSync } from './theme-sync.js';
 import { APP } from './app.js';
 import { usingHost, libraryDir } from './local.js';
+import { installMcpBridge } from './mcp.js';
+import { d3McpTools } from './mcp-tools.js';
 
 let booted = false;
 
@@ -36,6 +38,12 @@ export function boot() {
   if (usingHost()) {
     libraryDir().catch(() => { /* 建不了目录不该让启动失败 */ });
   }
+
+  // MCP 桥挂在最后：宿主读 `window.__otoolsMcp` 时会用到上面装好的库目录能力，
+  // 所以它必须晚于 i18n / 主题就绪。挂载本身没有副作用（只赋值，不触发工具调用）。
+  // 领域级工具（读/改当前场景对象）在 `otools/mcp-tools.js`；它们直接 import 的
+  // `app`（app/app.ts 的活绑定）在 setApp 之后自动可用，无需入口传句柄。
+  installMcpBridge({ extraTools: d3McpTools() });
 
   if (typeof document !== 'undefined') {
     document.documentElement.dataset.otoolsPlugin = APP.id;
