@@ -2,7 +2,7 @@
 // (time translate, scale, extend) and the Graph Editor (translate, rotate, scale
 // with axis constraints, numeric input and frame snapping).
 import { app, type ModalHandler } from '../app/app';
-import type { FCurve, Keyframe } from '../data/types';
+import type { FCurve, Keyframe, TimelineMarker } from '../data/types';
 import type { CurveRef } from './channels';
 import { calcHandles, alignHandle, sortKeyframes } from '../anim/fcurve';
 import { finalizeCurve, editable, isAnySelected } from './keyedit';
@@ -25,10 +25,33 @@ export interface KeyTransformHost {
   /** screen position (client px) of a frame/display value */
   screen(x: number, d: number): { x: number; y: number };
   autoSnap: boolean;
+  /** what snapping snaps to (whole frames by default); absolute snaps the keys, not the offset */
+  snapTo?: { mode: 'FRAME' | 'SECOND' | 'MARKER'; absolute: boolean; fps: number; markers: number[] };
   /** handles are only editable when displayed */
   handlesVisible(k: Keyframe): boolean;
   pivot?: 'BOUNDING_BOX_CENTER' | 'CURSOR' | 'INDIVIDUAL_ORIGINS';
   cursorValue?: number;
+  /** proportional editing: unselected keys within the radius (frames) follow with a falloff */
+  proportional?: { size: number; falloff: string };
+  /** keys moved onto the frame of another key replace it (View ▸ Auto-Merge Keyframes; default on) */
+  autoMerge?: boolean;
+  /** markers that move in time with the keys (Marker ▸ Sync Markers: the selected ones) */
+  syncMarkers?: TimelineMarker[];
+  /** View ▸ Realtime Updates off: other views update when the transform ends (`redraw` repaints the editor meanwhile) */
+  realtime?: boolean;
+  redraw?: () => void;
+  /** View ▸ Auto-Lock Key Axis: free moves follow only the dominant direction */
+  autoLockAxis?: boolean;
+}
+
+/** Move the synced markers by the time part of a transform (from their original frames). */
+function applyMarkers(orig: [TimelineMarker, number][], t: TransformValues, pivot: { x: number }) {
+  for (const [m, f] of orig) {
+    let x = f;
+    if (t.mode === 'TIME_TRANSLATE' || t.mode === 'TIME_EXTEND' || (t.mode === 'TRANSLATION' && t.constraint !== 'Y')) x = f + t.value[0];
+    else if (t.mode === 'TIME_SCALE' || (t.mode === 'RESIZE' && t.constraint !== 'Y')) x = pivot.x + (f - pivot.x) * t.value[0];
+    m.frame = Math.round(x);
+  }
 }
 
 interface Snap {
@@ -43,6 +66,10 @@ interface Snap {
   c: boolean;
   l: boolean;
   r: boolean;
+  /** proportional weight (1 for selected keys) */
+  w: number;
+  /** distance (frames) to the nearest selected key, for proportional editing */
+  dist: number;
 }
 
 export interface TransformValues {
@@ -57,6 +84,8 @@ export interface TransformValues {
 function collect(host: KeyTransformHost, mode: KeyTransformMode, side?: 'LEFT' | 'RIGHT'): Snap[] {
   const out: Snap[] = [];
   const cfra = app.doc.scene.frame_current;
+  const prop = host.proportional && mode !== 'TIME_EXTEND' && mode !== 'TIME_SLIDE' ? host.proportional : null;
+  const others: { k: Keyframe; fc: FCurve }[] = [];
   for (const { fc } of editable(host.transformCurves())) {
     for (const k of fc.keyframe_points) {
       let c = !!k.select_control_point;
@@ -67,22 +96,58 @@ function collect(host: KeyTransformHost, mode: KeyTransformMode, side?: 'LEFT' |
         const onSide = side === 'LEFT' ? k.co[0] <= cfra : k.co[0] >= cfra;
         if (!onSide) c = l = r = false;
       }
-      if (!c && !l && !r) continue;
-      out.push({
-        k,
-        fc,
-        co: [...k.co],
-        hl: [...k.handle_left],
-        hr: [...k.handle_right],
-        hlt: k.handle_left_type,
-        hrt: k.handle_right_type,
-        c,
-        l,
-        r,
-      });
+      if (!c && !l && !r) {
+        if (prop) others.push({ k, fc });
+        continue;
+      }
+      out.push(snapOf(k, fc, c, l, r, 1, 0));
     }
   }
+  if (prop && out.length) {
+    // proportional: distance to the nearest selected key (frames; in the Graph Editor the value
+    // axis is scaled to frames through the view's aspect)
+    const aspect = host.graph ? host.ppv() / Math.max(1e-6, host.ppf()) : 0;
+    const sel = out.filter((o) => o.c).map((o) => [o.co[0], host.toDisp(o.fc, o.co[1])] as const);
+    for (const { k, fc } of others) {
+      const y = host.toDisp(fc, k.co[1]);
+      let d = Infinity;
+      for (const [sx, sy] of sel) d = Math.min(d, Math.hypot(k.co[0] - sx, (y - sy) * aspect));
+      out.push(snapOf(k, fc, true, true, true, 0, d));
+    }
+    weighProportional(out, prop);
+  }
   return out;
+}
+
+function snapOf(k: Keyframe, fc: FCurve, c: boolean, l: boolean, r: boolean, w: number, dist: number): Snap {
+  return { k, fc, co: [...k.co], hl: [...k.handle_left], hr: [...k.handle_right], hlt: k.handle_left_type, hrt: k.handle_right_type, c, l, r, w, dist };
+}
+
+/** Falloff weight for a normalised distance (0 at the selection, 1 at the radius). */
+export function propFalloff(type: string, t: number): number {
+  const x = Math.max(0, Math.min(1, 1 - t));
+  switch (type) {
+    case 'SPHERE':
+      return Math.sqrt(1 - (1 - x) * (1 - x));
+    case 'ROOT':
+      return Math.sqrt(x);
+    case 'INVERSE_SQUARE':
+      return x * (2 - x);
+    case 'SHARP':
+      return x * x;
+    case 'LINEAR':
+      return x;
+    case 'CONSTANT':
+      return x > 0 ? 1 : 0;
+    case 'RANDOM':
+      return x * (0.5 + 0.5 * Math.random());
+    default:
+      return x * x * (3 - 2 * x);
+  }
+}
+
+function weighProportional(snaps: Snap[], prop: { size: number; falloff: string }) {
+  for (const s of snaps) if (s.dist > 0 || s.w < 1) s.w = s.dist < prop.size ? propFalloff(prop.falloff, s.dist / Math.max(1e-6, prop.size)) : 0;
 }
 
 function restore(s: Snap) {
@@ -102,6 +167,7 @@ function pivotOf(host: KeyTransformHost, snaps: Snap[], mode: KeyTransformMode):
     y0 = Infinity,
     y1 = -Infinity;
   for (const s of snaps) {
+    if (s.w < 1) continue;
     const pts: [number, number][] = [];
     if (s.c) pts.push(s.co);
     else {
@@ -117,6 +183,34 @@ function pivotOf(host: KeyTransformHost, snaps: Snap[], mode: KeyTransformMode):
     }
   }
   return x0 === Infinity ? { x: cfra, d: 0 } : { x: (x0 + x1) / 2, d: (y0 + y1) / 2 };
+}
+
+/** Snap a frame (absolute) to the chosen target. */
+export function snapFrameTo(f: number, snap: NonNullable<KeyTransformHost['snapTo']> | undefined): number {
+  if (!snap || snap.mode === 'FRAME') return Math.round(f);
+  if (snap.mode === 'SECOND') return Math.round(f / snap.fps) * snap.fps;
+  if (!snap.markers.length) return Math.round(f);
+  return snap.markers.reduce((a, b) => (Math.abs(b - f) < Math.abs(a - f) ? b : a));
+}
+
+/** Snap a time offset: by whole frames or seconds (markers and absolute snapping work per key). */
+function snapDelta(dx: number, snap: KeyTransformHost['snapTo']): number {
+  if (snap?.mode === 'SECOND' && !snap.absolute) return Math.round(dx / snap.fps) * snap.fps;
+  return Math.round(dx);
+}
+
+const perKeySnap = (snap: KeyTransformHost['snapTo']) => !!snap && (snap.absolute || snap.mode === 'MARKER');
+
+/** Frame range of the keys taking part in a transform (from their original positions). */
+function slideRange(snaps: Snap[]): [number, number] {
+  let a = Infinity,
+    b = -Infinity;
+  for (const s of snaps)
+    if (s.c && s.w >= 1) {
+      a = Math.min(a, s.co[0]);
+      b = Math.max(b, s.co[0]);
+    }
+  return a === Infinity ? [0, 0] : [a, b];
 }
 
 /** Apply transform values to the snapshot (from the initial state). */
@@ -135,9 +229,15 @@ function apply(host: KeyTransformHost, snaps: Snap[], t: TransformValues, pivot:
       switch (t.mode) {
         case 'TIME_TRANSLATE':
         case 'TIME_EXTEND':
-        case 'TIME_SLIDE':
           x += t.value[0];
           break;
+        case 'TIME_SLIDE': {
+          // inner keys slide towards one end of the selected range; the outer keys stay
+          const [a, b] = slideRange(snaps);
+          const f = Math.max(-1, Math.min(1, t.value[0]));
+          if (x > a + 1e-6 && x < b - 1e-6) x = f >= 0 ? x + (b - x) * f : x + (x - a) * f;
+          break;
+        }
         case 'TIME_SCALE':
           x = pivot.x + (x - pivot.x) * t.value[0];
           break;
@@ -164,7 +264,7 @@ function apply(host: KeyTransformHost, snaps: Snap[], t: TransformValues, pivot:
     };
     if (s.c) {
       const nco = map(s.co);
-      if (snapFrames && t.mode === 'TIME_SCALE') nco[0] = Math.round(nco[0]);
+      if (snapFrames && (t.mode === 'TIME_SCALE' || t.mode === 'TIME_SLIDE' || ((t.mode === 'TIME_TRANSLATE' || t.mode === 'TIME_EXTEND' || t.mode === 'TRANSLATION') && perKeySnap(host.snapTo)))) nco[0] = snapFrameTo(nco[0], host.snapTo);
       if (t.mode === 'ROTATION' || t.mode === 'RESIZE') {
         // handles follow the full mapping (they rotate/scale with the key)
         const nl = map(s.hl),
@@ -203,6 +303,13 @@ function apply(host: KeyTransformHost, snaps: Snap[], t: TransformValues, pivot:
         if (s.k.handle_left_type === 'ALIGNED' && s.k.handle_right_type === 'ALIGNED' && !s.l) alignHandle(s.k, 'left');
       }
     }
+    if (s.w < 1) {
+      // proportional: partial move towards the mapped position
+      const mix = (a: [number, number], b: [number, number]): [number, number] => [a[0] + (b[0] - a[0]) * s.w, a[1] + (b[1] - a[1]) * s.w];
+      s.k.co = mix(s.co, s.k.co as [number, number]);
+      s.k.handle_left = mix(s.hl, s.k.handle_left as [number, number]);
+      s.k.handle_right = mix(s.hr, s.k.handle_right as [number, number]);
+    }
     // keep handles on their side of the key
     if (s.k.handle_left[0] > s.k.co[0]) s.k.handle_left[0] = s.k.co[0];
     if (s.k.handle_right[0] < s.k.co[0]) s.k.handle_right[0] = s.k.co[0];
@@ -220,7 +327,8 @@ export function transformKeys(host: KeyTransformHost, t: TransformValues): numbe
   if (!snaps.length) return 0;
   const pivot = pivotOf(host, snaps, t.mode);
   const touched = apply(host, snaps, t, pivot, host.autoSnap);
-  for (const fc of touched) finalizeCurve(fc);
+  if (host.syncMarkers?.length) applyMarkers(host.syncMarkers.map((m) => [m, m.frame]), t, pivot);
+  for (const fc of touched) finalizeCurve(fc, host.autoMerge !== false);
   return snaps.length;
 }
 
@@ -254,6 +362,7 @@ export function startKeyTransform(
     side = opts.start.x < p.x ? 'LEFT' : 'RIGHT';
   }
   const snaps = collect(host, mode, side);
+  const markerOrig: [TimelineMarker, number][] = (host.syncMarkers ?? []).map((m) => [m, m.frame]);
   if (!snaps.length) return false;
   const pivot = pivotOf(host, snaps, mode);
   const pivotScreen = host.screen(pivot.x, pivot.d);
@@ -293,11 +402,16 @@ export function startKeyTransform(
     const num = evalNumeric();
     let value: [number, number];
     switch (mode) {
-      case 'TIME_TRANSLATE':
-      case 'TIME_EXTEND':
       case 'TIME_SLIDE': {
+        const [a, b] = slideRange(snaps);
+        const span = Math.max(1e-6, b - a);
+        value = [Math.max(-1, Math.min(1, num !== null ? num / 100 : (mouse.x - start.x) / ppf / span)), 0];
+        break;
+      }
+      case 'TIME_TRANSLATE':
+      case 'TIME_EXTEND': {
         let dx = num ?? (mouse.x - start.x) / ppf;
-        if (snapOn && num === null) dx = Math.round(dx);
+        if (snapOn && num === null && !perKeySnap(host.snapTo)) dx = snapDelta(dx, host.snapTo);
         value = [dx, 0];
         break;
       }
@@ -310,7 +424,11 @@ export function startKeyTransform(
             dx = num;
             if (constraint === 'NONE') dy = 0;
           }
-        } else if (snapOn) dx = Math.round(dx);
+        } else if (snapOn && !perKeySnap(host.snapTo)) dx = snapDelta(dx, host.snapTo);
+        if (num === null && constraint === 'NONE' && host.autoLockAxis) {
+          if (Math.abs(mouse.x - start.x) >= Math.abs(mouse.y - start.y)) dy = 0;
+          else dx = 0;
+        }
         value = [dx, dy];
         break;
       }
@@ -338,22 +456,32 @@ export function startKeyTransform(
     }
     current = { mode, value, constraint, side };
     apply(host, snaps, current, pivot, snapOn);
-    app.changed('doc');
+    if (markerOrig.length) applyMarkers(markerOrig, current, pivot);
+    if (host.realtime === false && host.redraw) host.redraw();
+    else app.changed('doc');
     opts.onUpdate?.();
   };
 
+  const resizeProportional = (k: number) => {
+    const prop = host.proportional!;
+    prop.size = Math.max(0.1, Math.min(10000, prop.size * k));
+    app.doc.scene.tool_settings.proportional_size = prop.size;
+    weighProportional(snaps, prop);
+    compute();
+  };
   const fmt = (v: number, d = 3) => (Math.abs(v) < 1e-9 ? '0' : v.toFixed(d));
   const handler: ModalHandler = {
     label: MODE_LABEL[mode],
     cursor: mode === 'TIME_TRANSLATE' || mode === 'TIME_EXTEND' ? 'ew-resize' : 'move',
     header: () => {
-      const n = numeric ? ` [${numeric}|]` : '';
+      const n = (numeric ? ` [${numeric}|]` : '') + (host.proportional ? `  Proportional size: ${host.proportional.size.toFixed(2)}` : '');
       const c = constraint !== 'NONE' ? ` along ${constraint}` : '';
       switch (mode) {
         case 'TIME_TRANSLATE':
         case 'TIME_EXTEND':
-        case 'TIME_SLIDE':
           return `Delta: ${fmt(current.value[0], 2)}${n}`;
+        case 'TIME_SLIDE':
+          return `Time Slide: ${Math.round(current.value[0] * 100)}%${n}`;
         case 'TIME_SCALE':
           return `Scale: ${fmt(current.value[0])}${n}`;
         case 'TRANSLATION':
@@ -400,9 +528,17 @@ export function startKeyTransform(
       if (opts.releaseConfirm && e.button === 0) return 'FINISHED';
       return undefined;
     },
+    onWheel(e: WheelEvent) {
+      if (!host.proportional) return;
+      resizeProportional(e.deltaY > 0 ? 1 / 1.1 : 1.1);
+    },
     onKey(e: KeyboardEvent) {
       if (e.key === 'Escape') return 'CANCELLED';
       if (e.key === 'Enter' || e.key === ' ') return 'FINISHED';
+      if (host.proportional && e.type === 'keydown' && (e.key === 'PageUp' || e.key === 'PageDown')) {
+        resizeProportional(e.key === 'PageUp' ? 1.1 : 1 / 1.1);
+        return true;
+      }
       if (e.key === 'Control' || e.key === 'Meta') {
         snapToggle = e.type === 'keydown';
         compute();
@@ -434,6 +570,7 @@ export function startKeyTransform(
       return true;
     },
     cancel() {
+      for (const [m, f] of markerOrig) m.frame = f;
       const touched = new Set<FCurve>();
       for (const s of snaps) {
         restore(s);
@@ -448,7 +585,7 @@ export function startKeyTransform(
     },
     finish() {
       const touched = new Set(snaps.map((s) => s.fc));
-      for (const fc of touched) finalizeCurve(fc);
+      for (const fc of touched) finalizeCurve(fc, host.autoMerge !== false);
       handler.redoOp = {
         idname: opts.redoIdname,
         props: {

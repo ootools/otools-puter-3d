@@ -1,11 +1,11 @@
 // Brush footprint for vertex-based paint modes (vertex colors, weights): projected (screen space
-// circle, the default like the reference app) or spherical (3D distance around the surface hit),
+// circle, the default) or spherical (3D distance around the surface hit),
 // with optional front-face test and normal falloff, plus symmetry passes.
 import { Matrix3, Matrix4, Vector3 } from 'three';
 import type { View3D } from '../editors/view3d/view3d';
 import { app } from '../app/app';
 import type { PaintBrush } from './brushes';
-import { falloff, mirror, symmetryPasses } from './math';
+import { cachedCurveTable, falloff, mirror, symmetryPasses } from './math';
 import type { Hit, MeshSession } from './session';
 
 /** Screen positions of all vertices (x, y, ndc z) for the current view. */
@@ -45,6 +45,20 @@ export interface GatherOptions {
   strength: number;
   /** cosine falloff of the normal against the view (paint modes); 0 disables */
   normalAngle?: number;
+  /** pen pressure factor for the radius */
+  sizeFactor?: number;
+  /** brush texture factor per vertex */
+  tex?: ((vi: number) => number) | null;
+}
+
+/**
+ * Brush radius in pixels at a world point: the pixel radius, or the scene-unit radius projected
+ * at that depth when the size is locked to the scene.
+ */
+export function brushRadiusPx(b: PaintBrush, s: MeshSession, v: View3D, world: Vector3 | null | undefined): number {
+  if (b.use_locked_size !== 'SCENE' || !world) return b.radius;
+  const perPx = s.pixelsToLocal(v, world, 1) * s.scale();
+  return Math.max(1, (b.unprojected_radius ?? 0.1) / Math.max(1e-9, perPx));
 }
 
 /**
@@ -72,7 +86,9 @@ export function gatherPaint(s: MeshSession, v: View3D, o: GatherOptions, scratch
   const ff = !!b.use_frontface;
   const P = s.positions;
   const hard = b.hardness ?? 0;
-  const R = b.falloff_shape === 'SPHERE' && o.hit ? s.pixelsToLocal(v, o.hit.world, b.radius) : 0;
+  const fc = b.falloff === 'CUSTOM' ? cachedCurveTable(b.falloff_curve) : null;
+  const rpx = brushRadiusPx(b, s, v, o.hit?.world) * (o.sizeFactor ?? 1);
+  const R = b.falloff_shape === 'SPHERE' && o.hit ? s.pixelsToLocal(v, o.hit.world, rpx) : 0;
   if (b.falloff_shape === 'SPHERE' && !o.hit) return 0;
   // Symmetry passes work like a mirrored viewpoint: the mesh is mirrored (object space) and painted
   // from the same view, so mirrored strokes reach the far side of the object too.
@@ -111,7 +127,7 @@ export function gatherPaint(s: MeshSession, v: View3D, o: GatherOptions, scratch
           dz = P[vi * 3 + 2] - c[2];
         const d2 = dx * dx + dy * dy + dz * dz;
         if (d2 > r2) continue;
-        const f = falloff(b.falloff, Math.sqrt(d2) / R, hard) * o.strength * normalFactor(vi);
+        const f = falloff(b.falloff, Math.sqrt(d2) / R, hard, fc) * o.strength * normalFactor(vi);
         if (f <= 0) continue;
         if (best[vi] === 0) list.push(vi);
         if (f > best[vi]) best[vi] = f;
@@ -119,7 +135,7 @@ export function gatherPaint(s: MeshSession, v: View3D, o: GatherOptions, scratch
     } else {
       scratch.proj = projectVertices(s, v, scratch.proj, sg);
       const proj = scratch.proj;
-      const r = b.radius,
+      const r = rpx,
         cx = o.x,
         cy = o.y;
       for (let vi = 0; vi < nv; vi++) {
@@ -130,19 +146,23 @@ export function gatherPaint(s: MeshSession, v: View3D, o: GatherOptions, scratch
         if (proj[vi * 3 + 2] > 1 || proj[vi * 3 + 2] < -1) continue;
         const d = Math.hypot(dx, dy);
         if (d > r) continue;
-        const f = falloff(b.falloff, d / r, hard) * o.strength * normalFactor(vi);
+        const f = falloff(b.falloff, d / r, hard, fc) * o.strength * normalFactor(vi);
         if (f <= 0) continue;
         if (best[vi] === 0) list.push(vi);
         if (f > best[vi]) best[vi] = f;
       }
     }
   }
-  const n = list.length;
-  for (let k = 0; k < n; k++) {
+  const allowed = s.paintVerts;
+  let n = 0;
+  for (let k = 0; k < list.length; k++) {
     const vi = list[k];
-    s.gv[k] = vi;
-    s.gf[k] = best[vi];
+    const f = best[vi];
     best[vi] = 0;
+    if (allowed && !allowed[vi]) continue;
+    s.gv[n] = vi;
+    s.gf[n] = o.tex ? f * o.tex(vi) : f;
+    n++;
   }
   return n;
 }
@@ -173,3 +193,15 @@ export function smearSource(s: MeshSession, vi: number, dir: Vector3): number {
 
 /** Default normal falloff angle of the paint modes (80°). */
 export const NORMAL_ANGLE = (80 * Math.PI) / 180;
+
+/** Normal falloff settings of a paint mode (tool_settings.vertex_paint / weight_paint / image_paint). */
+export interface NormalFalloff {
+  use_normal_falloff?: boolean;
+  normal_angle?: number;
+}
+
+/** The normal falloff angle a paint mode uses (0: off). */
+export function normalAngleOf(settings: NormalFalloff | undefined | null): number {
+  if (settings?.use_normal_falloff === false) return 0;
+  return settings?.normal_angle ?? NORMAL_ANGLE;
+}

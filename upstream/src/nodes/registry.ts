@@ -8,7 +8,7 @@
 // Shader nodes register in shader/defs.ts; Geometry Nodes and Compositor nodes can use the same
 // registry (set `treeTypes`), editor and tree utilities.
 import type { DocumentData, NodeData, NodeTreeData, SocketValue } from '../data/types';
-import type { MenuCategory, NodePropDef, NodeTypeDef, RawNodeData, RawSocket, ResolvedSocket, SocketContext, SocketDef, SocketType, TreeType, NodeClass } from './types';
+import type { MenuCategory, NodePanelDef, NodePropDef, NodeTypeDef, RawNodeData, RawSocket, ResolvedSocket, SocketContext, SocketDef, SocketType, TreeType, NodeClass } from './types';
 
 export const nodeTypes: Record<string, NodeTypeDef> = {};
 const aliases: Record<string, string> = {};
@@ -123,6 +123,7 @@ export function interfaceSocketType(socketType: string): {
     ['Collection', 'COLLECTION'],
     ['Image', 'IMAGE'],
     ['Material', 'MATERIAL'],
+    ['Font', 'FONT'],
     ['Texture', 'TEXTURE'],
     ['Rotation', 'ROTATION'],
     ['Matrix', 'MATRIX'],
@@ -148,10 +149,13 @@ export const SOCKET_IDNAME: Record<string, string> = {
   COLLECTION: 'NodeSocketCollection',
   IMAGE: 'NodeSocketImage',
   MATERIAL: 'NodeSocketMaterial',
+  FONT: 'NodeSocketFont',
   TEXTURE: 'NodeSocketTexture',
   ROTATION: 'NodeSocketRotation',
   MATRIX: 'NodeSocketMatrix',
   MENU: 'NodeSocketMenu',
+  CLOSURE: 'NodeSocketClosure',
+  BUNDLE: 'NodeSocketBundle',
 };
 
 /** Sockets of a group interface as node sockets. */
@@ -166,6 +170,8 @@ export function interfaceSockets(tree: NodeTreeData | undefined, inOut: 'INPUT' 
       if (i.default_value !== undefined) s.default = i.default_value;
       if (i.min_value !== undefined) s.min = i.min_value;
       if (i.max_value !== undefined) s.max = i.max_value;
+      if (i.hide_value) s.hide_value = true;
+      if (i.description) s.description = i.description;
       return s;
     });
 }
@@ -197,6 +203,25 @@ export function nodeSockets(node: NodeData, ctx?: SocketContext): { inputs: Reso
     inputs: all.inputs.filter((s) => isAvailable(node, s, false)).map((s) => resolve(def, node, s, false)),
     outputs: all.outputs.filter((s) => isAvailable(node, s, true)).map((s) => resolve(def, node, s, true)),
   };
+}
+
+/** Collapsible input panels of a node: from its type, or from a group's interface. */
+export function nodePanels(node: NodeData, ctx?: SocketContext): NodePanelDef[] {
+  const def = getNodeType(node.type);
+  if (!def) return [];
+  if (def.dynamicSockets && ctx) return def.dynamicSockets(node, ctx).panels ?? def.panels ?? [];
+  return def.panels ?? [];
+}
+
+/** Panels of a group interface, as node panels (inputs only). */
+export function interfacePanels(tree: NodeTreeData | undefined): NodePanelDef[] {
+  if (!tree?.interface_panels?.length) return [];
+  return tree.interface_panels.map((p) => ({
+    name: p.name,
+    inputs: (tree.interface ?? []).filter((i) => i.in_out === 'INPUT' && i.panel === p.identifier).map((i) => i.identifier),
+    closed: !!p.default_closed,
+    ...(p.toggle ? { toggle: p.toggle } : {}),
+  }));
 }
 
 export function findSocket(node: NodeData, identifier: string, isOutput: boolean, ctx?: SocketContext): SocketDef | undefined {
@@ -245,53 +270,62 @@ export function nodeTypesFor(treeType: TreeType): NodeTypeDef[] {
 // ---------------------------------------------------------------------------
 // Theme colors (header colors per node class, socket colors per type)
 
+/** Node editor behaviour (Preferences ▸ Editing ▸ Node Editor). */
+export const nodeEditorSettings = { insertOffset: true, insertMargin: 40 };
+
+/** Node editor canvas colours (Preferences ▸ Themes writes them). */
+export const NODE_EDITOR_COLORS = { back: '#1a1b1c', grid: '#292a2c', gridMajor: '#323335' };
+
 export const NODE_CLASS_COLORS: Record<NodeClass, string> = {
-  input: '#83314a',
-  output: '#4c1e2a',
-  shader: '#2b652b',
-  texture: '#79461d',
-  color: '#6e6e1d',
-  vector: '#3c3c83',
-  converter: '#246283',
-  group: '#3b5959',
-  layout: '#4d4d4d',
-  geometry: '#1d725e',
-  attribute: '#1d2546',
-  distort: '#4c9797',
-  matte: '#977474',
-  filter: '#3a2a4a',
-  script: '#2d4a2d',
-  interface: '#3b3b3b',
-  pattern: '#79461d',
+  input: '#813246',
+  output: '#4b1e28',
+  shader: '#2c642f',
+  texture: '#73481d',
+  color: '#6a6e1f',
+  vector: '#3f3b7e',
+  converter: '#276086',
+  group: '#3c5859',
+  layout: '#4b4c4d',
+  geometry: '#1e7161',
+  attribute: '#1e2447',
+  distort: '#4f9599',
+  matte: '#957472',
+  filter: '#3a2a48',
+  script: '#2d492f',
+  interface: '#38393b',
+  pattern: '#73481d',
 };
 
 export const SOCKET_COLORS: Record<SocketType, string> = {
-  FLOAT: '#a1a1a1',
-  INT: '#598c5c',
-  BOOLEAN: '#cca6d6',
-  VECTOR: '#6363c7',
-  RGBA: '#c7c729',
-  SHADER: '#63c763',
-  STRING: '#70b2ff',
-  ROTATION: '#a663c7',
-  MATRIX: '#4882bf',
-  MENU: '#4d4d4d',
-  GEOMETRY: '#00d6a3',
-  OBJECT: '#ed9e5c',
-  COLLECTION: '#f5f5f5',
-  IMAGE: '#633863',
-  MATERIAL: '#eb7582',
-  TEXTURE: '#9e4fa3',
-  CLOSURE: '#fcb36b',
-  BUNDLE: '#4a8899',
-  CUSTOM: '#808080',
+  FLOAT: '#a1a2a3',
+  INT: '#598b5f',
+  BOOLEAN: '#cea7d6',
+  VECTOR: '#6661c4',
+  RGBA: '#c3cb2d',
+  SHADER: '#6ac76e',
+  STRING: '#7db2fd',
+  ROTATION: '#a861c4',
+  MATRIX: '#4f80bf',
+  MENU: '#4b4c4d',
+  GEOMETRY: '#03d7af',
+  OBJECT: '#eaa258',
+  COLLECTION: '#f7f8fa',
+  IMAGE: '#623860',
+  MATERIAL: '#e9787f',
+  TEXTURE: '#9e4f9f',
+  FONT: '#e4b269',
+  SOUND: '#c7b2e0',
+  CLOSURE: '#fab767',
+  BUNDLE: '#4d869b',
+  CUSTOM: '#7f8082',
 };
 
 /** Socket type compatibility for links (implicit conversions). */
 export function canConvert(from: SocketType, to: SocketType): boolean {
   if (from === to) return true;
   const numeric: SocketType[] = ['FLOAT', 'INT', 'BOOLEAN', 'VECTOR', 'RGBA', 'ROTATION'];
-  if (numeric.includes(from) && numeric.includes(to)) return !(from === 'ROTATION' && to !== 'VECTOR') && !(to === 'ROTATION' && from !== 'VECTOR');
+  if (numeric.includes(from) && numeric.includes(to)) return !(from === 'ROTATION' && to !== 'VECTOR') && !(to === 'ROTATION' && from !== 'VECTOR' && from !== 'FLOAT');
+  if ((from === 'ROTATION' && to === 'MATRIX') || (from === 'MATRIX' && to === 'ROTATION')) return true;
   if (to === 'SHADER') return from !== 'GEOMETRY' && numeric.includes(from);
   if (to === 'CUSTOM' || from === 'CUSTOM') return true;
   return false;

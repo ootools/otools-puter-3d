@@ -1,46 +1,53 @@
-// Realtime (raster) renderer: HDR scene pass with MSAA, ground-truth ambient occlusion and bloom,
-// producing a scene-linear premultiplied buffer that is colour-managed for display afterwards.
-import { Color, ShaderMaterial, NoBlending, Vector2, MeshBasicMaterial, type Camera, type Scene, type Texture, type WebGLRenderer, type WebGLRenderTarget } from 'three';
+// Realtime (raster) renderer: HDR scene pass with MSAA, screen-traced reflections and horizon-scan
+// lighting (see ../realtime), and bloom, producing a scene-linear premultiplied buffer that is
+// colour-managed for display afterwards.
+import { Color, ShaderMaterial, NoBlending, Vector2, Vector3, Vector4, MeshBasicMaterial, type Camera, type Scene, type Texture, type WebGLRenderer, type WebGLRenderTarget } from 'three';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
-import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
-import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import type { RenderSettings } from '../../data/types';
 import { floatTarget, Blit } from './gbuffer';
-import { displayGLSL, VIEW_INDEX, type ViewTransform } from './colormanage';
+import { displayGLSL, VIEW_INDEX, lookParams, viewWhiteBalance, viewCurve, CURVE_TABLE_SIZE, type ViewSettings } from './colormanage';
+import { traceSettings, bloomOptions, type TraceSettings } from '../realtime/settings';
+import { TraceBuffer } from '../realtime/trace';
+import { BloomPass, type BloomSettings } from '../realtime/bloom';
+import { beginProbes } from '../realtime/probes/capture';
+import { fxUniforms } from '../realtime/fxshader';
+import { SssPass } from '../realtime/sss';
 
 export interface RasterEffects {
+  /** screen effects allowed (tracing / horizon scan); false for quick previews */
   gtao: boolean;
-  gtaoDistance: number;
   bloom: boolean;
-  bloomThreshold: number;
-  bloomIntensity: number;
-  bloomRadius: number;
   transparent: boolean;
+  /** Render ▸ Raytracing options (null: nothing traced) */
+  trace?: TraceSettings | null;
+  bloomSettings?: BloomSettings;
+  /** index of the accumulated sample (varies the tracing noise) */
+  sample?: number;
+  /** sphere probe cubemap resolution */
+  probeResolution?: number;
+  /** Light Paths ▸ Clamping ▸ Surface: direct, indirect (0 = off) */
+  clamp?: [number, number];
 }
 
 export function effectsFrom(r: RenderSettings): RasterEffects {
   return {
-    gtao: r.use_gtao,
-    gtaoDistance: r.gtao_distance,
+    gtao: true,
     bloom: r.use_bloom,
-    bloomThreshold: r.bloom_threshold,
-    bloomIntensity: r.bloom_intensity,
-    bloomRadius: r.bloom_radius,
     transparent: r.film_transparent,
+    trace: traceSettings(r),
+    bloomSettings: bloomOptions(r),
+    probeResolution: Number(r.gi_cubemap_resolution ?? 512) || 512,
+    clamp: [Math.max(0, r.clamp_surface_direct ?? 0), Math.max(0, r.clamp_surface_indirect ?? 10)],
   };
-}
-
-/** Map the reference bloom settings onto the bloom pass (strength, radius 0..1). */
-export function bloomParams(intensity: number, radius: number): { strength: number; radius: number } {
-  return { strength: Math.max(0, intensity) * 12, radius: Math.min(1, Math.max(0, radius / 10)) };
 }
 
 export class RasterRenderer {
   private composer: EffectComposer | null = null;
   private renderPass: RenderPass | null = null;
-  private gtao: GTAOPass | null = null;
-  private bloom: UnrealBloomPass | null = null;
+  private bloom: BloomPass | null = null;
+  private trace = new TraceBuffer();
+  private sss = new SssPass();
   private size = new Vector2();
 
   constructor(private samples = 4) {}
@@ -62,6 +69,11 @@ export class RasterRenderer {
     this.renderPass!.camera = camera;
   }
 
+  /** The bloom glare of the last render (Bloom pass), when bloom is on. */
+  get glare(): Texture | null {
+    return this.bloom?.enabled ? this.bloom.glare : null;
+  }
+
   /** Render into the composer and return the linear HDR result texture. */
   render(renderer: WebGLRenderer, scene: Scene, camera: Camera, w: number, h: number, fx: RasterEffects): Texture {
     this.ensure(renderer, scene, camera, w, h);
@@ -69,49 +81,51 @@ export class RasterRenderer {
     const rp = this.renderPass!;
     rp.clearColor = new Color(0, 0, 0);
     rp.clearAlpha = 0;
-    // ambient occlusion
-    if (fx.gtao) {
-      if (!this.gtao) {
-        this.gtao = new GTAOPass(scene, camera, w, h);
-        composer.insertPass(this.gtao, 1);
-      }
-      this.gtao.scene = scene;
-      this.gtao.camera = camera;
-      this.gtao.enabled = true;
-      this.gtao.updateGtaoMaterial({ radius: Math.max(0.01, fx.gtaoDistance) * 2, distanceExponent: 1, thickness: 1, scale: 1, samples: 16 });
-      this.gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 6, rings: 2, samples: 16 });
-      this.gtao.blendIntensity = 1;
-    } else if (this.gtao) this.gtao.enabled = false;
-    // bloom
+    // bloom (same steps as the compositor's Glare node in Bloom mode)
     if (fx.bloom) {
-      const p = bloomParams(fx.bloomIntensity, fx.bloomRadius);
       if (!this.bloom) {
-        this.bloom = new UnrealBloomPass(new Vector2(w, h), p.strength, p.radius, fx.bloomThreshold);
+        this.bloom = new BloomPass();
         composer.addPass(this.bloom);
       }
       this.bloom.enabled = true;
-      this.bloom.strength = p.strength;
-      this.bloom.radius = p.radius;
-      this.bloom.threshold = fx.bloomThreshold;
+      if (fx.bloomSettings) this.bloom.settings = fx.bloomSettings;
     } else if (this.bloom) this.bloom.enabled = false;
     const tm = renderer.toneMapping;
     const scissor = renderer.getScissorTest();
     const prev = renderer.getRenderTarget();
+    const shadowAuto = renderer.shadowMap.autoUpdate;
     renderer.setScissorTest(false);
     renderer.toneMapping = 0; // NoToneMapping: keep scene-linear values
-    composer.render();
-    renderer.toneMapping = tm;
-    renderer.setRenderTarget(prev);
-    renderer.setScissorTest(scissor);
+    // light probes (captures, planar reflection, per-object environments), then the screen
+    // tracing buffer (which also renders this frame's shadow maps, reused by the main pass)
+    if (fx.clamp) fxUniforms.ndClamp.value.set(fx.clamp[0], fx.clamp[1], 0, 0);
+    const restoreProbes = fx.gtao ? beginProbes(renderer, scene, camera, w, h, fx.probeResolution ?? 512) : null;
+    const traced = this.trace.prepare(renderer, scene, camera, w, h, fx.gtao && fx.trace ? fx.trace : null, fx.sample ?? 0);
+    if (traced) renderer.shadowMap.autoUpdate = false;
+    // subsurface scattering: irradiance of subsurface surfaces, gathered by the main pass
+    const sss = fx.gtao ? this.sss.prepare(renderer, scene, camera, w, h, fx.sample ?? 0, { samples: 24, maxRadius: Math.max(8, 0.2 * Math.max(w, h)) }) : false;
+    if (sss) renderer.shadowMap.autoUpdate = false;
+    try {
+      composer.render();
+    } finally {
+      if (sss) this.sss.disarm();
+      if (traced) this.trace.disarm();
+      restoreProbes?.();
+      fxUniforms.ndClamp.value.set(0, 0, 0, 0);
+      renderer.shadowMap.autoUpdate = shadowAuto;
+      renderer.toneMapping = tm;
+      renderer.setRenderTarget(prev);
+      renderer.setScissorTest(scissor);
+    }
     return composer.readBuffer.texture;
   }
 
   dispose() {
     this.composer?.dispose();
-    this.gtao?.dispose();
     this.bloom?.dispose();
+    this.trace.dispose();
+    this.sss.dispose();
     this.composer = null;
-    this.gtao = null;
     this.bloom = null;
     this.size.set(0, 0);
   }
@@ -132,24 +146,43 @@ export const displayMaterial = new ShaderMaterial({
     uInvGamma: { value: 1 },
     uBg: { value: new Color() },
     uComposite: { value: 1 },
+    uWb: { value: new Vector3(1, 1, 1) },
+    uLook: { value: new Vector4(1, 0, 1, 1) },
+    uCurve: { value: new Float32Array(CURVE_TABLE_SIZE) },
+    uUseCurve: { value: 0 },
   },
   vertexShader: /* glsl */ `varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
   fragmentShader: /* glsl */ `
-    uniform sampler2D tMap; uniform int uView; uniform float uExposure; uniform float uInvGamma; uniform vec3 uBg; uniform float uComposite;
+    uniform sampler2D tMap; uniform int uView; uniform float uExposure; uniform float uInvGamma; uniform vec3 uBg; uniform float uComposite; uniform vec3 uWb; uniform vec4 uLook;
+    uniform float uCurve[${CURVE_TABLE_SIZE}]; uniform float uUseCurve;
+    float cmCurve1(float x) {
+      float p = clamp(x, 0.0, 1.0) * ${CURVE_TABLE_SIZE - 1}.0;
+      int i = int(min(floor(p), ${CURVE_TABLE_SIZE - 2}.0));
+      return mix(uCurve[i], uCurve[i + 1], p - float(i));
+    }
     varying vec2 vUv;
     ${displayGLSL}
     void main() {
       vec4 p = texture2D(tMap, vUv);
       if (uComposite > 0.5) { p.rgb += uBg * (1.0 - clamp(p.a, 0.0, 1.0)); p.a = 1.0; }
-      gl_FragColor = cmDisplay(p, uView, uExposure, uInvGamma);
+      gl_FragColor = cmDisplayX(p, uView, uExposure, uInvGamma, uWb, uLook);
+      if (uUseCurve > 0.5) gl_FragColor.rgb = vec3(cmCurve1(gl_FragColor.r), cmCurve1(gl_FragColor.g), cmCurve1(gl_FragColor.b));
     }`,
 });
 
-export function setDisplay(view: ViewTransform, exposure: number, gamma: number, bg: Color | null) {
+/** Display settings of the Rendered viewport: the scene's view settings with an exposure offset. */
+export function setDisplay(s: ViewSettings, exposureOffset: number, bg: Color | null) {
   const u = displayMaterial.uniforms;
-  u.uView.value = VIEW_INDEX[view] ?? 1;
-  u.uExposure.value = Math.pow(2, exposure);
-  u.uInvGamma.value = gamma > 0 ? 1 / gamma : 1;
+  u.uView.value = VIEW_INDEX[s.view_transform] ?? 1;
+  u.uExposure.value = Math.pow(2, s.exposure + exposureOffset);
+  u.uInvGamma.value = s.gamma > 0 ? 1 / s.gamma : 1;
+  const wb = viewWhiteBalance(s) ?? [1, 1, 1];
+  (u.uWb.value as Vector3).set(wb[0], wb[1], wb[2]);
+  const look = lookParams(s.view_transform, s.look) ?? [1, 0, 1, 1];
+  (u.uLook.value as Vector4).set(look[0], look[1], look[2], look[3]);
+  const curve = viewCurve(s);
+  u.uUseCurve.value = curve ? 1 : 0;
+  if (curve) (u.uCurve.value as Float32Array).set(curve);
   u.uComposite.value = bg ? 1 : 0;
   if (bg) u.uBg.value.copy(bg);
 }

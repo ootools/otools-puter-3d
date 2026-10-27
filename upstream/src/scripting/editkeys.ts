@@ -4,7 +4,7 @@ import { app, type AreaLike } from '../app/app';
 import { keymaps, keyName, type KeyItem } from '../app/keymap';
 
 export function keyMatches(k: KeyItem, name: string, e: KeyboardEvent) {
-  if (k.key !== name) return false;
+  if (k.key !== name || k.inactive || (k.value ?? 'PRESS') !== 'PRESS') return false;
   if (k.any) return true;
   return !!k.shift === e.shiftKey && !!k.ctrl === (e.ctrlKey || e.metaKey) && !!k.alt === e.altKey;
 }
@@ -40,7 +40,7 @@ export function dispatchEditorKeys(e: KeyboardEvent, area: AreaLike, keymapNames
 }
 
 /**
- * Keyboard focus follows the mouse (like the reference application): when the pointer is over
+ * Keyboard focus follows the mouse: when the pointer is over
  * another area, keys typed while a text field of this editor has focus go to that area instead.
  */
 export function redirectIfElsewhere(e: KeyboardEvent, area: AreaLike, field: HTMLElement): boolean {

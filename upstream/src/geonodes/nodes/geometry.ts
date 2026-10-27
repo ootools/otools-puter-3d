@@ -1,4 +1,5 @@
 // Geometry, attribute and instance-level nodes that work on any component.
+import { curvesMoved } from '../curves/curvedata';
 import { gn, prop, sprop } from './defs';
 import { evalOn, pointDomainOf, hasDomain, DATA_TYPE_ITEMS } from './common';
 import { GeometrySet, InstancesComponent, composeMat, geometryBounds, mulMat, allocData, readAttribute, type Component } from '../geometry';
@@ -43,7 +44,7 @@ function setPositions(c: Component, sel: Field, pos: Field, off: Field, implicit
   void implicitPos;
   const cc = c.copy();
   cc.positions = out;
-  return cc;
+  return cc.kind === 'CURVES' ? curvesMoved(cc, old) : cc;
 }
 
 gn('GeometryNodeSetPosition', 'geometry', {
@@ -194,7 +195,7 @@ gn(
   {
     items: { domain: DELETE_DOMAINS },
     propPatch: {
-      mode: { visible: (n) => ['EDGE', 'FACE'].includes(sprop(n, 'domain')) },
+      mode: { visible: (n) => ['POINT', 'EDGE', 'FACE'].includes(sprop(n, 'domain')) },
     },
   },
 );
@@ -244,6 +245,13 @@ gn(
   },
 );
 
+/** The volume grids of a geometry on their own. */
+function volumeOnly(g: GeometrySet): GeometrySet {
+  const out = new GeometrySet();
+  out.volume = g.volume;
+  return out;
+}
+
 gn(
   'GeometryNodeSeparateComponents',
   'geometry',
@@ -255,10 +263,11 @@ gn(
         Curve: new GeometrySet(undefined, undefined, g.curves),
         'Point Cloud': new GeometrySet(undefined, g.points),
         Instances: new GeometrySet(undefined, undefined, undefined, g.instances),
+        Volume: volumeOnly(g),
       };
     },
   },
-  { drop: ['Grease Pencil', 'Volume'] },
+  { drop: ['Grease Pencil'] },
 );
 
 // ---------------------------------------------------------------------------
@@ -444,6 +453,7 @@ export function valueSocket(id: string, t: FieldType, name = id): SocketDef {
     VECTOR: [0, 0, 0],
     RGBA: [0, 0, 0, 1],
     ROTATION: [0, 0, 0],
+    MATRIX: undefined,
   };
   return {
     name,

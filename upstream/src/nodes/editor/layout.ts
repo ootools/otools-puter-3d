@@ -1,7 +1,7 @@
 // Node layout in node-space units (zoom 1): rows, sizes and socket positions. Pure (no DOM), so
 // the DOM renderer, the link canvas and hit-testing all agree on socket positions.
 import type { DocumentData, NodeData, NodeTreeData } from '../../data/types';
-import { getNodeType, nodeSockets, propValue } from '../registry';
+import { getNodeType, nodePanels, nodeSockets, propValue } from '../registry';
 import type { NodePanelDef, NodePropDef, ResolvedSocket } from '../types';
 
 export const HEADER = 22;
@@ -163,7 +163,7 @@ export function layoutNode(doc: DocumentData, tree: NodeTreeData, n: NodeData, l
     });
     cy += ROW;
   }
-  const panels = def?.panels ?? [];
+  const panels = nodePanels(n, { doc, tree });
   const inPanel = new Set(panels.flatMap((p) => [...p.inputs, ...(p.props ?? [])]));
   if (!n.hide_options) {
     for (const p of visibleProps(n, def?.props ?? [])) {
@@ -195,17 +195,20 @@ export function layoutNode(doc: DocumentData, tree: NodeTreeData, n: NodeData, l
   for (const s of showIn) if (!inPanel.has(s.identifier)) addInput(s);
   const open = new Set(n.open_panels ?? []);
   for (const p of panels) {
-    const members = showIn.filter((s) => p.inputs.includes(s.identifier));
+    const toggle = p.toggle ? showIn.find((s) => s.identifier === p.toggle) : undefined;
+    const members = showIn.filter((s) => p.inputs.includes(s.identifier) && s !== toggle);
     const pprops = n.hide_options
       ? []
       : visibleProps(
           n,
           (def?.props ?? []).filter((x) => p.props?.includes(x.id)),
         );
-    if (!members.length && !pprops.length) continue;
+    if (!members.length && !pprops.length && !toggle) continue;
     const isOpen = open.has(p.name) || (!p.closed && !n.open_panels);
     const headerY = cy;
-    rows.push({ kind: 'panel', y: cy, h: PANEL_ROW, panel: p, open: isOpen });
+    rows.push({ kind: 'panel', y: cy, h: PANEL_ROW, panel: p, open: isOpen, ...(toggle ? { socket: toggle, linked: linked.has(toggle.identifier) } : {}) });
+    // the panel toggle's socket sits on the panel header
+    if (toggle) sockets.set(sockKey(false, toggle.identifier), { x, y: y + cy + PANEL_ROW / 2, socket: toggle, isOutput: false });
     cy += PANEL_ROW;
     if (isOpen) {
       for (const pr of pprops) {
@@ -380,6 +383,37 @@ export function curveCrossesPolyline(c: number[], line: [number, number][], step
     prev = p;
   }
   return false;
+}
+
+/** First point where a polyline crosses a link curve, or null. */
+export function curvePolylineHit(c: number[], line: [number, number][], steps = 24): [number, number] | null {
+  let prev = bezierPoint(c, 0);
+  for (let i = 1; i <= steps; i++) {
+    const p = bezierPoint(c, i / steps);
+    for (let j = 1; j < line.length; j++) {
+      const a = line[j - 1],
+        b = line[j];
+      if (!segmentsIntersect(prev, p, a, b)) continue;
+      // intersection of the two segments
+      const d = (prev[0] - p[0]) * (a[1] - b[1]) - (prev[1] - p[1]) * (a[0] - b[0]);
+      if (Math.abs(d) < 1e-9) return [(prev[0] + p[0]) / 2, (prev[1] + p[1]) / 2];
+      const t = ((prev[0] - a[0]) * (a[1] - b[1]) - (prev[1] - a[1]) * (a[0] - b[0])) / d;
+      return [prev[0] + t * (p[0] - prev[0]), prev[1] + t * (p[1] - prev[1])];
+    }
+    prev = p;
+  }
+  return null;
+}
+
+/** Whether a point is inside a polygon (even-odd rule). */
+export function pointInPolygon(x: number, y: number, poly: [number, number][]): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i],
+      [xj, yj] = poly[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
 }
 
 /** Squared distance from a point to a link curve (approximate). */

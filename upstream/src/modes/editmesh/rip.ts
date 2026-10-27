@@ -14,7 +14,7 @@ import { extrudeRegion } from './ops-topology';
  * vertex, the fan group with the best score receives a new copy of the vertex.
  * Returns the number of new vertices.
  */
-export function ripSelection(m: MeshEdit, score: (f: number) => number): number {
+export function ripSelection(m: MeshEdit, score: (f: number) => number, ripMap?: Map<number, number>): number {
   const selEdges = new Set(m.selectedEdges().map(([a, b]) => edgeKey(a, b)));
   const facesOf = new Map<number, number[]>();
   m.faces.forEach((f, fi) => {
@@ -62,6 +62,7 @@ export function ripSelection(m: MeshEdit, score: (f: number) => number): number 
       ripped = [fs.reduce((a, b) => (score(a) <= score(b) ? a : b))];
     }
     const nv = m.addVert(m.p(v), [[v, 1]], 1);
+    ripMap?.set(v, nv);
     created++;
     newSel.push(nv);
     for (const f of ripped) (remapPerFace.get(f) ?? remapPerFace.set(f, new Map()).get(f)!).set(v, nv);
@@ -74,39 +75,152 @@ export function ripSelection(m: MeshEdit, score: (f: number) => number): number 
   return created;
 }
 
+/** Close the gap a rip opened with new faces between the old and the new vertices. */
+export function ripFill(m: MeshEdit, ripMap: Map<number, number>) {
+  const ef = m.edgeFaces();
+  const done = new Set<string>();
+  const first = m.faces.length;
+  for (const [v, nv] of ripMap) {
+    for (const [k, l] of ef) {
+      if (l.length !== 1) continue;
+      const [a, b] = k.split(':').map(Number);
+      if (a !== v && b !== v) continue;
+      const o = a === v ? b : a;
+      const no = ripMap.get(o) ?? o;
+      const twin = edgeKey(nv, no);
+      if (!ef.has(twin) || done.has(k)) continue;
+      done.add(k).add(twin);
+      // the remaining face runs x→y along the old edge; the fill runs y→x then over to the new side
+      const [fi, ci] = l[0];
+      const f = m.faces[fi];
+      const x = f.verts[ci],
+        y = f.verts[(ci + 1) % f.verts.length];
+      const map = (q: number) => ripMap.get(q) ?? q;
+      const verts = [y, x, map(x), map(y)].filter((q, i, arr) => arr.indexOf(q) === i);
+      if (verts.length >= 3) m.faces.push(m.makeFace(verts, f));
+    }
+  }
+  return m.faces.length - first;
+}
+
+/** Extend boundary vertices: each gets a new vertex joined by a triangle on its boundary edge nearest `score`. */
+export function ripEdge(m: MeshEdit, score: (v: number) => number): number {
+  const ef = m.edgeFaces();
+  const sel = m.selectedVerts();
+  const created: number[] = [];
+  for (const v of sel) {
+    let best: { o: number; fi: number; ci: number } | null = null,
+      bs = Infinity;
+    for (const [k, l] of ef) {
+      if (l.length !== 1) continue;
+      const [a, b] = k.split(':').map(Number);
+      if (a !== v && b !== v) continue;
+      const o = a === v ? b : a;
+      const s = score(o);
+      if (s < bs) {
+        bs = s;
+        best = { o, fi: l[0][0], ci: l[0][1] };
+      }
+    }
+    const nv = m.addVert(m.p(v), [[v, 1]], 1);
+    created.push(nv);
+    if (!best) {
+      m.looseEdges.push([v, nv]);
+      continue;
+    }
+    const f = m.faces[best.fi];
+    const x = f.verts[best.ci],
+      y = f.verts[(best.ci + 1) % f.verts.length];
+    // new triangle on the open side of edge x→y, with the new vertex replacing v's role
+    m.faces.push(m.makeFace(x === v ? [y, x, nv] : [nv, y, x], f));
+  }
+  m.sel = m.sel.map(() => 0);
+  for (const v of created) m.sel[v] = 1;
+  return created.length;
+}
+
+/** Rip the selection away from the side nearest the mouse; false when nothing could be ripped. */
+function ripAtMouse(ev: { x: number; y: number } | undefined, fill: boolean): boolean {
+  const v = activeView3D();
+  if (!v) return false;
+  const r = v.el.getBoundingClientRect();
+  const mx = (ev?.x ?? app.pointer.x) - r.left,
+    my = (ev?.y ?? app.pointer.y) - r.top;
+  let total = 0;
+  withEdit((m, ob) => {
+    const w: Matrix4 = worldMatrix(ob);
+    const centre = (fi: number) => {
+      const c = new Vector3();
+      for (const vi of m.faces[fi].verts) c.add(new Vector3(...m.p(vi)));
+      c.multiplyScalar(1 / m.faces[fi].verts.length).applyMatrix4(w);
+      const s = v.project(c);
+      return Math.hypot(s.x - mx, s.y - my);
+    };
+    const ripMap = new Map<number, number>();
+    const n = ripSelection(m, centre, ripMap);
+    if (n && fill) ripFill(m, ripMap);
+    total += n;
+    return n > 0;
+  });
+  if (!total) app.report('WARNING', 'Cannot rip selected faces or vertices without connected geometry');
+  return total > 0;
+}
+
+/** Extend the selected boundary vertices towards the mouse; false when nothing was extended. */
+function ripEdgeAtMouse(ev: { x: number; y: number } | undefined): boolean {
+  const v = activeView3D();
+  if (!v) return false;
+  const r = v.el.getBoundingClientRect();
+  const mx = (ev?.x ?? app.pointer.x) - r.left,
+    my = (ev?.y ?? app.pointer.y) - r.top;
+  return withEdit((m, ob) => {
+    const w = worldMatrix(ob);
+    const dist = (vi: number) => {
+      const s = v.project(new Vector3(...m.p(vi)).applyMatrix4(w));
+      return Math.hypot(s.x - mx, s.y - my);
+    };
+    return ripEdge(m, dist) > 0;
+  });
+}
+
+// the mouse position a rip was invoked at, so the redo panel can repeat it
+let lastRipMouse: { x: number; y: number } | undefined;
+
 registerOperators([
   {
     idname: 'mesh.rip_move',
     label: 'Rip',
     description: 'Disconnect vertex or edges from connected geometry and move them',
+    props: [{ id: 'use_fill', label: 'Fill', type: 'bool', default: false }],
     poll: inMeshEdit,
-    invoke: (ctx) => {
-      const v = activeView3D();
-      if (!v) return 'CANCELLED';
-      const r = v.el.getBoundingClientRect();
-      const mx = (ctx.event?.x ?? app.pointer.x) - r.left,
-        my = (ctx.event?.y ?? app.pointer.y) - r.top;
-      let total = 0;
-      withEdit((m, ob) => {
-        const w: Matrix4 = worldMatrix(ob);
-        const centre = (fi: number) => {
-          const c = new Vector3();
-          for (const vi of m.faces[fi].verts) c.add(new Vector3(...m.p(vi)));
-          c.multiplyScalar(1 / m.faces[fi].verts.length).applyMatrix4(w);
-          const s = v.project(c);
-          return Math.hypot(s.x - mx, s.y - my);
-        };
-        const n = ripSelection(m, centre);
-        total += n;
-        return n > 0;
-      });
-      if (!total) {
-        app.report('WARNING', 'Cannot rip selected faces or vertices without connected geometry');
-        return 'CANCELLED';
-      }
+    invoke: (ctx, p) => {
+      if (!ripAtMouse(ctx.event, !!p.use_fill)) return 'CANCELLED';
       app.flush();
       return startTransform('TRANSLATION', { event: ctx.event, label: 'Rip' }) ? 'RUNNING_MODAL' : 'CANCELLED';
     },
+  },
+  {
+    idname: 'mesh.rip',
+    label: 'Rip',
+    description: 'Tear the selection loose from the faces on the side nearest the mouse, leaving it in place',
+    props: [{ id: 'use_fill', label: 'Fill', type: 'bool', default: false }],
+    poll: inMeshEdit,
+    invoke: (ctx, p) => {
+      lastRipMouse = ctx.event ?? { ...app.pointer };
+      return ripAtMouse(lastRipMouse, !!p.use_fill) ? 'FINISHED' : 'CANCELLED';
+    },
+    exec: (_ctx, p) => (ripAtMouse(lastRipMouse, !!p.use_fill) ? 'FINISHED' : 'CANCELLED'),
+  },
+  {
+    idname: 'mesh.rip_edge',
+    label: 'Extend Vertices',
+    description: 'Extend the selected boundary vertices with new faces on the side nearest the mouse, leaving them in place',
+    poll: inMeshEdit,
+    invoke: (ctx) => {
+      lastRipMouse = ctx.event ?? { ...app.pointer };
+      return ripEdgeAtMouse(lastRipMouse) ? 'FINISHED' : 'CANCELLED';
+    },
+    exec: () => (ripEdgeAtMouse(lastRipMouse) ? 'FINISHED' : 'CANCELLED'),
   },
 ]);
 
@@ -150,7 +264,22 @@ registerOperators([
   },
 ]);
 
+registerOperators([
+  {
+    idname: 'mesh.rip_edge_move',
+    label: 'Extend Vertices',
+    description: 'Extend the selected boundary vertices with new faces and move the new vertices',
+    poll: inMeshEdit,
+    invoke: (ctx) => {
+      if (!ripEdgeAtMouse(ctx.event)) return 'CANCELLED';
+      app.flush();
+      return startTransform('TRANSLATION', { event: ctx.event, label: 'Extend Vertices' }) ? 'RUNNING_MODAL' : 'CANCELLED';
+    },
+  },
+]);
+
 addKeys('Mesh', [
   { key: 'V', op: 'mesh.rip_move', when: inMeshEdit },
-  { key: 'V', alt: true, op: 'mesh.rip_move', when: inMeshEdit },
+  { key: 'V', alt: true, op: 'mesh.rip_move', props: { use_fill: true }, when: inMeshEdit },
+  { key: 'D', alt: true, op: 'mesh.rip_edge_move', when: inMeshEdit },
 ]);

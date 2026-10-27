@@ -5,18 +5,36 @@ import { h, patch, type Child } from '../ui/h';
 import { icon } from '../ui/icons';
 import { app, type ChangeKind } from '../app/app';
 import type { Area, Editor } from '../ui/screen';
-import { openMenu, promptText, type MenuItem } from '../ui/menu';
-import { textField } from '../ui/widgets';
-import type { ObjectData } from '../data/types';
-import { View2D, frameStep } from './view2d';
+import { openMenu, openPopover, promptText, type MenuItem } from '../ui/menu';
+import './anim.css';
+import { textField, numberField, checkbox, enumMenu } from '../ui/widgets';
+import { getValue, setValue } from '../data/rna';
+import { keyProperty } from '../anim/keyframes';
+import type { ObjectData, TimelineMarker } from '../data/types';
+import { View2D, frameStep, formatSeconds } from './view2d';
 import { C } from './theme';
-import { buildChannels, channelSelected, setChannelSelected, channelCurves, isExpanded, setExpanded, channelState, type Channel, type ChannelList, type SpaceKind, type CurveRef } from './channels';
+import { curveSlot, slotName } from '../anim/slots';
+import { renameSlotEverywhere } from './slotops';
+import { collectionObjects, buildChannels, channelSelected, type ChannelFilter, setChannelSelected, channelCurves, isExpanded, setExpanded, channelState, type Channel, type ChannelList, type SpaceKind, type CurveRef } from './channels';
 import { setKeySelected } from './keyedit';
+import { markerMenu, markerAt, markersLocked } from './markers';
+import { playbackOptions, playbackFooter } from './footer';
 
 export const RULER_H = 22;
 export const MARKER_H = 22;
 
+/** A selectable point in the main region (canvas-local px) for box/circle/lasso selection. */
+export interface Selectable {
+  x: number;
+  y: number;
+  selected: boolean;
+  set(v: boolean): void;
+}
+
 export type Region = 'channels' | 'main' | 'ruler' | 'markers' | 'sidebar' | 'footer';
+
+/** The visible frame range shared by editors with Sync Visible Range on (last change wins). */
+const syncedRange = { a: 0, b: 0, rev: 0 };
 
 export interface SidebarTab {
   id: string;
@@ -73,10 +91,51 @@ export abstract class AnimEditor implements Editor {
   sidebarTab = '';
   autoSnap = true;
   showMarkers = true;
+  /** ruler labels in seconds+frames instead of frames */
+  showSeconds = false;
+  /** value sliders next to F-Curve channels */
+  showSliders = false;
+  /** the channel region is shown (View ▸ Channels) */
+  showChannels = true;
+  /** keys moved onto another key's frame replace it (View ▸ Auto-Merge Keyframes) */
+  autoMerge = true;
+  /** View ▸ Realtime Updates: other views follow while keys are transformed */
+  realtimeUpdates = true;
+  /** View ▸ Sync Visible Range: editors with it on show the same frame range */
+  syncRange = false;
+  /** View ▸ Playback Controls: the footer with the playback controls */
+  showFooter = false;
+  /** the channel search matches every word separately (View ▸ Multi-Word Match Search) */
+  multiWordSearch = false;
+  /** Filters popover: only objects of this collection ('' for all) */
+  filterCollection = '';
+  /** Filters popover: channel types not shown */
+  hiddenTypes: string[] = [];
+  /** Filters popover: objects in alphabetical order */
+  sortByName = true;
+  /** Marker ▸ Sync Markers: selected markers move with transformed keys */
+  syncMarkers = false;
+  /** what transforms snap to, and whether keys snap to it (absolute) or move by whole steps */
+  snapMode: 'FRAME' | 'SECOND' | 'MARKER' = 'FRAME';
+  snapAbsolute = false;
   hover: Region | null = null;
-  list: ChannelList = { rows: [], curves: [] };
+  private _list: ChannelList = { rows: [], curves: [] };
+  private listDoc: unknown = null;
+  /** Channel list; rebuilt lazily when the document was swapped (undo, Adjust Last Operation). */
+  get list(): ChannelList {
+    if (this.listDoc !== app.doc) this.rebuild();
+    return this._list;
+  }
+  set list(v: ChannelList) {
+    this._list = v;
+    this.listDoc = app.doc;
+  }
   rowH = 18;
   boxRect: { x0: number; y0: number; x1: number; y1: number } | null = null;
+  /** markers drawn over the bottom of the content instead of in their own row (short editors) */
+  compactMarkers = false;
+  /** transient overlays drawn over the main region (circle/lasso select, slider tools) */
+  overlay: { circle?: { x: number; y: number; r: number }; lasso?: { x: number; y: number }[]; slider?: { label: string; text: string; t: number | null; t0?: number } } | null = null;
   protected canvas: HTMLCanvasElement;
   protected bodyEl: HTMLElement;
   protected chEl: HTMLElement;
@@ -113,7 +172,13 @@ export abstract class AnimEditor implements Editor {
     this.canvas.addEventListener('wheel', (e) => this.onWheel(e), {
       passive: false,
     });
-    this.canvas.addEventListener('dblclick', (e) => this.onCanvasDblClick(e));
+    this.canvas.addEventListener('dblclick', (e) => {
+      if (this.regionAt(e) === 'markers') {
+        if (this.markerList().some((m) => m.select)) app.run('marker.rename', {}, { area: this.area });
+        return;
+      }
+      this.onCanvasDblClick(e);
+    });
     this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     this.mainEl.addEventListener('pointermove', (e) => (this.hover = this.regionAt(e)));
     this.chEl.addEventListener('pointermove', () => (this.hover = 'channels'));
@@ -129,10 +194,29 @@ export abstract class AnimEditor implements Editor {
     );
     this.chRowsEl.addEventListener('pointerdown', (e) => {
       if (e.target === this.chRowsEl || (e.target as HTMLElement).classList.contains('anim-ch-inner')) {
-        if (e.button === 0 && !e.shiftKey) {
-          this.deselectChannels();
-          app.pushUndo('Deselect Channels');
-          app.changed('doc');
+        if (e.button === 0 && !app.modal) {
+          const x0 = e.clientX,
+            y0 = e.clientY;
+          const move = (ev: PointerEvent) => {
+            if (Math.hypot(ev.clientX - x0, ev.clientY - y0) < 4) return;
+            cleanup();
+            this.channelBoxGesture(e, (a, b, up) =>
+              app.run('anim.channels_select_box', { ymin: a, ymax: b, extend: e.shiftKey || up.shiftKey, deselect: e.ctrlKey || e.metaKey }, { area: this.area, invoke: false }),
+            );
+          };
+          const up = () => {
+            cleanup();
+            if (e.shiftKey) return;
+            this.deselectChannels();
+            app.pushUndo('Deselect Channels');
+            app.changed('doc');
+          };
+          const cleanup = () => {
+            removeEventListener('pointermove', move);
+            removeEventListener('pointerup', up);
+          };
+          addEventListener('pointermove', move);
+          addEventListener('pointerup', up);
         }
       }
       if (e.button === 1) this.dragScroll(e);
@@ -183,8 +267,33 @@ export abstract class AnimEditor implements Editor {
   protected rowToggles(_ch: Channel): Child {
     return null;
   }
-  protected rowExtra(_ch: Channel): Child {
-    return null;
+  protected rowExtra(ch: Channel): Child {
+    return this.valueSlider(ch);
+  }
+
+  /** Value slider for an F-Curve channel (View ▸ Show Sliders); edits key the value with auto keying. */
+  protected valueSlider(ch: Channel): Child {
+    if (!this.showSliders || ch.kind !== 'FCURVE' || !ch.fc || !ch.ob) return null;
+    const ob = ch.ob,
+      fc = ch.fc;
+    const v = getValue(app.doc, ob, fc.data_path, fc.array_index);
+    if (typeof v !== 'number') return null;
+    return h(
+      'span',
+      { class: 'anim-ch-slider' },
+      numberField({
+        id: `chs-${ch.key}`,
+        value: v,
+        precision: 3,
+        step: 0.1,
+        set: (nv, final) => {
+          setValue(app.doc, ob, fc.data_path, fc.array_index, nv);
+          if (final && app.doc.scene.tool_settings.use_keyframe_insert_auto) keyProperty(app.doc, ob, fc.data_path, fc.array_index);
+          app.changed('doc');
+          if (final) app.pushUndo('Change Channel Value');
+        },
+      }),
+    );
   }
   protected mainContextMenu(): MenuItem[] | null {
     return null;
@@ -193,6 +302,10 @@ export abstract class AnimEditor implements Editor {
     return [];
   }
   protected onCanvasDblClick(_e: MouseEvent) {}
+  /** selectable points for shaped (box/circle/lasso) selection */
+  selectables(_includeHandles = true): Selectable[] {
+    return [];
+  }
   /** whether vertical pan scrolls channel rows (true) or pans the value axis */
   protected rowScroll = true;
   /** wheel zoom over the main region */
@@ -211,6 +324,20 @@ export abstract class AnimEditor implements Editor {
       sidebarTab: this.sidebarTab,
       autoSnap: this.autoSnap,
       showMarkers: this.showMarkers,
+      showSeconds: this.showSeconds,
+      showSliders: this.showSliders,
+      showChannels: this.showChannels,
+      autoMerge: this.autoMerge,
+      realtimeUpdates: this.realtimeUpdates,
+      syncRange: this.syncRange,
+      showFooter: this.showFooter,
+      multiWordSearch: this.multiWordSearch,
+      filterCollection: this.filterCollection,
+      hiddenTypes: this.hiddenTypes,
+      sortByName: this.sortByName,
+      syncMarkers: this.syncMarkers,
+      snapMode: this.snapMode,
+      snapAbsolute: this.snapAbsolute,
       view: {
         x0: this.view.x0,
         ppf: this.view.ppf,
@@ -233,6 +360,20 @@ export abstract class AnimEditor implements Editor {
     if (typeof s.sidebarTab === 'string') this.sidebarTab = s.sidebarTab;
     if (typeof s.autoSnap === 'boolean') this.autoSnap = s.autoSnap;
     if (typeof s.showMarkers === 'boolean') this.showMarkers = s.showMarkers;
+    if (typeof s.showSeconds === 'boolean') this.showSeconds = s.showSeconds;
+    if (typeof s.showSliders === 'boolean') this.showSliders = s.showSliders;
+    if (typeof s.showChannels === 'boolean') this.showChannels = s.showChannels;
+    if (typeof s.autoMerge === 'boolean') this.autoMerge = s.autoMerge;
+    if (typeof s.realtimeUpdates === 'boolean') this.realtimeUpdates = s.realtimeUpdates;
+    if (typeof s.syncRange === 'boolean') this.syncRange = s.syncRange;
+    if (typeof s.showFooter === 'boolean') this.showFooter = s.showFooter;
+    if (typeof s.multiWordSearch === 'boolean') this.multiWordSearch = s.multiWordSearch;
+    if (typeof s.filterCollection === 'string') this.filterCollection = s.filterCollection;
+    if (Array.isArray(s.hiddenTypes)) this.hiddenTypes = s.hiddenTypes.filter((x): x is string => typeof x === 'string');
+    if (typeof s.sortByName === 'boolean') this.sortByName = s.sortByName;
+    if (typeof s.syncMarkers === 'boolean') this.syncMarkers = s.syncMarkers;
+    if (s.snapMode === 'FRAME' || s.snapMode === 'SECOND' || s.snapMode === 'MARKER') this.snapMode = s.snapMode;
+    if (typeof s.snapAbsolute === 'boolean') this.snapAbsolute = s.snapAbsolute;
     if (typeof s.scrollY === 'number') this.scrollY = s.scrollY;
     const v = s.view as Record<string, number> | undefined;
     if (v && typeof v.x0 === 'number') {
@@ -241,11 +382,20 @@ export abstract class AnimEditor implements Editor {
     }
   }
 
-  get filter() {
+  /** list only channels whose property can't be found */
+  onlyErrors = false;
+
+  get filter(): ChannelFilter {
     return {
       onlySelected: this.onlySelected,
       showHidden: this.showHidden,
       search: this.search,
+      multiWord: this.multiWordSearch,
+      collection: this.filterCollection && app.doc.collections[this.filterCollection] ? collectionObjects(app.doc, this.filterCollection) : null,
+      hiddenTypes: new Set(this.hiddenTypes),
+      sortByName: this.sortByName,
+      onlyErrors: this.onlyErrors,
+      curveError: (ob, fc) => !!fc.disabled || (fc.data_path !== '' && getValue(app.doc, ob, fc.data_path, fc.array_index) === undefined),
       isVisible: (ob: ObjectData) => app.isVisible(ob.id),
       activeObject: app.activeObject,
     };
@@ -262,7 +412,12 @@ export abstract class AnimEditor implements Editor {
 
   // ---------------------------------------------------------------- Editor
 
-  update(_kinds?: Set<ChangeKind>) {
+  update(kinds?: Set<ChangeKind>) {
+    // Follow Current Frame: page the view along with the playhead during playback
+    if (app.playing && playbackOptions.follow && kinds?.has('frame') && this.mainW) {
+      const x = this.view.fx(app.doc.scene.frame_current);
+      if (x < 0 || x > this.mainW) this.view.panPx(-(x - this.mainW * 0.1), 0);
+    }
     this.refresh();
   }
 
@@ -276,6 +431,7 @@ export abstract class AnimEditor implements Editor {
 
   layout() {
     this.chEl.style.width = `${this.chWidth}px`;
+    this.chEl.style.display = this.showChannels ? '' : 'none';
     this.sbEl.hidden = !this.showSidebar || !this.sidebarTabs().length;
   }
 
@@ -287,7 +443,7 @@ export abstract class AnimEditor implements Editor {
     this.drawChannels();
     this.draw();
     this.drawSidebar();
-    const f = this.footer();
+    const f = this.showFooter ? (this.footer() ?? playbackFooter()) : null;
     this.footerEl.hidden = !f;
     if (f) patch(this.footerEl, f);
   }
@@ -301,11 +457,11 @@ export abstract class AnimEditor implements Editor {
     return this.mainEl.clientHeight;
   }
   markersVisible() {
-    return this.showMarkers && app.doc.scene.timeline_markers.length > 0;
+    return this.showMarkers && this.markerList().length > 0;
   }
   /** bottom of the content region (top of the markers row) */
   contentBottom() {
-    return this.mainH - (this.markersVisible() ? MARKER_H : 0);
+    return this.mainH - (this.markersVisible() && !this.compactMarkers ? MARKER_H : 0);
   }
   rowTop(i: number) {
     return RULER_H + i * this.rowH - this.scrollY;
@@ -318,7 +474,7 @@ export abstract class AnimEditor implements Editor {
     const r = this.canvas.getBoundingClientRect();
     const y = e.clientY - r.top;
     if (y < RULER_H) return 'ruler';
-    if (this.markersVisible() && y > r.height - MARKER_H) return 'markers';
+    if (this.markersVisible() && y > r.height - (this.compactMarkers ? 12 : MARKER_H)) return 'markers';
     return 'main';
   }
   local(e: { clientX: number; clientY: number }) {
@@ -349,7 +505,181 @@ export abstract class AnimEditor implements Editor {
     channelState.selectedGroups.clear();
     channelState.selectedDrivers.clear();
     channelState.selectedShapeKeys.clear();
-    for (const ch of this.list.rows) if (ch.kind === 'NLA_TRACK' && ch.track) ch.track.select = false;
+    for (const ch of this.list.rows) {
+      if (ch.kind === 'NLA_TRACK' && ch.track) ch.track.select = false;
+      if (ch.kind === 'SLOT' && ch.slot) ch.slot.select = false;
+    }
+  }
+
+  /** Markers shown in the marker row (the scene's; the Action Editor can show pose markers). */
+  markerList(): TimelineMarker[] {
+    return app.doc.scene.timeline_markers;
+  }
+  setMarkerList(list: TimelineMarker[]) {
+    app.doc.scene.timeline_markers = list;
+  }
+
+  /** Snap settings for transforms. */
+  snapTo() {
+    const sc = app.doc.scene;
+    return { mode: this.snapMode, absolute: this.snapAbsolute, fps: sc.render.fps / (sc.render.fps_base || 1), markers: sc.timeline_markers.map((m) => m.frame) };
+  }
+
+  /** Header snapping toggle with its options popover. */
+  /** extra rows at the top of the Filters popover (e.g. the Dope Sheet's Summary toggle) */
+  protected filterExtras(): Child {
+    return null;
+  }
+
+  /** Header toggle: list only channels with errors. */
+  errorsToggle(): Child {
+    return hdrToggle('only-errors', 'error', this.onlyErrors, 'Only Show Errors\nOnly include channels whose property (or driver) has an error', () => ((this.onlyErrors = !this.onlyErrors), this.refresh(), app.changed('ui')));
+  }
+
+  /** Header ▸ Filters popover: what the channel list includes. */
+  filtersHeader(): Child {
+    const types: [string, string][] = [
+      ['MESH', 'Meshes'],
+      ['CAMERA', 'Cameras'],
+      ['LIGHT', 'Lights'],
+      ['ARMATURE', 'Armatures'],
+      ['CURVE', 'Curves'],
+      ['EMPTY', 'Empties'],
+      ['GREASEPENCIL', 'Grease Pencil'],
+      ['SPEAKER', 'Speakers'],
+    ];
+    const kinds: [string, string][] = [
+      ['TRANSFORMS', 'Transforms'],
+      ['MODIFIERS', 'Modifiers'],
+      ['MATERIALS', 'Materials'],
+      ['SHAPEKEYS', 'Shape Keys'],
+      ['DATA', 'Object Data'],
+    ];
+    const toggleType = (t: string, on: boolean) => {
+      this.hiddenTypes = on ? this.hiddenTypes.filter((x) => x !== t) : [...this.hiddenTypes, t];
+      this.refresh();
+      app.changed('ui');
+    };
+    const body = (): Child => {
+      const cols = Object.values(app.doc.collections).filter((c) => c.id !== app.doc.scene.collection);
+      return h(
+        'div',
+        { class: 'pop-panel anim-filters' },
+        h('div', { class: 'pop-title' }, 'Filters'),
+        this.filterExtras(),
+        checkbox('af-onlysel', 'Only Show Selected', this.onlySelected, (v) => ((this.onlySelected = v), this.refresh(), app.changed('ui'))),
+        checkbox('af-hidden', 'Show Hidden', this.showHidden, (v) => ((this.showHidden = v), this.refresh(), app.changed('ui'))),
+        checkbox('af-errors', 'Only Show Errors', this.onlyErrors, (v) => ((this.onlyErrors = v), this.refresh(), app.changed('ui'))),
+        h('div', { class: 'opt-head' }, 'Collection'),
+        enumMenu(
+          'af-coll',
+          [{ value: '', label: 'All Collections' }, ...cols.map((c) => ({ value: c.id, label: c.name, icon: 'outliner_collection' }))],
+          this.filterCollection,
+          (v) => ((this.filterCollection = v), this.refresh(), app.changed('ui')),
+        ),
+        h('div', { class: 'opt-head' }, 'Filter by Type'),
+        h('div', { class: 'anim-filter-grid' }, types.map(([t, l]) => checkbox(`af-t-${t}`, l, !this.hiddenTypes.includes(t), (v) => toggleType(t, v)))),
+        h('div', { class: 'anim-filter-grid' }, kinds.map(([t, l]) => checkbox(`af-k-${t}`, l, !this.hiddenTypes.includes(t), (v) => toggleType(t, v)))),
+        h('div', { class: 'opt-head' }, 'Options'),
+        checkbox('af-sort', 'Sort Data-Blocks', this.sortByName, (v) => ((this.sortByName = v), this.refresh(), app.changed('ui')), { tip: 'Objects are listed alphabetically (otherwise in scene order)' }),
+      );
+    };
+    const active = !!this.filterCollection || this.hiddenTypes.length > 0 || this.onlyErrors;
+    return h(
+      'button',
+      {
+        key: 'filters',
+        class: { 'hdr-toggle': true, 'anim-filters-btn': true, on: active },
+        'data-tip': 'Filters\nWhich channels are listed',
+        onpointerdown: (e: PointerEvent) => {
+          e.preventDefault();
+          openPopover(e.currentTarget as HTMLElement, body, { width: 250 });
+        },
+      },
+      icon('filter'),
+      icon('down_arrow_hlt', 'tiny'),
+    );
+  }
+
+  snapHeader(what = 'keyframes'): Child {
+    const modes: [AnimEditor['snapMode'], string][] = [
+      ['FRAME', 'Frame'],
+      ['SECOND', 'Second'],
+      ['MARKER', 'Nearest Marker'],
+    ];
+    return h(
+      'div',
+      { key: 'snap', class: 'hdr-group' },
+      hdrToggle('snap-on', this.autoSnap ? 'snap_on' : 'snap_off', this.autoSnap, `Snap\nSnap ${what} while transforming (Ctrl toggles)`, () => ((this.autoSnap = !this.autoSnap), app.changed('ui'))),
+      h(
+        'button',
+        {
+          key: 'snap-opts',
+          class: 'hdr-toggle',
+          'data-tip': 'Snapping\nWhat transforms snap to',
+          onpointerdown: (e: PointerEvent) => {
+            e.preventDefault();
+            openMenu(
+              [
+                { heading: 'Snap To' },
+                ...modes.map(([v, l]) => ({ label: l, active: this.snapMode === v, action: () => ((this.snapMode = v), app.changed('ui')) })),
+                { separator: true },
+                { label: 'Absolute Time Snap', checked: this.snapAbsolute, action: () => ((this.snapAbsolute = !this.snapAbsolute), app.changed('ui')) },
+              ],
+              e.currentTarget as HTMLElement,
+              { title: 'Snapping' },
+            );
+          },
+        },
+        icon('down_arrow_hlt', 'tiny'),
+      ),
+    );
+  }
+
+  /** Channel row under a client y coordinate. */
+  channelAtClient(clientY: number): Channel | null {
+    const r = this.chRowsEl.getBoundingClientRect();
+    const i = Math.floor((clientY - r.top + this.scrollY) / this.rowH);
+    return this.list.rows[i] ?? null;
+  }
+
+  /** Channel rows overlapping a client y range. */
+  channelRowsBetween(y0: number, y1: number): Channel[] {
+    const r = this.chRowsEl.getBoundingClientRect();
+    const a = Math.floor((Math.min(y0, y1) - r.top + this.scrollY) / this.rowH),
+      b = Math.floor((Math.max(y0, y1) - r.top + this.scrollY) / this.rowH);
+    return this.list.rows.slice(Math.max(0, a), Math.max(0, b + 1));
+  }
+
+  focusSearch() {
+    const inp = this.chTopEl.querySelector('input');
+    if (inp) {
+      inp.focus();
+      inp.select();
+    }
+  }
+
+  /** Vertical drag over the channel list; `done` gets the client y range. */
+  channelBoxGesture(e: { clientX: number; clientY: number }, done: (y0: number, y1: number, ev: PointerEvent) => void) {
+    const y0 = e.clientY;
+    const box = div('anim-ch-box');
+    const r = this.chEl.getBoundingClientRect();
+    box.style.cssText = `position:absolute;left:0;right:0;top:${y0 - r.top}px;height:0;border:1px dashed rgba(255, 255, 255,0.8);background:rgba(255, 255, 255,0.06);pointer-events:none;z-index:3`;
+    this.chEl.append(box);
+    const move = (ev: PointerEvent) => {
+      const a = Math.min(y0, ev.clientY),
+        b = Math.max(y0, ev.clientY);
+      box.style.top = `${a - r.top}px`;
+      box.style.height = `${b - a}px`;
+    };
+    const up = (ev: PointerEvent) => {
+      removeEventListener('pointermove', move);
+      removeEventListener('pointerup', up);
+      box.remove();
+      done(Math.min(y0, ev.clientY), Math.max(y0, ev.clientY), ev);
+    };
+    addEventListener('pointermove', move);
+    addEventListener('pointerup', up);
   }
 
   /** Click on a channel name: select it (Shift toggles). */
@@ -366,6 +696,8 @@ export abstract class AnimEditor implements Editor {
       return;
     }
     if (ch.kind === 'ACTION' || ch.kind === 'DRIVERS' || ch.kind === 'NLA_ACTION') return;
+    // a slot row makes its slot the action's active one (shown in the sidebar)
+    if (ch.kind === 'SLOT' && ch.action && ch.slot) ch.action.active_slot = ch.slot.handle;
     const was = channelSelected(ch);
     if (!extend) this.deselectChannels();
     setChannelSelected(ch, extend ? !was : true);
@@ -386,6 +718,11 @@ export abstract class AnimEditor implements Editor {
       const a = ch.action;
       current = a.name;
       apply = (v) => (a.name = v);
+    } else if (ch.kind === 'SLOT' && ch.action && ch.slot) {
+      const a = ch.action,
+        slot = ch.slot;
+      current = slotName(slot);
+      apply = (v) => renameSlotEverywhere(app.doc, a, slot, v);
     } else if (ch.kind === 'NLA_ACTION' && ch.action) {
       const a = ch.action;
       current = a.name;
@@ -394,8 +731,9 @@ export abstract class AnimEditor implements Editor {
       const a = ch.action,
         old = ch.group;
       current = old;
+      const slot = ch.curves[0] ? curveSlot(a, ch.curves[0].fc) : undefined;
       apply = (v) => {
-        for (const fc of a.fcurves) if (fc.group === old) fc.group = v;
+        for (const fc of a.fcurves) if (fc.group === old && (slot === undefined || curveSlot(a, fc) === slot)) fc.group = v;
       };
     } else if (ch.kind === 'NLA_TRACK' && ch.track) {
       const t = ch.track;
@@ -411,6 +749,14 @@ export abstract class AnimEditor implements Editor {
         if (fc) fc.data_path = `data.shape_keys.key_blocks["${v.replace(/"/g, '\\"')}"].value`;
         void ob;
       };
+    } else if (ch.kind === 'MASK' && ch.mask) {
+      const m = ch.mask;
+      current = m.name;
+      apply = (v) => (m.name = v);
+    } else if (ch.kind === 'MASK_LAYER' && ch.maskLayer) {
+      const l = ch.maskLayer;
+      current = l.name;
+      apply = (v) => (l.name = v);
     }
     if (!apply) return;
     const doApply = apply;
@@ -437,8 +783,20 @@ export abstract class AnimEditor implements Editor {
     app.changed('doc');
   }
 
+  private lastClicked: string | null = null;
+
+  /** Whether a channel can be renamed in place. */
+  canRename(ch: Channel) {
+    return ['OBJECT', 'ACTION', 'SLOT', 'NLA_ACTION', 'GROUP', 'NLA_TRACK', 'SHAPEKEY', 'MASK', 'MASK_LAYER'].includes(ch.kind) && (ch.kind !== 'ACTION' && ch.kind !== 'NLA_ACTION' ? true : !!ch.action);
+  }
+
   protected channelDown(e: PointerEvent, ch: Channel) {
     if ((e.target as HTMLElement).closest('.anim-tg, .num-field, input, .anim-exp')) return;
+    if (e.button === 1 && e.altKey) {
+      e.preventDefault();
+      app.run('anim.channel_view_pick', {}, { area: this.area, event: { x: e.clientX, y: e.clientY } });
+      return;
+    }
     if (e.button === 2) {
       e.preventDefault();
       if (!channelSelected(ch)) {
@@ -450,12 +808,44 @@ export abstract class AnimEditor implements Editor {
       return;
     }
     if (e.button !== 0) return;
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey) {
+    if (e.shiftKey && (e.ctrlKey || e.metaKey) && ch.curves.length > 1) {
+      // Shift Ctrl: the channel and everything under it
+      this.deselectChannels();
+      setChannelSelected(ch, true);
+      for (const r of ch.curves) r.fc.select = true;
+      this.lastClicked = ch.key;
+      app.pushUndo('Select Channel Children');
+      app.changed('doc');
+      return;
+    }
+    if (e.shiftKey && !(e.ctrlKey || e.metaKey) && this.lastClicked) {
+      // Shift: select the range from the last clicked channel
+      const rows = this.list.rows;
+      const a = rows.findIndex((r) => r.key === this.lastClicked),
+        b = rows.indexOf(ch);
+      if (a >= 0 && b >= 0) {
+        for (let i = Math.min(a, b); i <= Math.max(a, b); i++) if (!['SUMMARY', 'ACTION', 'DRIVERS', 'NLA_ACTION'].includes(rows[i].kind)) setChannelSelected(rows[i], true);
+        app.pushUndo('Select Channels');
+        app.changed('doc');
+        return;
+      }
+    }
+    // Ctrl (or Shift without an anchor) toggles the channel in the selection
+    this.clickChannel(ch, e.shiftKey || e.ctrlKey || e.metaKey);
+    this.lastClicked = ch.key;
+    app.pushUndo('Click Channel');
+    app.changed('doc');
+  }
+
+  /** Double-click: rename channels that have a name, otherwise select the channel's keys. */
+  protected channelDblClick(e: MouseEvent, ch: Channel) {
+    if ((e.target as HTMLElement).closest('.anim-tg, .num-field, input, .anim-exp')) return;
+    if (this.canRename(ch) && !e.shiftKey) {
       this.renameChannel(ch);
       return;
     }
-    this.clickChannel(ch, e.shiftKey);
-    app.pushUndo('Click Channel');
+    this.selectChannelKeys(ch, e.shiftKey);
+    app.pushUndo('Select Channel Keyframes');
     app.changed('doc');
   }
 
@@ -493,20 +883,15 @@ export abstract class AnimEditor implements Editor {
                 [`k-${ch.kind.toLowerCase()}`]: true,
                 sel,
                 muted: ch.kind === 'FCURVE' && !!ch.fc?.mute,
+                err: !!ch.error,
               },
               style: {
                 top: `${i * this.rowH}px`,
                 height: `${this.rowH}px`,
-                paddingLeft: `${4 + ch.depth * 14}px`,
+                paddingLeft: `${4 + ch.depth * 8}px`,
               },
               onpointerdown: (e: PointerEvent) => this.channelDown(e, ch),
-              ondblclick: (e: MouseEvent) => {
-                if ((e.target as HTMLElement).closest('.anim-tg, .num-field, input, .anim-exp')) return;
-                if (e.ctrlKey || e.metaKey) return;
-                this.selectChannelKeys(ch, e.shiftKey);
-                app.pushUndo('Select Channel Keyframes');
-                app.changed('doc');
-              },
+              ondblclick: (e: MouseEvent) => this.channelDblClick(e, ch),
             },
             ch.expandable
               ? h(
@@ -522,9 +907,11 @@ export abstract class AnimEditor implements Editor {
                   },
                   icon(ch.expanded ? 'disclosure_tri_down' : 'disclosure_tri_right'),
                 )
-              : h('span', { class: 'anim-exp-space' }),
-            this.rowPrefix(ch, i),
+              : this.expanderSpace(ch)
+                ? h('span', { class: 'anim-exp-space' })
+                : null,
             ch.icon ? icon(ch.icon) : null,
+            this.rowPrefix(ch, i),
             h('span', { class: 'anim-ch-name' }, ch.label),
             this.rowExtra(ch),
             h('span', { class: 'anim-ch-tgs' }, this.rowToggles(ch)),
@@ -534,15 +921,79 @@ export abstract class AnimEditor implements Editor {
     );
   }
 
+  /** Pin of object and group rows: keeps them listed while unselected with Only Show Selected. */
+  protected pinToggle(ch: Channel): Child {
+    const ob = ch.ob;
+    let on: boolean;
+    let flip: () => void;
+    if (ch.kind === 'OBJECT' && ob?.animation_data) {
+      const ad = ob.animation_data;
+      on = !!ad.use_pin;
+      flip = () => (ad.use_pin = !on);
+    } else if (ch.kind === 'GROUP' && ch.action && ch.group) {
+      const act = ch.action,
+        g = ch.group;
+      on = !!act.pinned_groups?.includes(g);
+      flip = () => (act.pinned_groups = on ? (act.pinned_groups ?? []).filter((x) => x !== g) : [...(act.pinned_groups ?? []), g]);
+    } else return null;
+    return h(
+      'button',
+      {
+        key: 'pin',
+        class: { 'anim-tg': true, on, off: !on },
+        'data-tip': 'Pin\nKeep the channel listed in the Graph Editor while it is not selected (Only Show Selected)',
+        onpointerdown: (e: PointerEvent) => {
+          e.stopPropagation();
+          if (e.button !== 0) return;
+          flip();
+          app.pushUndo('Toggle Pin');
+          app.changed('doc');
+        },
+      },
+      icon(on ? 'pinned' : 'unpinned'),
+    );
+  }
+
+  /** Modifiers on / off of curve and group rows (dimmed on curves without modifiers). */
+  protected modifierToggle(ch: Channel): Child {
+    const fcs = channelCurves(ch);
+    if (!fcs.length || (ch.kind !== 'FCURVE' && ch.kind !== 'GROUP')) return null;
+    const withMods = fcs.filter((f) => f.modifiers.length);
+    const modsOff = !withMods.length ? ch.kind === 'FCURVE' : withMods.every((f) => f.modifiers.every((m) => m.mute));
+    return h(
+      'button',
+      {
+        key: 'mods',
+        class: { 'anim-tg': true, off: modsOff },
+        'data-tip': 'Modifiers\nEnable/disable F-Curve modifiers',
+        onpointerdown: (e: PointerEvent) => {
+          e.stopPropagation();
+          if (e.button !== 0 || !withMods.length) return;
+          const allMuted = withMods.every((f) => f.modifiers.every((m) => m.mute));
+          for (const f of withMods) f.modifiers.forEach((m) => (m.mute = !allMuted));
+          app.pushUndo('Toggle Modifiers');
+          app.changed('doc');
+        },
+      },
+      icon(modsOff ? 'modifier_off' : 'modifier_on'),
+    );
+  }
+
+  /** whether a row without an expander keeps its place (indentation) */
+  protected expanderSpace(_ch: Channel): boolean {
+    return true;
+  }
+
   /** standard mute/lock toggles */
   protected muteLockToggles(ch: Channel): Child {
-    if (!['GROUP', 'FCURVE', 'SHAPEKEY'].includes(ch.kind)) return null;
+    if (!['GROUP', 'FCURVE', 'SHAPEKEY', 'MASK_LAYER'].includes(ch.kind)) return null;
     const fcs = channelCurves(ch);
     if (!fcs.length) return null;
     const muted = fcs.every((f) => f.mute);
     const locked = fcs.every((f) => f.lock);
     return [
-      h(
+      // mask layers can only be locked
+      ch.kind === 'MASK_LAYER' ? null : h(
         'button',
         {
           key: 'mute',
@@ -594,6 +1045,74 @@ export abstract class AnimEditor implements Editor {
     ]);
   }
 
+  /** View ▸ Playback Controls: shows / hides the footer */
+  footerMenuItem(): MenuItem {
+    return { label: 'Playback Controls', checked: this.showFooter, action: () => ((this.showFooter = !this.showFooter), this.refresh(), app.changed('ui')) };
+  }
+
+  /** View ▸ Realtime Updates */
+  realtimeMenuItem(): MenuItem {
+    return { label: 'Realtime Updates', checked: this.realtimeUpdates, description: 'Other views follow keyframes while they are being transformed', action: () => ((this.realtimeUpdates = !this.realtimeUpdates), app.changed('ui')) };
+  }
+
+  /** View ▸ Sync Visible Range */
+  syncRangeMenuItem(): MenuItem {
+    return {
+      label: 'Sync Visible Range',
+      checked: this.syncRange,
+      description: 'Keep the visible frame range the same as in the other time editors that have this on',
+      action: () => {
+        this.syncRange = !this.syncRange;
+        this.lastRange = null;
+        if (this.syncRange && syncedRange.rev) this.syncSeen = 0;
+        this.draw();
+        app.changed('ui');
+      },
+    };
+  }
+
+  /** View ▸ Area: split, maximize and close the area */
+  areaMenuItem(): MenuItem {
+    return { label: 'Area', submenu: () => this.area.areaMenu() };
+  }
+
+  private syncSeen = 0;
+  private lastRange: [number, number] | null = null;
+
+  /** Sync Visible Range: publish this editor's range after it changed, or adopt the one published last. */
+  private syncVisibleRange(W: number) {
+    if (!this.syncRange || W <= 0) {
+      this.lastRange = null;
+      return;
+    }
+    const a = this.view.xf(0),
+      b = this.view.xf(W);
+    const same = (r: [number, number] | null, x: number, y: number) => !!r && Math.abs(r[0] - x) < 1e-6 && Math.abs(r[1] - y) < 1e-6;
+    const unchanged = !this.lastRange || same(this.lastRange, a, b);
+    if (this.syncSeen < syncedRange.rev && unchanged) {
+      this.view.ppf = W / Math.max(1e-6, syncedRange.b - syncedRange.a);
+      this.view.x0 = syncedRange.a;
+      this.syncSeen = syncedRange.rev;
+      this.lastRange = [syncedRange.a, syncedRange.b];
+      return;
+    }
+    if (!unchanged || !this.lastRange) {
+      syncedRange.a = a;
+      syncedRange.b = b;
+      this.syncSeen = ++syncedRange.rev;
+      this.lastRange = [a, b];
+      for (const ar of this.area.screen.areas) {
+        const ed = ar.editor;
+        if (ed !== this && ed instanceof AnimEditor && ed.syncRange) ed.draw();
+      }
+    }
+  }
+
+  /** View ▸ Channels: the menu entry that shows / hides the channel region */
+  channelsMenuItem(): MenuItem {
+    return { label: 'Channels', checked: this.showChannels, action: () => ((this.showChannels = !this.showChannels), this.layout(), this.draw(), app.changed('ui')) };
+  }
+
   toggleSidebar() {
     this.showSidebar = !this.showSidebar;
     this.layout();
@@ -626,6 +1145,7 @@ export abstract class AnimEditor implements Editor {
       this.fitInitial(W);
       this.fitted = true;
     }
+    this.syncVisibleRange(W);
     const g = c.getContext('2d')!;
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.fillStyle = C.back;
@@ -643,13 +1163,65 @@ export abstract class AnimEditor implements Editor {
     this.drawRuler(g, W);
     if (this.boxRect) {
       const b = this.boxRect;
-      g.fillStyle = 'rgba(255,255,255,0.06)';
-      g.strokeStyle = 'rgba(255,255,255,0.8)';
+      g.fillStyle = 'rgba(255, 255, 255,0.06)';
+      g.strokeStyle = 'rgba(255, 255, 255,0.8)';
       g.setLineDash([4, 3]);
       g.fillRect(Math.min(b.x0, b.x1), Math.min(b.y0, b.y1), Math.abs(b.x1 - b.x0), Math.abs(b.y1 - b.y0));
       g.strokeRect(Math.min(b.x0, b.x1) + 0.5, Math.min(b.y0, b.y1) + 0.5, Math.abs(b.x1 - b.x0), Math.abs(b.y1 - b.y0));
       g.setLineDash([]);
     }
+    if (this.overlay) this.drawOverlay(g, W);
+  }
+
+  protected drawOverlay(g: CanvasRenderingContext2D, W: number) {
+    const o = this.overlay!;
+    g.save();
+    if (o.circle) {
+      g.strokeStyle = 'rgba(255, 255, 255,0.85)';
+      g.setLineDash([4, 3]);
+      g.beginPath();
+      g.arc(o.circle.x, o.circle.y, o.circle.r, 0, Math.PI * 2);
+      g.stroke();
+    }
+    if (o.lasso && o.lasso.length > 1) {
+      g.strokeStyle = 'rgba(255, 255, 255,0.85)';
+      g.fillStyle = 'rgba(255, 255, 255,0.06)';
+      g.setLineDash([4, 3]);
+      g.beginPath();
+      o.lasso.forEach((p, i) => (i ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y)));
+      g.closePath();
+      g.fill();
+      g.stroke();
+    }
+    g.setLineDash([]);
+    if (o.slider) {
+      // slider readout centred at the top of the content region
+      const w = Math.min(320, W - 20),
+        x = (W - w) / 2,
+        y = RULER_H + 8,
+        hh = 22;
+      g.fillStyle = 'rgba(27, 28, 29,0.9)';
+      roundRect(g, x, y, w, hh, 5);
+      g.fill();
+      if (o.slider.t !== null) {
+        const t = Math.max(0, Math.min(1, o.slider.t)),
+          t0 = o.slider.t0 ?? 0;
+        g.fillStyle = 'rgba(87, 128, 219,0.55)';
+        const a = Math.min(t, t0),
+          b = Math.max(t, t0);
+        roundRect(g, x + 2 + (w - 4) * a, y + 2, Math.max(0, (w - 4) * (b - a)), hh - 4, 3);
+        g.fill();
+        g.fillStyle = 'rgba(255, 255, 255,0.35)';
+        g.fillRect(Math.round(x + w / 2) + 0.5, y + 3, 1, hh - 6);
+      }
+      g.fillStyle = '#eaebec';
+      g.font = '12px Inter, system-ui, sans-serif';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.fillText(`${o.slider.label}: ${o.slider.text}`, W / 2, y + hh / 2 + 1);
+      g.textBaseline = 'alphabetic';
+    }
+    g.restore();
   }
 
   protected drawRanges(g: CanvasRenderingContext2D, W: number, H: number) {
@@ -698,7 +1270,7 @@ export abstract class AnimEditor implements Editor {
       s = app.doc.scene;
     g.fillStyle = C.rulerBack;
     g.fillRect(0, 0, W, RULER_H);
-    g.fillStyle = 'rgba(0,0,0,0.3)';
+    g.fillStyle = 'rgba(0, 0, 0,0.3)';
     g.fillRect(0, RULER_H - 1, W, 1);
     const step = frameStep(v.ppf, s.render.fps);
     const first = Math.floor(v.xf(0) / step) * step;
@@ -708,13 +1280,14 @@ export abstract class AnimEditor implements Editor {
     g.fillStyle = C.rulerText;
     // playhead box (labels under it are skipped)
     const px = Math.round(v.fx(s.frame_current));
-    const label = String(s.frame_current);
+    const fmt = (f: number) => (this.showSeconds ? formatSeconds(f, s.render.fps / (s.render.fps_base || 1)) : String(f));
+    const label = fmt(s.frame_current);
     const tw = Math.max(24, g.measureText(label).width + 12);
     for (let f = first; v.fx(f) < W + 30; f += step) {
       const x = Math.round(v.fx(f));
-      const lw = g.measureText(String(f)).width;
+      const lw = g.measureText(fmt(f)).width;
       if (Math.abs(x - px) < tw / 2 + lw / 2 + 2) continue;
-      g.fillText(String(f), x, RULER_H / 2 + 1);
+      g.fillText(fmt(f), x, RULER_H / 2 + 1);
     }
     g.fillStyle = C.playhead;
     roundRect(g, px - tw / 2, 2, tw, RULER_H - 4, 4);
@@ -737,15 +1310,16 @@ export abstract class AnimEditor implements Editor {
 
   protected drawMarkers(g: CanvasRenderingContext2D, W: number, H: number) {
     if (!this.markersVisible()) return;
+    if (this.compactMarkers) return this.drawCompactMarkers(g, W, H);
     const top = H - MARKER_H;
-    g.fillStyle = 'rgba(0,0,0,0.25)';
+    g.fillStyle = 'rgba(0, 0, 0,0.25)';
     g.fillRect(0, top, W, MARKER_H);
     g.font = '11px Inter, system-ui, sans-serif';
     g.textAlign = 'left';
-    for (const m of app.doc.scene.timeline_markers) {
+    for (const m of this.markerList()) {
       const x = Math.round(this.view.fx(m.frame)) + 0.5;
       if (x < -100 || x > W + 10) continue;
-      g.strokeStyle = m.select ? 'rgba(255,255,255,0.55)' : 'rgba(0,0,0,0.45)';
+      g.strokeStyle = m.select ? 'rgba(255, 255, 255,0.55)' : 'rgba(0, 0, 0,0.45)';
       g.setLineDash([3, 3]);
       g.beginPath();
       g.moveTo(x, RULER_H);
@@ -761,8 +1335,34 @@ export abstract class AnimEditor implements Editor {
       g.lineTo(x + 5, top + 8);
       g.closePath();
       g.fill();
-      g.fillStyle = m.select ? '#fff' : '#bbb';
+      g.fillStyle = m.select ? '#ffffff' : '#bbbcbe';
       g.fillText(m.name, x + 8, top + 14);
+    }
+  }
+
+  /** Small markers along the bottom edge (no separate row). */
+  protected drawCompactMarkers(g: CanvasRenderingContext2D, W: number, H: number) {
+    g.font = '10px Inter, system-ui, sans-serif';
+    g.textAlign = 'left';
+    for (const m of this.markerList()) {
+      const x = Math.round(this.view.fx(m.frame)) + 0.5;
+      if (x < -100 || x > W + 10) continue;
+      g.strokeStyle = m.select ? 'rgba(255, 255, 255,0.5)' : 'rgba(0, 0, 0,0.4)';
+      g.setLineDash([3, 3]);
+      g.beginPath();
+      g.moveTo(x, RULER_H);
+      g.lineTo(x, H - 9);
+      g.stroke();
+      g.setLineDash([]);
+      g.fillStyle = m.select ? C.markerSelected : C.marker;
+      g.beginPath();
+      g.moveTo(x, H - 2);
+      g.lineTo(x - 4, H - 8);
+      g.lineTo(x + 4, H - 8);
+      g.closePath();
+      g.fill();
+      g.fillStyle = m.select ? '#ffffff' : '#bbbcbe';
+      g.fillText(m.name, x + 6, H - 2);
     }
   }
 
@@ -796,7 +1396,12 @@ export abstract class AnimEditor implements Editor {
 
   scrub(e: PointerEvent) {
     const set = (ev: PointerEvent) => {
-      const f = Math.round(this.view.xf(this.local(ev).x));
+      let f = Math.round(this.view.xf(this.local(ev).x));
+      const sc = app.doc.scene;
+      if (sc.lock_frame_selection_to_range) {
+        const [a, b] = sc.use_preview_range ? [sc.frame_preview_start ?? sc.frame_start, sc.frame_preview_end ?? sc.frame_end] : [sc.frame_start, sc.frame_end];
+        f = Math.max(a, Math.min(b, f));
+      }
       if (f !== app.doc.scene.frame_current) app.setFrame(f);
     };
     set(e);
@@ -809,30 +1414,37 @@ export abstract class AnimEditor implements Editor {
   }
 
   protected markerDown(e: PointerEvent, x: number) {
-    const markers = app.doc.scene.timeline_markers;
-    let best: (typeof markers)[number] | null = null,
-      bd = 7;
-    for (const m of markers) {
-      const d = Math.abs(this.view.fx(m.frame) - x);
-      if (d < bd) {
-        bd = d;
-        best = m;
-      }
-    }
+    if (markersLocked()) return;
+    const list = this.markerList();
+    const best = markerAt(this.view.xf(x), this.view.ppf);
     if (!best) {
-      if (!e.shiftKey) markers.forEach((m) => (m.select = false));
-      app.pushUndo('Select Markers');
-      app.changed('ui');
-      this.draw();
+      // empty marker row: click deselects, drag box-selects markers
+      this.clickOrDrag(
+        e,
+        () => {
+          if (e.shiftKey) return;
+          list.forEach((m) => (m.select = false));
+          app.pushUndo('Select Markers');
+          app.changed('ui');
+          this.draw();
+        },
+        (start) =>
+          this.boxGesture(start, (r, mode) => app.run('marker.select_box', { mode, xmin: this.view.xf(r.x0), xmax: this.view.xf(r.x1) }, { area: this.area, invoke: false })),
+      );
+      return;
+    }
+    if (e.ctrlKey || e.metaKey) {
+      // Ctrl+click: select and make the marker's camera active
+      app.run('marker.select', { frame: best.frame, extend: e.shiftKey, camera: true }, { area: this.area, invoke: false });
       return;
     }
     if (e.shiftKey) best.select = !best.select;
     else if (!best.select) {
-      markers.forEach((m) => (m.select = false));
+      list.forEach((m) => (m.select = false));
       best.select = true;
     }
     this.draw();
-    const sel = markers.filter((m) => m.select);
+    const sel = list.filter((m) => m.select);
     const orig = sel.map((m) => m.frame);
     const x0 = e.clientX;
     let moved = false;
@@ -847,6 +1459,9 @@ export abstract class AnimEditor implements Editor {
     const up = () => {
       removeEventListener('pointermove', move);
       removeEventListener('pointerup', up);
+      if (!moved && !e.shiftKey) {
+        list.forEach((m) => (m.select = m === best));
+      }
       app.pushUndo(moved ? 'Move Markers' : 'Select Marker');
       app.changed('doc');
     };
@@ -913,7 +1528,10 @@ export abstract class AnimEditor implements Editor {
 
   protected onWheel(e: WheelEvent) {
     e.preventDefault();
-    if (app.modal) return;
+    if (app.modal) {
+      app.modal.onWheel?.(e);
+      return;
+    }
     const { x, y } = this.local(e);
     const dx = e.deltaX,
       dy = e.deltaY;
@@ -1012,6 +1630,8 @@ export abstract class AnimEditor implements Editor {
   }
 }
 
+export { formatSeconds } from './view2d';
+
 function div(cls: string) {
   const d = document.createElement('div');
   d.className = cls;
@@ -1028,24 +1648,4 @@ export function roundRect(g: CanvasRenderingContext2D, x: number, y: number, w: 
   g.closePath();
 }
 
-export function markerMenu(): MenuItem[] {
-  return [
-    { label: 'Add Marker', op: 'screen.marker_add', shortcut: 'M' },
-    { label: 'Duplicate Marker', op: 'marker.duplicate' },
-    { label: 'Delete Marker', op: 'screen.marker_delete' },
-    { separator: true },
-    { label: 'Rename Marker', op: 'marker.rename', shortcut: 'F2' },
-    { label: 'Move Marker', op: 'marker.move' },
-    { separator: true },
-    {
-      label: 'Jump to Next Marker',
-      op: 'screen.marker_jump',
-      props: { next: true },
-    },
-    {
-      label: 'Jump to Previous Marker',
-      op: 'screen.marker_jump',
-      props: { next: false },
-    },
-  ];
-}
+export { markerMenu };

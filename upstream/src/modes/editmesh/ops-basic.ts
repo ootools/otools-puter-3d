@@ -1,5 +1,6 @@
 // Edit-mode mesh operators: delete/dissolve, merge, split/separate, duplicate, normals,
 // edge flags, shading, triangulate, smoothing, adding primitives.
+import { symmetrizeMesh } from './symmetrize';
 import { Matrix4, Vector3, Euler, Quaternion } from 'three';
 import { app, registerOperators, type OpContext } from '../../app/app';
 import { MeshEdit, edgeKey, type EFace } from './meshedit';
@@ -8,7 +9,7 @@ import { startTransform } from '../../ops/transform';
 import { newObject, newMeshData, uid } from '../../data/defaults';
 import { uniqueName } from '../../ops/object';
 import { cloneShared } from '../../data/cow';
-import { triangulatePoly } from '../../mesh/mesh';
+import { trisToQuads } from './geom';
 import { modeHandlers } from '../../ops/modes';
 import type { PrimitiveArrays } from '../../mesh/primitives';
 
@@ -232,38 +233,55 @@ export function mergeVerts(m: MeshEdit, groups: number[][], positions: Vector3[]
   m.remap(map);
 }
 
-export function removeDoubles(m: MeshEdit, threshold: number, onlySelected = true): number {
+/**
+ * Merge vertices closer than `threshold`. Vertices are visited in order of x+y+z; each one that is
+ * not merged yet collects the later vertices within reach (clusters do not chain). With
+ * `centroid` the kept vertex moves to the middle of its cluster. When `onlySelected` is false,
+ * selected vertices may also merge into unselected ones (which stay in place).
+ */
+export function removeDoubles(m: MeshEdit, threshold: number, onlySelected = true, centroid = true): number {
   const n = m.vcount;
-  const cell = Math.max(threshold, 1e-9);
-  const grid = new Map<string, number[]>();
+  const cand: number[] = [];
+  for (let v = 0; v < n; v++) if (!m.hide[v] && (m.sel[v] || !onlySelected)) cand.push(v);
+  const key = (v: number) => m.pos[v * 3] + m.pos[v * 3 + 1] + m.pos[v * 3 + 2];
+  // unselected vertices act as fixed targets only (they come first among equals)
+  cand.sort((a, b) => key(a) - key(b) || (m.sel[a] ? 1 : 0) - (m.sel[b] ? 1 : 0) || a - b);
   const map = Array.from({ length: n }, (_, i) => i);
+  const t2 = threshold * threshold;
+  const reach = threshold * 3 + 1e-12;
+  const clusters = new Map<number, number[]>();
+  const done = new Uint8Array(n);
   let merged = 0;
-  for (let v = 0; v < n; v++) {
-    if (onlySelected && !m.sel[v]) continue;
-    const p = m.p(v);
-    const gx = Math.floor(p[0] / cell),
-      gy = Math.floor(p[1] / cell),
-      gz = Math.floor(p[2] / cell);
-    let found = -1;
-    for (let dx = -1; dx <= 1 && found < 0; dx++)
-      for (let dy = -1; dy <= 1 && found < 0; dy++)
-        for (let dz = -1; dz <= 1 && found < 0; dz++)
-          for (const u of grid.get(`${gx + dx},${gy + dy},${gz + dz}`) ?? []) {
-            const q = m.p(u);
-            if ((q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2 + (q[2] - p[2]) ** 2 <= threshold * threshold) {
-              found = u;
-              break;
-            }
-          }
-    if (found >= 0) {
-      map[v] = found;
+  for (let i = 0; i < cand.length; i++) {
+    const v = cand[i];
+    if (done[v]) continue;
+    done[v] = 1;
+    const kv = key(v);
+    for (let j = i + 1; j < cand.length; j++) {
+      const u = cand[j];
+      if (key(u) - kv > reach) break;
+      if (done[u] || !m.sel[u]) continue;
+      // two unselected vertices never merge with each other
+      if (!m.sel[v] && !m.sel[u]) continue;
+      const dx = m.pos[u * 3] - m.pos[v * 3],
+        dy = m.pos[u * 3 + 1] - m.pos[v * 3 + 1],
+        dz = m.pos[u * 3 + 2] - m.pos[v * 3 + 2];
+      if (dx * dx + dy * dy + dz * dz > t2) continue;
+      done[u] = 1;
+      map[u] = v;
       merged++;
-    } else {
-      const k = `${gx},${gy},${gz}`;
-      (grid.get(k) ?? grid.set(k, []).get(k)!).push(v);
+      (clusters.get(v) ?? clusters.set(v, [v]).get(v)!).push(u);
     }
   }
-  if (merged) m.remap(map);
+  if (!merged) return 0;
+  if (centroid)
+    for (const [v, list] of clusters) {
+      if (!m.sel[v]) continue;
+      const c = [0, 0, 0];
+      for (const u of list) for (let k = 0; k < 3; k++) c[k] += m.pos[u * 3 + k] / list.length;
+      m.setP(v, c);
+    }
+  m.remap(map);
   return merged;
 }
 
@@ -333,12 +351,31 @@ export function flipFace(f: EFace) {
   f.verts = order.map((i) => f.verts[i]);
   f.uvs = order.flatMap((i) => [f.uvs[i * 2], f.uvs[i * 2 + 1]]);
   if (f.colors) f.colors = order.flatMap((i) => f.colors!.slice(i * 4, i * 4 + 4));
+  // custom normals follow their corners and turn around with the face
+  if (f.cnormals) f.cnormals = order.length * 3 === f.cnormals.length ? order.flatMap((i) => f.cnormals!.slice(i * 3, i * 3 + 3).map((x) => -x)) : undefined;
 }
 
 function setEdgeFlag(m: MeshEdit, key: 'seams' | 'sharp' | 'creases', value: number) {
   const sel = new Set(m.selectedEdges().map(([a, b]) => edgeKey(a, b)));
   for (const f of m.faces)
     for (let i = 0; i < f.verts.length; i++) if (sel.has(edgeKey(f.verts[i], f.verts[(i + 1) % f.verts.length]))) f[key][i] = value;
+}
+
+/** Move selected vertices towards the average of their neighbours. */
+export function smoothVertices(m: MeshEdit, factor: number, repeat: number, axes: boolean[] = [true, true, true]) {
+  const nb = m.neighbors();
+  for (let it = 0; it < repeat; it++) {
+    const next = m.pos.slice();
+    for (let v = 0; v < m.vcount; v++) {
+      if (!m.sel[v] || m.hide[v] || !nb[v].length) continue;
+      const c = [0, 0, 0];
+      for (const w of nb[v]) for (let k = 0; k < 3; k++) c[k] += m.pos[w * 3 + k] / nb[v].length;
+      for (let k = 0; k < 3; k++) if (axes[k]) next[v * 3 + k] = m.pos[v * 3 + k] + (c[k] - m.pos[v * 3 + k]) * factor;
+    }
+    m.pos = next;
+  }
+  if (m.keys.length) m.keys[0] = m.pos.slice();
+  return m.selectedVerts().length > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +530,7 @@ modeHandlers.EDIT = {
     const world = app.graph.get(ob.id)?.world ?? new Matrix4();
     const loc = new Vector3(...((props.location as number[]) ?? app.doc.scene.cursor.location));
     const rot = (props.rotation as number[]) ?? [0, 0, 0];
-    const m4 = world.clone().invert().multiply(new Matrix4().compose(loc, new Quaternion().setFromEuler(new Euler(rot[0], rot[1], rot[2], 'ZYX')), new Vector3(1, 1, 1)));
+    const m4 = world.clone().invert().multiply(new Matrix4().compose(loc, new Quaternion().setFromEuler(new Euler(rot[0], rot[1], rot[2], 'ZYX')), new Vector3(...((props.scale as number[] | null) ?? [1, 1, 1]))));
     const m = MeshEdit.from(me);
     m.sel.fill(0);
     const base = m.vcount;
@@ -560,12 +597,23 @@ registerOperators([
   {
     idname: 'mesh.delete_loose',
     label: 'Delete Loose',
-    props: [{ id: 'use_verts', label: 'Vertices', type: 'bool', default: true }, { id: 'use_edges', label: 'Edges', type: 'bool', default: true }],
+    description: 'Delete selected vertices, edges and faces that are not connected to anything else',
+    props: [
+      { id: 'use_verts', label: 'Vertices', type: 'bool', default: true },
+      { id: 'use_edges', label: 'Edges', type: 'bool', default: true },
+      { id: 'use_faces', label: 'Faces', type: 'bool', default: false },
+    ],
     poll: editPoll,
     exec: (_ctx, p) => {
       let removed = 0;
       withEdit((m) => {
         const before = m.vcount;
+        if (p.use_faces) {
+          // faces that share no edge with another face
+          const ef = m.edgeFaces();
+          const fsel = new Set(m.selectedFaces());
+          m.faces = m.faces.filter((f, i) => !fsel.has(i) || f.verts.some((v, k) => (ef.get(edgeKey(v, f.verts[(k + 1) % f.verts.length]))?.length ?? 0) > 1));
+        }
         if (p.use_edges) m.looseEdges = m.looseEdges.filter(([a, b]) => !(m.sel[a] && m.sel[b]));
         if (p.use_verts) {
           const used = new Uint8Array(m.vcount);
@@ -630,12 +678,16 @@ registerOperators([
   {
     idname: 'mesh.remove_doubles',
     label: 'Merge by Distance',
-    props: [{ id: 'threshold', label: 'Merge Distance', type: 'float', default: 0.0001, min: 0, subtype: 'distance' }, { id: 'use_unselected', label: 'Unselected', type: 'bool', default: false }],
+    props: [
+      { id: 'threshold', label: 'Merge Distance', type: 'float', default: 0.0001, min: 0, subtype: 'distance' },
+      { id: 'use_centroid', label: 'Centroid Merge', type: 'bool', default: true },
+      { id: 'use_unselected', label: 'Unselected', type: 'bool', default: false },
+    ],
     poll: editPoll,
     exec: (_ctx, p) => {
       let n = 0;
       withEdit((m) => {
-        n += removeDoubles(m, p.threshold as number, !p.use_unselected);
+        n += removeDoubles(m, p.threshold as number, !p.use_unselected, p.use_centroid !== false);
       });
       app.report('INFO', `Removed ${n} vertice(s)`);
     },
@@ -664,23 +716,41 @@ registerOperators([
   {
     idname: 'mesh.duplicate_move',
     label: 'Duplicate',
-    description: 'Duplicate mesh and move',
+    description: 'Duplicate the selection and move the copy',
+    props: [{ id: 'value', label: 'Move', type: 'vec3', default: [0, 0, 0], subtype: 'distance' }],
     poll: editPoll,
     invoke: (ctx) => {
-      if (!withEdit((m) => duplicateSelection(m))) return 'CANCELLED';
-      app.pushUndo('Duplicate');
+      if (!withEdit((m) => (m.selectedVerts().length ? void duplicateSelection(m) : false))) return 'CANCELLED';
       app.flush();
-      startTransform('TRANSLATION', { event: ctx.event });
+      if (!startTransform('TRANSLATION', { event: ctx.event, label: 'Duplicate', redo: (v) => ({ idname: 'mesh.duplicate_move', props: { value: v } }) })) return 'FINISHED';
       return 'RUNNING_MODAL';
     },
-    exec: () => void withEdit((m) => duplicateSelection(m)),
+    exec: (_ctx, p) =>
+      withEdit((m, ob) => {
+        if (!m.selectedVerts().length) return false;
+        duplicateSelection(m);
+        const d = new Vector3(...((p.value as number[]) ?? [0, 0, 0]));
+        const inv = (app.graph.get(ob.id)?.world ?? new Matrix4()).clone().invert().setPosition(0, 0, 0);
+        d.applyMatrix4(inv);
+        for (const v of m.selectedVerts()) m.setP(v, [m.pos[v * 3] + d.x, m.pos[v * 3 + 1] + d.y, m.pos[v * 3 + 2] + d.z]);
+      })
+        ? 'FINISHED'
+        : 'CANCELLED',
   },
   {
     idname: 'mesh.flip_normals',
     label: 'Flip',
     description: 'Flip the direction of selected faces’ normals',
+    props: [{ id: 'only_clnors', label: 'Custom Normals Only', type: 'bool', default: false }],
     poll: editPoll,
-    exec: () => void withEdit((m) => m.selectedFaces().forEach((fi) => flipFace(m.faces[fi]))),
+    exec: (_ctx, p) =>
+      void withEdit((m) =>
+        m.selectedFaces().forEach((fi) => {
+          const f = m.faces[fi];
+          if (!p.only_clnors) flipFace(f);
+          else if (f.cnormals) f.cnormals = f.cnormals.map((x) => -x);
+        }),
+      ),
   },
   {
     idname: 'mesh.normals_make_consistent',
@@ -697,20 +767,6 @@ registerOperators([
     exec: (_ctx, p) => void withEdit((m) => setEdgeFlag(m, 'seams', p.clear ? 0 : 1)),
   },
   {
-    idname: 'mesh.mark_sharp',
-    label: 'Mark Sharp',
-    props: [{ id: 'clear', label: 'Clear', type: 'bool', default: false }],
-    poll: editPoll,
-    exec: (_ctx, p) => void withEdit((m) => setEdgeFlag(m, 'sharp', p.clear ? 0 : 1)),
-  },
-  {
-    idname: 'transform.edge_crease',
-    label: 'Edge Crease',
-    props: [{ id: 'value', label: 'Factor', type: 'float', default: 1, min: -1, max: 1, subtype: 'factor' }],
-    poll: editPoll,
-    exec: (_ctx, p) => void withEdit((m) => setEdgeFlag(m, 'creases', Math.max(0, Math.min(1, p.value as number)))),
-  },
-  {
     idname: 'mesh.faces_shade_smooth',
     label: 'Shade Smooth',
     poll: editPoll,
@@ -723,74 +779,27 @@ registerOperators([
     exec: () => void withEdit((m) => m.selectedFaces().forEach((fi) => (m.faces[fi].smooth = false))),
   },
   {
-    idname: 'mesh.quads_convert_to_tris',
-    label: 'Triangulate Faces',
-    poll: editPoll,
-    exec: () =>
-      void withEdit((m) => {
-        const out: EFace[] = [];
-        const fsel = new Set(m.selectedFaces());
-        m.faces.forEach((f, fi) => {
-          if (!fsel.has(fi) || f.verts.length === 3) return out.push(f);
-          const tmp: number[] = [];
-          triangulatePoly(m.pos, f.verts, tmp, 0);
-          for (let i = 0; i < tmp.length; i += 3) {
-            const c = [tmp[i], tmp[i + 1], tmp[i + 2]];
-            const nf = m.makeFace(c.map((k) => f.verts[k]), f, c.flatMap((k) => [f.uvs[k * 2], f.uvs[k * 2 + 1]]));
-            out.push(nf);
-          }
-        });
-        m.faces = out;
-      }),
-  },
-  {
     idname: 'mesh.tris_convert_to_quads',
     label: 'Tris to Quads',
-    props: [{ id: 'face_threshold', label: 'Max Face Angle', type: 'float', default: (40 * Math.PI) / 180, min: 0, max: Math.PI, subtype: 'angle' }],
+    props: [
+      { id: 'face_threshold', label: 'Max Face Angle', type: 'float', default: (40 * Math.PI) / 180, min: 0, max: Math.PI, subtype: 'angle' },
+      { id: 'shape_threshold', label: 'Max Shape Angle', type: 'float', default: (40 * Math.PI) / 180, min: 0, max: Math.PI, subtype: 'angle' },
+      { id: 'uvs', label: 'Compare UVs', type: 'bool', default: false },
+      { id: 'seam', label: 'Compare Seam', type: 'bool', default: false },
+      { id: 'sharp', label: 'Compare Sharp', type: 'bool', default: false },
+      { id: 'materials', label: 'Compare Materials', type: 'bool', default: false },
+      { id: 'deselect_joined', label: 'Deselect Joined', type: 'bool', default: false },
+    ],
     poll: editPoll,
     exec: (_ctx, p) =>
       void withEdit((m) => {
-        const fsel = new Set(m.selectedFaces().filter((fi) => m.faces[fi].verts.length === 3));
-        const ef = m.edgeFaces();
-        // candidate pairs sorted by planarity
-        const pairs: { a: number; b: number; score: number; key: string }[] = [];
-        for (const [k, l] of ef) {
-          if (l.length !== 2) continue;
-          const [fa] = l[0],
-            [fb] = l[1];
-          if (!fsel.has(fa) || !fsel.has(fb)) continue;
-          const na = new Vector3(...m.faceNormal(m.faces[fa])),
-            nb = new Vector3(...m.faceNormal(m.faces[fb]));
-          const ang = na.angleTo(nb);
-          if (ang > (p.face_threshold as number)) continue;
-          pairs.push({ a: fa, b: fb, score: ang, key: k });
+        const n = trisToQuads(m, new Set(m.selectedFaces()), p.face_threshold as number, { shapeThreshold: p.shape_threshold as number, compareUVs: !!p.uvs, compareSeam: !!p.seam, compareSharp: !!p.sharp, compareMaterials: !!p.materials });
+        if (p.deselect_joined && n) {
+          // the new quads are at the end: keep only the triangles that could not be joined selected
+          const keep = new Set<number>();
+          for (let i = 0; i < m.faces.length - n; i++) if (m.faces[i].verts.length === 3 && m.isFaceSelected(m.faces[i])) m.faces[i].verts.forEach((v) => keep.add(v));
+          for (let i = m.faces.length - n; i < m.faces.length; i++) for (const v of m.faces[i].verts) if (!keep.has(v)) m.sel[v] = 0;
         }
-        pairs.sort((x, y) => x.score - y.score);
-        const used = new Set<number>();
-        const remove = new Set<number>();
-        const add: EFace[] = [];
-        for (const pr of pairs) {
-          if (used.has(pr.a) || used.has(pr.b)) continue;
-          const A = m.faces[pr.a],
-            B = m.faces[pr.b];
-          const [x, y] = pr.key.split(':').map(Number);
-          const oa = A.verts.find((v) => v !== x && v !== y)!,
-            ob = B.verts.find((v) => v !== x && v !== y)!;
-          const ia = A.verts.indexOf(oa);
-          const quad = [oa, A.verts[(ia + 1) % 3], ob, A.verts[(ia + 2) % 3]];
-          const uvOf = (v: number) => {
-            const i = A.verts.indexOf(v);
-            if (i >= 0) return [A.uvs[i * 2], A.uvs[i * 2 + 1]];
-            const j = B.verts.indexOf(v);
-            return [B.uvs[j * 2], B.uvs[j * 2 + 1]];
-          };
-          add.push(m.makeFace(quad, A, quad.flatMap(uvOf)));
-          used.add(pr.a);
-          used.add(pr.b);
-          remove.add(pr.a);
-          remove.add(pr.b);
-        }
-        m.faces = m.faces.filter((_, i) => !remove.has(i)).concat(add);
       }),
   },
   {
@@ -798,21 +807,7 @@ registerOperators([
     label: 'Smooth Vertices',
     props: [{ id: 'factor', label: 'Smoothing', type: 'float', default: 0.5, min: -10, max: 10, subtype: 'factor' }, { id: 'repeat', label: 'Repeat', type: 'int', default: 1, min: 1, max: 1000 }, { id: 'xaxis', label: 'X', type: 'bool', default: true }, { id: 'yaxis', label: 'Y', type: 'bool', default: true }, { id: 'zaxis', label: 'Z', type: 'bool', default: true }],
     poll: editPoll,
-    exec: (_ctx, p) =>
-      void withEdit((m) => {
-        const nb = m.neighbors();
-        const ax = [p.xaxis, p.yaxis, p.zaxis];
-        for (let it = 0; it < (p.repeat as number); it++) {
-          const next = m.pos.slice();
-          for (let v = 0; v < m.vcount; v++) {
-            if (!m.sel[v] || !nb[v].length) continue;
-            const c = [0, 0, 0];
-            for (const w of nb[v]) for (let k = 0; k < 3; k++) c[k] += m.pos[w * 3 + k] / nb[v].length;
-            for (let k = 0; k < 3; k++) if (ax[k]) next[v * 3 + k] = m.pos[v * 3 + k] + (c[k] - m.pos[v * 3 + k]) * (p.factor as number);
-          }
-          m.pos = next;
-        }
-      }),
+    exec: (_ctx, p) => void withEdit((m) => smoothVertices(m, p.factor as number, p.repeat as number, [!!p.xaxis, !!p.yaxis, !!p.zaxis])),
   },
   {
     idname: 'mesh.symmetrize',
@@ -820,34 +815,12 @@ registerOperators([
     props: [{ id: 'direction', label: 'Direction', type: 'enum', default: 'NEGATIVE_X', items: [['NEGATIVE_X', '-X to +X'], ['POSITIVE_X', '+X to -X'], ['NEGATIVE_Y', '-Y to +Y'], ['POSITIVE_Y', '+Y to -Y'], ['NEGATIVE_Z', '-Z to +Z'], ['POSITIVE_Z', '+Z to -Z']] }, { id: 'threshold', label: 'Threshold', type: 'float', default: 0.0001, min: 0, subtype: 'distance' }],
     poll: editPoll,
     exec: (_ctx, p) =>
-      void withEdit((m) => {
+      withEdit((m) => {
         const d = p.direction as string;
-        const axis = d.endsWith('X') ? 0 : d.endsWith('Y') ? 1 : 2;
-        const keepNeg = d.startsWith('NEGATIVE');
-        const thr = p.threshold as number;
-        // remove faces fully on the target side, snap plane verts, mirror kept faces
-        const side = (v: number) => m.pos[v * 3 + axis] * (keepNeg ? -1 : 1);
-        m.faces = m.faces.filter((f) => f.verts.every((v) => side(v) >= -thr));
-        for (let v = 0; v < m.vcount; v++) if (Math.abs(m.pos[v * 3 + axis]) <= thr) m.pos[v * 3 + axis] = 0;
-        m.compact();
-        const map = new Map<number, number>();
-        const n0 = m.vcount;
-        for (let v = 0; v < n0; v++) {
-          if (Math.abs(m.pos[v * 3 + axis]) <= thr) {
-            map.set(v, v);
-            continue;
-          }
-          const q = m.p(v);
-          q[axis] = -q[axis];
-          map.set(v, m.addVert(q, [[v, 1]], m.sel[v]));
-        }
-        const mirrored = m.faces.map((f) => {
-          const nf = { ...f, verts: f.verts.map((v) => map.get(v)!), uvs: [...f.uvs], seams: [...f.seams], sharp: [...f.sharp], creases: [...f.creases], colors: f.colors ? [...f.colors] : undefined };
-          flipFace(nf);
-          return nf;
-        });
-        m.faces.push(...mirrored);
-      }),
+        return symmetrizeMesh(m, d.endsWith('X') ? 0 : d.endsWith('Y') ? 1 : 2, d.startsWith('NEGATIVE'), p.threshold as number);
+      })
+        ? 'FINISHED'
+        : 'CANCELLED',
   },
   {
     idname: 'mesh.edge_rotate',

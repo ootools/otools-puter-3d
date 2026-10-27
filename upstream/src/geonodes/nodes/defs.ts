@@ -30,11 +30,13 @@ export function sockFromRaw(r: GnRawSocket): SocketDef {
   return s;
 }
 
-const ID_TYPES = new Set<SocketType>(['OBJECT', 'COLLECTION', 'MATERIAL']);
+const ID_TYPES = new Set<SocketType>(['OBJECT', 'COLLECTION', 'MATERIAL', 'FONT', 'IMAGE']);
 const ID_ICON: Record<string, string> = {
   OBJECT: 'object',
   COLLECTION: 'collection',
   MATERIAL: 'material',
+  FONT: 'outliner_ob_font',
+  IMAGE: 'image',
 };
 
 /** Selector rows for unlinked object/collection/material inputs (drawn in the node body). */
@@ -47,7 +49,15 @@ export function idSocketBody(ctx: NodeDrawContext, sockets: SocketDef[]): Child 
       const linked = tree.links.some((l) => l.to_node === node.id && l.to_socket === s.identifier);
       const doc = app.doc;
       const list: { id: string; name: string }[] =
-        s.type === 'OBJECT' ? Object.values(doc.objects) : s.type === 'COLLECTION' ? Object.values(doc.collections).filter((c) => c.id !== doc.scene.collection) : Object.values(doc.materials);
+        s.type === 'OBJECT'
+          ? Object.values(doc.objects)
+          : s.type === 'COLLECTION'
+            ? Object.values(doc.collections).filter((c) => c.id !== doc.scene.collection)
+            : s.type === 'FONT'
+              ? Object.values(doc.fonts ?? {})
+              : s.type === 'IMAGE'
+                ? Object.values(doc.images)
+                : Object.values(doc.materials);
       const cur = (node.inputs[s.identifier] as string | null) ?? '';
       return h(
         'div',

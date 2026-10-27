@@ -4,15 +4,18 @@ import { preEvaluateHooks, type Depsgraph } from '../eval/depsgraph';
 import type { EvalMesh, ModifierContext } from '../eval/types';
 import type { DocumentData, ModifierBase, NodeGroupData, NodeTreeData, ObjectData, SocketValue } from '../data/types';
 import { interfaceSocketType, findSocket, allSockets } from '../nodes/registry';
-import { geoExecs, type EvalEnv, type Val } from './exec';
+import { alwaysEvaluated, geoExecs, type EvalEnv, type Val } from './exec';
 import { TreeEval, pruneCache, hash, coerce, FIELD_TYPES, type NodeCache, type EvalLog } from './evaluator';
 import { GeometrySet, identity, adaptDomain, dataComps, type Component } from './geometry';
 import { evalMeshToGeometry, geometryToEvalMesh, curveDataToCurves, materialSlots } from './convert';
+import { curveObjectModifierInput } from './curves/curvedata';
+import { greasePencilGeometry } from './curves/gpdata';
 import { attributeField } from './inputs';
 import { Field, ConstField } from './field';
 import { storeOn } from './nodes/geometry';
 import { isActiveViewer, VIEWER } from './nodes/output';
 import { gnResults, viewerState, resultListeners } from './results';
+import { viewerItems, viewerItemIn, viewerAttr } from './nodes/vieweritems';
 import { fieldTypeOfEnum, type Domain, type FieldType } from './types';
 import { hasDomain } from './nodes/common';
 
@@ -105,7 +108,7 @@ function meshSig(m: EvalMesh) {
 // ---------------------------------------------------------------------------
 // Environment
 
-function makeEnv(doc: DocumentData, ob: ObjectData, graph: Depsgraph, frame: number, render: boolean): EvalEnv {
+export function makeEnv(doc: DocumentData, ob: ObjectData, graph: Depsgraph, frame: number, render: boolean): EvalEnv {
   const self = graph.get(ob.id)?.world.elements ?? Array.from(identity());
   const geoCache = new Map<string, GeometrySet | null>();
   return {
@@ -125,7 +128,10 @@ function makeEnv(doc: DocumentData, ob: ObjectData, graph: Depsgraph, frame: num
         const r = gnResults.get(id);
         if (r && ev.mesh && r.evalMesh === ev.mesh) g = r.geometry;
         else if (cu && !cu.bevel_depth && !cu.extrude && !(o.modifiers ?? []).length) g = new GeometrySet(undefined, undefined, curveDataToCurves(cu));
-        else if (ev.mesh) g = evalMeshToGeometry(ev.mesh, o.type === 'MESH' && o.data ? doc.meshes[o.data] : null);
+        else if (o.type === 'GREASEPENCIL') {
+          g = new GeometrySet();
+          g.greasePencil = greasePencilGeometry(doc, o, frame) ?? undefined;
+        } else if (ev.mesh) g = evalMeshToGeometry(ev.mesh, o.type === 'MESH' && o.data ? doc.meshes[o.data] : null);
         else g = GeometrySet.empty();
         if (g.mesh && o.type === 'MESH' && o.data && !g.mesh.materials.length) {
           const mm = g.mesh.copy();
@@ -180,6 +186,7 @@ export function evaluateGroup(group: NodeGroupData, m: ModifierBase, env: EvalEn
   if (!cache) caches.set(cacheKey, (cache = new Map()));
   const log: EvalLog = {
     warnings: new Map(),
+    kinds: new Map(),
     executed: 0,
     generation: ++generation,
   };
@@ -198,6 +205,7 @@ export function evaluateGroup(group: NodeGroupData, m: ModifierBase, env: EvalEn
     log,
   );
   const outputs = root.groupOutputs();
+  for (const n of tree.nodes) if (alwaysEvaluated.has(n.type) && !n.mute) root.nodeOutputs(n);
   const outItems = (tree.interface ?? []).filter((i) => i.in_out === 'OUTPUT');
   const geoItem = outItems.find((i) => interfaceSocketType(i.socket_type).type === 'GEOMETRY');
   let geometry = geoItem && outputs[geoItem.identifier] instanceof GeometrySet ? (outputs[geoItem.identifier] as GeometrySet) : GeometrySet.empty();
@@ -222,6 +230,16 @@ export function evaluateGroup(group: NodeGroupData, m: ModifierBase, env: EvalEn
       const gv = gs ? root.inputValue(vn, gs) : undefined;
       viewer = gv instanceof GeometrySet ? gv : GeometrySet.empty();
       const dom = String(vn.props.domain ?? 'AUTO');
+      const pick = (c: Component): Domain => (dom !== 'AUTO' && hasDomain(c, dom as Domain) ? (dom as Domain) : c.kind === 'INSTANCES' ? 'INSTANCE' : 'POINT');
+      // extra values of the viewer, each stored as its own attribute
+      for (const it of viewerItems(vn)) {
+        const s = socks.find((x) => x.identifier === viewerItemIn(it));
+        if (!s || !root.links(vn.id, s.identifier).length) continue;
+        const t = fieldTypeOfEnum(String(it.data_type ?? 'FLOAT'));
+        const v = root.inputValue(vn, s);
+        const f = v instanceof Field ? v : new ConstField(t, (v ?? 0) as number);
+        viewer = viewer.map((c: Component) => storeOn(c, (viewerDomain = pick(c)), viewerAttr(it), t, f));
+      }
       if (vs && root.links(vn.id, 'Value').length) {
         const t = fieldTypeOfEnum(vn.props.data_type ?? 'FLOAT');
         const v = root.inputValue(vn, vs);
@@ -269,7 +287,7 @@ function viewerColors(g: GeometrySet): GeometrySet {
 }
 
 let nameHook: (() => string) | null = null;
-/** UI layer hook naming new modifiers (reference name "GeometryNodes", made unique per object). */
+/** UI layer hook naming new modifiers ("GeometryNodes", made unique per object). */
 export function setModifierNameHook(fn: () => string) {
   nameHook = fn;
 }
@@ -304,7 +322,8 @@ registerModifier({
     const t0 = performance.now();
     const graph = ctx.graph ?? currentGraph;
     const env = makeEnv(ctx.doc, ctx.ob, graph, ctx.frame, ctx.render);
-    const input = evalMeshToGeometry(mesh, ctx.source);
+    const cin = curveObjectModifierInput(ctx.doc, ctx.ob, m.id, ctx.render);
+    const input = cin ? new GeometrySet(undefined, undefined, cin) : evalMeshToGeometry(mesh, ctx.source);
     const withViewer = !ctx.render && viewerActiveFor(ctx.doc, ctx.ob, m);
     const r = evaluateGroup(group, m, env, input, meshSig(mesh), `${ctx.ob.id}/${m.id}`, withViewer);
     const shown = r.viewer ? viewerColors(r.viewer) : r.geometry;
@@ -322,6 +341,7 @@ registerModifier({
       viewer: r.viewer,
       viewerDomain: r.viewerDomain,
       warnings: r.log.warnings,
+      warningKinds: r.log.kinds,
       ms: performance.now() - t0,
       executed: r.log.executed,
     });

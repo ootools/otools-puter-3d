@@ -1,4 +1,5 @@
 // Join, transform and realize geometry (attributes are merged by name).
+import { joinVolumes } from '../../volume/component';
 import {
   CurvesComponent,
   EdgeHash,
@@ -16,6 +17,8 @@ import {
   type InstanceReference,
 } from '../geometry';
 import type { AttrArray, DataType, Domain } from '../types';
+import { missingCurveAttr, transformCurveAttrs } from '../curves/curvedata';
+import { joinGreasePencil, transformGreasePencil } from '../curves/gpdata';
 
 const TYPE_RANK: Record<DataType, number> = {
   BOOLEAN: 0,
@@ -26,6 +29,7 @@ const TYPE_RANK: Record<DataType, number> = {
   FLOAT_VECTOR: 5,
   QUATERNION: 5,
   FLOAT_COLOR: 6,
+  FLOAT4X4: 7,
 };
 
 function convertData(data: AttrArray, from: DataType, to: DataType, n: number): AttrArray {
@@ -76,6 +80,8 @@ function joinAttrs(comps: Component[], sizes: (c: Component, d: Domain) => numbe
         let d = a.domain === domain ? a.data : adaptDomain(c, a.data, a.type, a.domain, domain);
         d = convertData(d, a.type, type, n);
         data.set(d.subarray(0, n * comp), o * comp);
+      } else if (c.kind === 'CURVES' && missingCurveAttr(c, name, data, o, n)) {
+        // built-in curve attributes get their defaults (spline type, resolution, handles)
       } else if (type === 'FLOAT_COLOR') for (let i = 0; i < n; i++) data[(o + i) * 4 + 3] = 1;
       o += n;
     });
@@ -268,12 +274,15 @@ export function joinGeometries(list: GeometrySet[]): GeometrySet {
   const points = nonEmpty.map((g) => g.points).filter((x): x is PointsComponent => !!x);
   const curves = nonEmpty.map((g) => g.curves).filter((x): x is CurvesComponent => !!x);
   const inst = nonEmpty.map((g) => g.instances).filter((x): x is InstancesComponent => !!x);
-  return new GeometrySet(
+  const out = new GeometrySet(
     meshes.length ? joinMeshes(meshes) : undefined,
     points.length ? joinPoints(points) : undefined,
     curves.length ? joinCurves(curves) : undefined,
     inst.length ? joinInstances(inst) : undefined,
   );
+  out.greasePencil = joinGreasePencil(nonEmpty.map((g) => g.greasePencil));
+  out.volume = joinVolumes(nonEmpty.map((g) => g.volume));
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,11 +298,15 @@ export function transformComponent(c: Component, m: ArrayLike<number>): Componen
   }
   const out = c.copy();
   out.positions = transformPositions(m, c.positions);
+  if (out.kind === 'CURVES') transformCurveAttrs(out, m);
   return out;
 }
 
 export function transformGeometry(g: GeometrySet, m: ArrayLike<number>): GeometrySet {
-  return g.map((c) => transformComponent(c, m));
+  const out = g.map((c) => transformComponent(c, m));
+  if (g.greasePencil) out.greasePencil = transformGreasePencil(g.greasePencil, m);
+  if (g.volume) out.volume = g.volume.transformed(m);
+  return out;
 }
 
 // ---------------------------------------------------------------------------

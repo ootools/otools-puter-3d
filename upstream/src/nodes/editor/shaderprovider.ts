@@ -1,10 +1,13 @@
 // Shader Editor: edits the active object's active material, or the scene world.
+import { materialSettingsPanel, ensureMaterialDefaults } from '../../render/realtime/materialprops';
 import { h } from '../../ui/h';
 import { icon } from '../../ui/icons';
 import { app } from '../../app/app';
 import { registerEditor } from '../../ui/screen';
 import { openMenu } from '../../ui/menu';
-import { enumMenu } from '../../ui/widgets';
+import { enumMenu, panel, checkbox } from '../../ui/widgets';
+import { defaultLightTree } from '../shader/lightnodes';
+import { bool, colorProp, enumProp, num } from '../../ui/props';
 import { NodeEditor } from './editor';
 import { registerNodeEditorProvider } from './context';
 import { shaderEntryPoll } from '../shader/defs';
@@ -20,13 +23,14 @@ type Ed = { shaderType: 'OBJECT' | 'WORLD' };
 function slotOwner(o: ObjectData): { materials: (string | null)[] } | null {
   const doc = app.doc;
   if (!o.data) return null;
-  return doc.meshes[o.data] ?? doc.curves[o.data] ?? null;
+  return doc.meshes[o.data] ?? doc.curves[o.data] ?? doc.metaballs?.[o.data] ?? doc.hair_curves?.[o.data] ?? doc.volumes?.[o.data] ?? doc.pointclouds?.[o.data] ?? null;
 }
 
 const DATA_ICON: Record<string, string> = {
   MESH: 'mesh_data',
   CURVE: 'curve_data',
   FONT: 'curve_data',
+  META: 'meta_data',
 };
 
 function changed(label: string) {
@@ -37,7 +41,7 @@ function changed(label: string) {
 registerNodeEditorProvider({
   id: 'SHADER',
   label: 'Shader Editor',
-  icon: 'node_material',
+  icon: 'editor_shader',
   treeType: (ed) => (ed.shaderType === 'WORLD' ? 'WORLD' : 'SHADER'),
   root: (ed) => {
     const doc = app.doc;
@@ -48,9 +52,21 @@ registerNodeEditorProvider({
     }
     const ob = app.activeObject;
     if (!ob) return null;
+    if (ob.type === 'LIGHT') {
+      const la = ob.data ? doc.lights[ob.data] : undefined;
+      if (!la?.use_nodes || !la.node_tree) return null;
+      return {
+        tree: la.node_tree,
+        key: `la:${la.id}`,
+        crumbs: [
+          ['object', ob.name],
+          ['light_data', la.name],
+        ],
+      };
+    }
     const ma = activeMaterial(ob);
     if (!ma) return null;
-    const data = ob.data ? (doc.meshes[ob.data] ?? doc.curves[ob.data]) : undefined;
+    const data = ob.data ? (doc.meshes[ob.data] ?? doc.curves[ob.data] ?? doc.metaballs?.[ob.data] ?? doc.hair_curves?.[ob.data] ?? doc.volumes?.[ob.data] ?? doc.pointclouds?.[ob.data]) : undefined;
     return {
       tree: ma.tree,
       key: `ma:${ma.id}`,
@@ -62,10 +78,29 @@ registerNodeEditorProvider({
     if (e.shaderType === 'WORLD') return app.doc.scene.world ? '' : 'The scene has no world';
     const ob = app.activeObject;
     if (!ob) return '';
+    if (ob.type === 'LIGHT') return 'Enable Use Nodes in the header to shade this light with nodes';
     if (!slotOwner(ob)) return 'The active object cannot have materials';
     return '';
   },
   menuPoll: (idname, ed) => shaderEntryPoll(idname, ed.shaderType),
+  // sidebar Options: settings of the edited material or world
+  optionsPanels: (ed) => {
+    const e = ed as Ed;
+    if (e.shaderType === 'WORLD') {
+      const w = app.doc.scene.world ? app.doc.worlds[app.doc.scene.world] : undefined;
+      return w ? panel('nd-wo-display', 'Viewport Display', () => [colorProp(w, 'color', 'Color')]) : h('div', { class: 'prop-note' }, 'No world');
+    }
+    const ma = app.activeObject ? activeMaterial(app.activeObject) : null;
+    if (!ma) return h('div', { class: 'prop-note' }, 'No material');
+    return [
+      (ensureMaterialDefaults(ma), materialSettingsPanel(ma, 'nd-ma')),
+      panel('nd-ma-display', 'Viewport Display', () => [
+        colorProp(ma, 'diffuse_color', 'Color', { alpha: true }),
+        num(ma, 'metallic', 'Metallic', { min: 0, max: 1, slider: true }),
+        num(ma, 'roughness', 'Roughness', { min: 0, max: 1, slider: true }),
+      ]),
+    ];
+  },
   headerLeft: (ed) => {
     const e = ed as NodeEditor;
     return enumMenu(
@@ -120,6 +155,24 @@ registerNodeEditorProvider({
       );
     }
     const ob = app.activeObject;
+    if (ob?.type === 'LIGHT' && ob.data && doc.lights[ob.data]) {
+      const la = doc.lights[ob.data];
+      return h(
+        'div',
+        { class: 'nd-ids' },
+        checkbox(
+          'nd-light-nodes',
+          'Use Nodes',
+          !!la.use_nodes,
+          (v) => {
+            la.use_nodes = v;
+            if (v && !la.node_tree) la.node_tree = defaultLightTree();
+            changed(v ? 'Use Light Nodes' : 'Disable Light Nodes');
+          },
+          { tip: 'Use Nodes\nShade the light with a node tree' },
+        ),
+      );
+    }
     const owner = ob ? slotOwner(ob) : null;
     if (!ob || !owner) return null;
     const slots = materialSlots(doc, ob);
@@ -182,7 +235,7 @@ registerNodeEditorProvider({
 registerEditor({
   id: 'SHADER',
   label: 'Shader Editor',
-  icon: 'node_material',
+  icon: 'editor_shader',
   group: 'General',
   create: (a, s) => new NodeEditor(a, s, 'SHADER'),
 });

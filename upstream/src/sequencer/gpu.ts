@@ -5,6 +5,7 @@
 import type { BlendType, ColorBalanceData } from './types';
 import { BLEND_ITEMS } from './strips';
 import { brightContrastParams } from './blend';
+import { CURVE_GLSL } from '../compositor/color/curvemap';
 
 export interface Target {
   tex: WebGLTexture;
@@ -201,6 +202,9 @@ void main() {
     c *= uCbMul;
   } else if (uOp == 2) {
     c = c * uBC.x + uBC.y;
+  } else if (uOp == 3) {
+    // white balance: uP0 is the colour that should become white
+    c = c / max(uP0, vec3(1e-4));
   }
   o = vec4(max(c, 0.0) * a, a);
 }`;
@@ -251,6 +255,29 @@ precision highp float;
 in vec2 vUv; out vec4 o; uniform sampler2D uTex; uniform int uOpaque; uniform vec3 uBg;
 void main() { vec4 c = texture(uTex, vUv); if (uOpaque == 1) { c.rgb += uBg * (1.0 - c.a); c.a = 1.0; } o = c; }`;
 
+/** Modifier masks: keep the original where the mask is black, the modified image where white. */
+const FS_MASKMIX = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o; uniform sampler2D uA; uniform sampler2D uB; uniform sampler2D uM;
+void main() {
+  vec4 m = texture(uM, vUv);
+  float k = clamp(dot(m.rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+  o = mix(texture(uA, vUv), texture(uB, vUv), k);
+}`;
+
+/** Curves: combined curve, then the red / green / blue curves (rows 0–3 of the lookup table). */
+const FS_CURVES = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o; uniform sampler2D uTex; uniform sampler2D uLut; uniform vec4 uP[4]; uniform vec3 uBlack; uniform vec3 uWhite;
+${CURVE_GLSL}
+void main() {
+  vec4 p = texture(uTex, vUv);
+  if (p.a <= 0.0) { o = p; return; }
+  vec3 c = (p.rgb / p.a - uBlack) / max(uWhite - uBlack, vec3(1e-6));
+  vec3 r = vec3(cmp_curve(uLut, uP[1], 1, cmp_curve(uLut, uP[0], 0, c.r)), cmp_curve(uLut, uP[2], 2, cmp_curve(uLut, uP[0], 0, c.g)), cmp_curve(uLut, uP[3], 3, cmp_curve(uLut, uP[0], 0, c.b)));
+  o = vec4(max(r, 0.0) * p.a, p.a);
+}`;
+
 type Prog = { p: WebGLProgram; u: Map<string, WebGLUniformLocation | null> };
 
 /** 3×3 column-major matrix (image pixels → frame pixels). */
@@ -296,6 +323,58 @@ export class Compositor {
     this.progs.glow = this.program(VS_FULL, FS_GLOW);
     this.progs.fill = this.program(VS_FULL, FS_FILL);
     this.progs.copy = this.program(VS_FULL, FS_COPY);
+    this.progs.maskmix = this.program(VS_FULL, FS_MASKMIX);
+    this.progs.curves = this.program(VS_FULL, FS_CURVES);
+  }
+
+  private luts = new Map<string, WebGLTexture>();
+  private lutParams = new Map<string, { data: Float32Array; params: Float32Array }>();
+
+  /** Apply RGB curves (lookup table baked from the curve mapping, cached by its key). */
+  curves(dst: Target, src: Target, key: string, bake: () => { data: Float32Array; params: Float32Array }, black: number[], white: number[]) {
+    const gl = this.gl;
+    let tex = this.luts.get(key);
+    const lut = tex ? this.lutParams.get(key)! : bake();
+    if (!tex) {
+      tex = gl.createTexture()!;
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, lut.data.length / 4 / 4, 4, 0, gl.RGBA, gl.FLOAT, lut.data);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      if (this.luts.size > 32) {
+        const [k, t] = this.luts.entries().next().value!;
+        gl.deleteTexture(t);
+        this.luts.delete(k);
+        this.lutParams.delete(k);
+      }
+      this.luts.set(key, tex);
+      this.lutParams.set(key, { data: new Float32Array(0), params: lut.params });
+    }
+    this.bindTarget(dst);
+    const u = this.use('curves');
+    this.bindTex(0, src.tex);
+    this.bindTex(1, tex);
+    gl.uniform1i(u('uTex'), 0);
+    gl.uniform1i(u('uLut'), 1);
+    gl.uniform4fv(u('uP'), lut.params);
+    gl.uniform3f(u('uBlack'), black[0] ?? 0, black[1] ?? 0, black[2] ?? 0);
+    gl.uniform3f(u('uWhite'), white[0] ?? 1, white[1] ?? 1, white[2] ?? 1);
+    this.draw();
+  }
+
+  /** dst = mix(original, modified, luminance of mask). */
+  maskMix(dst: Target, original: Target, modified: Target, mask: Target) {
+    const gl = this.gl;
+    this.bindTarget(dst);
+    const u = this.use('maskmix');
+    this.bindTex(0, original.tex);
+    this.bindTex(1, modified.tex);
+    this.bindTex(2, mask.tex);
+    gl.uniform1i(u('uA'), 0);
+    gl.uniform1i(u('uB'), 1);
+    gl.uniform1i(u('uM'), 2);
+    this.draw();
   }
 
   private program(vs: string, fs: string): Prog {
@@ -556,6 +635,17 @@ export class Compositor {
     this.draw();
   }
 
+  whiteBalance(dst: Target, src: Target, white: number[]) {
+    const gl = this.gl;
+    this.bindTarget(dst);
+    const u = this.use('color');
+    this.bindTex(0, src.tex);
+    gl.uniform1i(u('uTex'), 0);
+    gl.uniform1i(u('uOp'), 3);
+    gl.uniform3f(u('uP0'), white[0] ?? 1, white[1] ?? 1, white[2] ?? 1);
+    this.draw();
+  }
+
   /** Separable gaussian blur (zero outside the frame); sigma in pixels per axis. */
   blur(dst: Target, src: Target, sx: number, sy: number) {
     const tmp = this.acquire();
@@ -671,6 +761,124 @@ export class Compositor {
     const b = new Uint8Array(4);
     gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, b);
     return Array.from(b).map((v) => v / 255);
+  }
+
+  // ------------------------------------------------------------------ extension passes
+
+  /** Premultiplied float RGBA of a target, rows bottom-up. */
+  readFloat(src: Target): Float32Array {
+    const gl = this.gl;
+    this.bindTarget(src);
+    const out = new Float32Array(src.w * src.h * 4);
+    if (this.float) gl.readPixels(0, 0, src.w, src.h, gl.RGBA, gl.FLOAT, out);
+    else {
+      const b = new Uint8Array(src.w * src.h * 4);
+      gl.readPixels(0, 0, src.w, src.h, gl.RGBA, gl.UNSIGNED_BYTE, b);
+      for (let i = 0; i < b.length; i++) out[i] = b[i] / 255;
+    }
+    return out;
+  }
+
+  /** Upload premultiplied float RGBA (rows bottom-up) into a texture (reused when given). */
+  uploadFloat(data: Float32Array, w: number, h: number, existing?: WebGLTexture): WebGLTexture {
+    const gl = this.gl;
+    const tex = existing ?? gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, data);
+    this.texParams(true);
+    return tex;
+  }
+
+  deleteTexture(tex: WebGLTexture) {
+    this.gl.deleteTexture(tex);
+  }
+
+  private lutTextures = new Map<string, WebGLTexture>();
+
+  /**
+   * Run a fragment shader over `dst` (compiled once per name). Textures bind to units in order
+   * (as uniforms `uTex0`, `uTex1`, …); numbers and arrays of 2–4 / 9 / 16 become uniforms.
+   */
+  pass(name: string, fs: string, dst: Target, textures: WebGLTexture[], uniforms: Record<string, number | number[]> = {}) {
+    const gl = this.gl;
+    if (!this.progs[name]) this.progs[name] = this.program(VS_FULL, fs);
+    this.bindTarget(dst);
+    const u = this.use(name);
+    textures.forEach((t, i) => {
+      this.bindTex(i, t);
+      gl.uniform1i(u(`uTex${i}`), i);
+    });
+    for (const [k, v] of Object.entries(uniforms)) {
+      const loc = u(k);
+      if (typeof v === 'number') gl.uniform1f(loc, v);
+      else if (v.length === 2) gl.uniform2fv(loc, v);
+      else if (v.length === 3) gl.uniform3fv(loc, v);
+      else if (v.length === 4) gl.uniform4fv(loc, v);
+      else if (v.length === 9) gl.uniformMatrix3fv(loc, false, v);
+      else if (v.length === 16) gl.uniformMatrix4fv(loc, false, v);
+    }
+    this.draw();
+  }
+
+  /** A float lookup table texture (width × 1 RGBA), cached by key. */
+  lut(key: string, width: number, bake: () => Float32Array): WebGLTexture {
+    const gl = this.gl;
+    let tex = this.lutTextures.get(key);
+    if (tex) return tex;
+    tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, 1, 0, gl.RGBA, gl.FLOAT, bake());
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    if (this.lutTextures.size > 32) {
+      const [k, t] = this.lutTextures.entries().next().value!;
+      gl.deleteTexture(t);
+      this.lutTextures.delete(k);
+    }
+    this.lutTextures.set(key, tex);
+    return tex;
+  }
+
+  private small: { tex: WebGLTexture; fbo: WebGLFramebuffer; w: number; h: number } | null = null;
+
+  /** Straight-alpha RGBA of a target scaled down to at most 64 pixels wide (for image statistics). */
+  sample(src: Target): { data: Float32Array; w: number; h: number } {
+    const gl = this.gl;
+    const w = Math.max(1, Math.min(64, src.w)),
+      h = Math.max(1, Math.round((src.h * w) / src.w));
+    if (!this.small || this.small.w !== w || this.small.h !== h) {
+      if (this.small) {
+        gl.deleteTexture(this.small.tex);
+        gl.deleteFramebuffer(this.small.fbo);
+      }
+      const tex = gl.createTexture()!;
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, this.float ? gl.RGBA16F : gl.RGBA8, w, h);
+      this.texParams(false);
+      const fbo = gl.createFramebuffer()!;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      this.small = { tex, fbo, w, h };
+    }
+    const t = { tex: this.small.tex, fbo: this.small.fbo, w, h };
+    this.copy(t, src);
+    this.bindTarget(t);
+    const out = new Float32Array(w * h * 4);
+    if (this.float) gl.readPixels(0, 0, w, h, gl.RGBA, gl.FLOAT, out);
+    else {
+      const b = new Uint8Array(w * h * 4);
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, b);
+      for (let i = 0; i < b.length; i++) out[i] = b[i] / 255;
+    }
+    for (let i = 0; i < out.length; i += 4) {
+      const a = out[i + 3];
+      if (a > 0) for (let k = 0; k < 3; k++) out[i + k] /= a;
+    }
+    return { data: out, w, h };
   }
 }
 

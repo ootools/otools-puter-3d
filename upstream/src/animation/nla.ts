@@ -4,16 +4,22 @@ import { h, type Child } from '../ui/h';
 import { icon } from '../ui/icons';
 import { app, registerOperators, type ModalHandler, type OpContext } from '../app/app';
 import { addKeys } from '../app/keymap';
-import { registerEditor } from '../ui/screen';
-import { openMenu, type MenuItem } from '../ui/menu';
+import { registerEditor, type Area } from '../ui/screen';
+import { promptText, openMenu, type MenuItem } from '../ui/menu';
 import { numberField, enumMenu, checkbox, textField, panel, button } from '../ui/widgets';
 import type { AnimData, NlaStrip, NlaTrack, ObjectData } from '../data/types';
+import { findSlot, isSlotted, stripSlot } from '../anim/slots';
+import { objectSlotBinding, slotSelector, type SlotBinding } from './slotops';
 import { AnimEditor, RULER_H, menuButton, hdrToggle, markerMenu, overMain, roundRect, type SidebarTab } from './animeditor';
 import { activeAction, type Channel, type SpaceKind } from './channels';
 import { C, drawKey } from './theme';
 import { aggregate } from './aggregate';
 import { pushDown, makeStrip, newTrack, stripFits, sortStrips, actionRange, ensureAnimData } from './actionops';
 import { browseActions } from './actionui';
+import { snapFrameTo } from './transformkeys';
+import { moveChannelsMenu, previewRangeMenu } from './menus';
+import { stripInfluence } from '../anim/evaluate';
+import { influenceKeyed, influenceSamples, keyStripInfluence, setAnimatedInfluence } from './nlacontrol';
 
 export interface StripRef {
   ob: ObjectData;
@@ -47,9 +53,24 @@ const EXTRAP_ITEMS = [
 ];
 
 export class NlaEditor extends AnimEditor {
-  keymaps = ['Animation Channels', 'NLA Editor', 'Animation'];
+  keymaps = ['Markers', 'Animation Channels', 'NLA Editor', 'Animation'];
   rowH = 24;
   activeStrip: NlaStrip | null = null;
+  /** View ▸ Show Control F-Curves: animated influence drawn over the strips */
+  showStripCurves = true;
+  /** View ▸ Show Local Markers: the action's markers drawn on its strips */
+  showLocalMarkers = true;
+
+  constructor(area: Area, state?: unknown) {
+    super(area, state);
+    const st = (state ?? {}) as Record<string, unknown>;
+    if (typeof st.showStripCurves === 'boolean') this.showStripCurves = st.showStripCurves;
+    if (typeof st.showLocalMarkers === 'boolean') this.showLocalMarkers = st.showLocalMarkers;
+  }
+
+  protected serializeExtra() {
+    return { ...super.serializeExtra(), showStripCurves: this.showStripCurves, showLocalMarkers: this.showLocalMarkers };
+  }
 
   space(): SpaceKind {
     return 'NLA';
@@ -103,6 +124,7 @@ export class NlaEditor extends AnimEditor {
         },
         { separator: true },
         { label: 'Box Select', op: 'nla.select_box', shortcut: 'B' },
+        { label: 'Box Select (Axis Range)', op: 'nla.select_box', props: { axis_range: true }, shortcut: 'Alt B' },
         { separator: true },
         {
           label: 'Before Current Frame',
@@ -118,83 +140,22 @@ export class NlaEditor extends AnimEditor {
         },
       ]),
       menuButton('Marker', markerMenu),
-      menuButton('Add', () => [
-        {
-          label: 'Action',
-          submenu: () => actionClipMenu(),
-          shortcut: 'Shift A',
-        },
-        { separator: true },
-        { label: 'Add Tracks', op: 'nla.tracks_add' },
-        {
-          label: 'Add Tracks Above Selected',
-          op: 'nla.tracks_add',
-          props: { above_selected: true },
-        },
-      ]),
-      menuButton('Track', () => [
-        { label: 'Add Tracks', op: 'nla.tracks_add' },
-        {
-          label: 'Add Tracks Above Selected',
-          op: 'nla.tracks_add',
-          props: { above_selected: true },
-        },
-        { label: 'Delete Tracks', op: 'nla.tracks_delete' },
-      ]),
-      menuButton('Strip', () => [
-        {
-          label: 'Transform',
-          submenu: () => [
+      menuButton('Add', () => this.addMenu()),
+      menuButton('Track', () => this.trackMenu()),
+      menuButton('Strip', () => this.stripMenu()),
+      this.tweaking()
+        ? h(
+            'button',
             {
-              label: 'Move',
-              op: 'nla.transform',
-              props: { mode: 'TRANSLATION' },
-              shortcut: 'G',
+              key: 'tweak',
+              class: { 'hdr-toggle': true, wide: true, on: true },
+              'data-tip': 'Stop Tweaking Strip Actions\nReturn to editing the NLA stack (Tab)',
+              onclick: () => app.run('nla.tweakmode_exit', {}, { area: this.area }),
             },
-            {
-              label: 'Scale',
-              op: 'nla.transform',
-              props: { mode: 'RESIZE' },
-              shortcut: 'S',
-            },
-          ],
-        },
-        {
-          label: 'Snap',
-          submenu: () => [
-            {
-              label: 'Selection to Current Frame',
-              op: 'nla.snap',
-              props: { type: 'CFRA' },
-            },
-            {
-              label: 'Selection to Nearest Frame',
-              op: 'nla.snap',
-              props: { type: 'NEAREST_FRAME' },
-            },
-            {
-              label: 'Selection to Nearest Second',
-              op: 'nla.snap',
-              props: { type: 'NEAREST_SECOND' },
-            },
-            {
-              label: 'Selection to Nearest Marker',
-              op: 'nla.snap',
-              props: { type: 'NEAREST_MARKER' },
-            },
-          ],
-          shortcut: 'Shift S',
-        },
-        { separator: true },
-        { label: 'Split', op: 'nla.split', shortcut: 'Y' },
-        { label: 'Duplicate', op: 'nla.duplicate_move', shortcut: 'Shift D' },
-        { label: 'Delete', op: 'nla.delete', shortcut: 'X' },
-        { separator: true },
-        { label: 'Toggle Muting', op: 'nla.mute_toggle', shortcut: 'H' },
-        { separator: true },
-        { label: 'Clear Scale', op: 'nla.clear_scale', shortcut: 'Alt S' },
-        { label: 'Sync Action Length', op: 'nla.action_sync_length' },
-      ]),
+            icon('nla'),
+            'Tweaking',
+          )
+        : null,
       h('div', { class: 'hdr-spacer' }),
       hdrToggle(
         'only-sel',
@@ -210,53 +171,111 @@ export class NlaEditor extends AnimEditor {
         'Show Hidden\nInclude channels from objects/bone that are not visible',
         () => ((this.showHidden = !this.showHidden), this.refresh(), app.changed('ui')),
       ),
-      hdrToggle(
-        'snap',
-        this.autoSnap ? 'snap_on' : 'snap_off',
-        this.autoSnap,
-        'Snap\nSnap strips to whole frames while transforming (Ctrl toggles)',
-        () => ((this.autoSnap = !this.autoSnap), app.changed('ui')),
-      ),
+      this.errorsToggle(),
+      this.filtersHeader(),
+      this.snapHeader('strips'),
     );
   }
 
-  viewMenu(): MenuItem[] {
+  tweaking() {
+    return this.list.rows.some((r) => r.ob?.animation_data?.tweak);
+  }
+
+  addMenu(): MenuItem[] {
+    return [
+      { label: 'Action', submenu: () => actionClipMenu(), shortcut: 'Shift A' },
+      { label: 'Transition', op: 'nla.transition_add', shortcut: 'Shift T' },
+      { label: 'Sound', op: 'nla.soundclip_add', shortcut: 'Shift K' },
+      { separator: true },
+      { label: 'Selected Objects', op: 'nla.selected_objects_add' },
+    ];
+  }
+
+  trackMenu(): MenuItem[] {
+    return [
+      { label: 'Add', op: 'nla.tracks_add', shortcut: 'Shift A' },
+      { label: 'Add Above Selected', op: 'nla.tracks_add', props: { above_selected: true }, shortcut: 'Shift Ctrl A' },
+      { label: 'Delete', op: 'nla.tracks_delete', shortcut: 'X' },
+      { separator: true },
+      { label: 'Move', submenu: moveChannelsMenu },
+      { separator: true },
+      { label: 'Remove Empty Animation Data', op: 'anim.channels_clean_empty' },
+    ];
+  }
+
+  tweakItems(): MenuItem[] {
+    return this.tweaking()
+      ? [{ label: 'Stop Tweaking Strip Actions', op: 'nla.tweakmode_exit', shortcut: 'Tab' }]
+      : [
+          { label: 'Start Editing Stashed Action', op: 'nla.tweakmode_enter', props: { isolate_action: true }, shortcut: 'Shift Tab' },
+          { label: 'Start Tweaking Strip Actions (Full Stack)', op: 'nla.tweakmode_enter', props: { use_upper_stack_evaluation: true }, shortcut: 'Tab' },
+          { label: 'Start Tweaking Strip Actions (Lower Stack)', op: 'nla.tweakmode_enter', props: { use_upper_stack_evaluation: false } },
+        ];
+  }
+
+  stripMenu(): MenuItem[] {
     return [
       {
-        label: 'Sidebar',
-        checked: this.showSidebar,
-        shortcut: 'N',
-        action: () => this.toggleSidebar(),
+        label: 'Transform',
+        submenu: () => [
+          { label: 'Move', op: 'nla.transform', props: { mode: 'TRANSLATION' }, shortcut: 'G' },
+          { label: 'Extend', op: 'nla.transform', props: { mode: 'TIME_EXTEND' }, shortcut: 'E' },
+          { label: 'Scale', op: 'nla.transform', props: { mode: 'RESIZE' }, shortcut: 'S' },
+          { separator: true },
+          { label: 'Swap', op: 'nla.swap', shortcut: 'Alt F' },
+          { separator: true },
+          { label: 'Move Up', op: 'nla.move_up', shortcut: 'Page Up' },
+          { label: 'Move Down', op: 'nla.move_down', shortcut: 'Page Down' },
+        ],
       },
-      {
-        label: 'Show Markers',
-        checked: this.showMarkers,
-        action: () => ((this.showMarkers = !this.showMarkers), this.refresh()),
-      },
+      { label: 'Snap', submenu: snapItems, shortcut: 'Shift S' },
       { separator: true },
-      {
-        label: 'Frame Selected',
-        op: 'nla.view_selected',
-        shortcut: 'Numpad .',
-      },
+      { label: 'Split', op: 'nla.split', shortcut: 'Y' },
+      { separator: true },
+      { label: 'Duplicate', op: 'nla.duplicate_move', shortcut: 'Alt D' },
+      { label: 'Linked Duplicate', op: 'nla.duplicate_linked_move', shortcut: 'Shift D' },
+      { label: 'Delete', op: 'nla.delete', shortcut: 'X' },
+      { separator: true },
+      { label: 'Make Meta', op: 'nla.meta_add', shortcut: 'Ctrl G' },
+      { label: 'Remove Meta', op: 'nla.meta_remove', shortcut: 'Ctrl Alt G' },
+      { separator: true },
+      { label: 'Toggle Muting', op: 'nla.mute_toggle', shortcut: 'H' },
+      { separator: true },
+      { label: 'Bake Action', op: 'nla.bake' },
+      { separator: true },
+      { label: 'Apply Scale', op: 'nla.apply_scale', shortcut: 'Ctrl A' },
+      { label: 'Clear Scale', op: 'nla.clear_scale', shortcut: 'Alt S' },
+      { label: 'Sync Action Length', op: 'nla.action_sync_length' },
+      { separator: true },
+      { label: 'Make Single User', op: 'nla.make_single_user', shortcut: 'U' },
+      { separator: true },
+      ...this.tweakItems(),
+    ];
+  }
+
+  viewMenu(): MenuItem[] {
+    const tog = (label: string, on: boolean, flip: () => void, extra: Partial<MenuItem> = {}): MenuItem => ({ label, checked: on, ...extra, action: () => (flip(), this.refresh(), app.changed('ui')) });
+    return [
+      { label: 'Sidebar', checked: this.showSidebar, shortcut: 'N', action: () => this.toggleSidebar() },
+      this.channelsMenuItem(),
+      this.footerMenuItem(),
+      { separator: true },
+      { label: 'Frame Selected', op: 'nla.view_selected', shortcut: 'Numpad .' },
       { label: 'Frame All', op: 'nla.view_all', shortcut: 'Home' },
-      {
-        label: 'Go to Current Frame',
-        op: 'nla.view_frame',
-        shortcut: 'Numpad 0',
-      },
+      { label: 'Frame Scene Range', op: 'anim.scene_range_frame' },
+      { label: 'Go to Current Frame', op: 'nla.view_frame', shortcut: 'Numpad 0' },
       { separator: true },
-      {
-        label: 'Clear Preview Range',
-        op: 'anim.previewrange_clear',
-        shortcut: 'Alt P',
-      },
+      { ...this.realtimeMenuItem(), description: 'Other views follow strips while they are being transformed' },
+      tog('Show Control F-Curves', this.showStripCurves, () => (this.showStripCurves = !this.showStripCurves), { description: 'Draw the animated influence over the strips' }),
       { separator: true },
-      {
-        label: this.area.screen.maximized === this.area ? 'Back to Previous' : 'Maximize Area',
-        op: 'screen.screen_full_area',
-        shortcut: 'Ctrl Space',
-      },
+      tog('Show Markers', this.showMarkers, () => (this.showMarkers = !this.showMarkers)),
+      tog('Show Local Markers', this.showLocalMarkers, () => (this.showLocalMarkers = !this.showLocalMarkers), { description: 'Draw the markers of each strip’s action on the strip' }),
+      { label: 'Show Seconds', checked: this.showSeconds, op: 'anim.show_seconds_toggle', shortcut: 'Ctrl T' },
+      this.syncRangeMenuItem(),
+      { separator: true },
+      ...previewRangeMenu('nla.previewrange_set'),
+      { separator: true },
+      this.areaMenuItem(),
     ];
   }
 
@@ -309,6 +328,7 @@ export class NlaEditor extends AnimEditor {
     }
     if (ch.kind === 'NLA_ACTION' && ch.ob) {
       const ob = ch.ob;
+      if (ob.animation_data?.tweak) return null;
       return ch.action
         ? h(
             'button',
@@ -346,32 +366,46 @@ export class NlaEditor extends AnimEditor {
 
   channelContextMenu(): MenuItem[] {
     return [
-      { label: 'Add Tracks', op: 'nla.tracks_add' },
-      {
-        label: 'Add Tracks Above Selected',
-        op: 'nla.tracks_add',
-        props: { above_selected: true },
-      },
-      { label: 'Delete Tracks', op: 'nla.tracks_delete' },
+      { label: 'Track Ordering', submenu: moveChannelsMenu },
       { separator: true },
-      { label: 'Expand Channels', op: 'anim.channels_expand' },
-      { label: 'Collapse Channels', op: 'anim.channels_collapse' },
+      { label: 'Add Track', op: 'nla.tracks_add' },
+      { label: 'Add Track Above Selected', op: 'nla.tracks_add', props: { above_selected: true } },
+      { separator: true },
+      { label: 'Delete Tracks', op: 'nla.tracks_delete' },
+      { label: 'Remove Empty Animation Data', op: 'anim.channels_clean_empty' },
     ];
   }
 
   protected mainContextMenu(): MenuItem[] {
+    const ref = this.activeStripRef();
     return [
-      { heading: 'Strip' },
-      {
-        label: 'Add Action Strip',
-        submenu: () => actionClipMenu(),
-        shortcut: 'Shift A',
-      },
+      { heading: 'NLA' },
+      ...this.tweakItems(),
       { separator: true },
-      { label: 'Split', op: 'nla.split', shortcut: 'Y' },
-      { label: 'Duplicate', op: 'nla.duplicate_move', shortcut: 'Shift D' },
-      { label: 'Toggle Muting', op: 'nla.mute_toggle', shortcut: 'H' },
-      { label: 'Delete', op: 'nla.delete', shortcut: 'X' },
+      {
+        label: 'Rename…',
+        disabled: !ref,
+        action: () =>
+          ref &&
+          promptText('Rename Strip', ref.strip.name, (v) => {
+            if (!v.trim()) return;
+            ref.strip.name = v.trim();
+            app.pushUndo('Rename Strip');
+            app.changed('doc');
+          }),
+      },
+      { label: 'Duplicate', op: 'nla.duplicate_move', shortcut: 'Alt D' },
+      { label: 'Duplicate Linked', op: 'nla.duplicate_linked_move', shortcut: 'Shift D' },
+      { separator: true },
+      { label: 'Split Strips', op: 'nla.split', shortcut: 'Y' },
+      { label: 'Delete Strips', op: 'nla.delete', shortcut: 'X' },
+      { separator: true },
+      { label: 'Add Meta-Strips', op: 'nla.meta_add', shortcut: 'Ctrl G' },
+      { label: 'Remove Meta-Strips', op: 'nla.meta_remove', shortcut: 'Ctrl Alt G' },
+      { separator: true },
+      { label: 'Swap Strips', op: 'nla.swap', shortcut: 'Alt F' },
+      { separator: true },
+      { label: 'Snap', submenu: snapItems },
     ];
   }
 
@@ -395,9 +429,9 @@ export class NlaEditor extends AnimEditor {
         g.fillRect(0, y, W, rh - 1);
         if (ch.action) {
           const [a, b] = actionRange(ch.action);
-          g.fillStyle = 'rgba(255,255,255,0.06)';
+          g.fillStyle = 'rgba(255, 255, 255,0.06)';
           g.fillRect(v.fx(a), y + 2, v.fx(b) - v.fx(a), rh - 5);
-          const agg = aggregate(ch.action.fcurves);
+          const agg = aggregate(ch.curves.map((r) => r.fc));
           for (const k of agg.keys) {
             const x = v.fx(k.frame);
             if (x < -10 || x > W + 10) continue;
@@ -406,26 +440,31 @@ export class NlaEditor extends AnimEditor {
         }
       } else if (ch.kind === 'NLA_TRACK' && ch.track && ch.ob) {
         const t = ch.track;
-        g.fillStyle = t.select ? C.nlaTrackSel : 'rgba(0,0,0,0.12)';
+        g.fillStyle = t.select ? C.nlaTrackSel : 'rgba(0, 0, 0,0.12)';
         g.fillRect(0, y, W, rh - 1);
         const ad = ch.ob.animation_data!;
         const soloed = ad.nla_tracks.some((o) => o.is_solo) && !t.is_solo;
-        const dim = t.mute || soloed;
-        t.strips.forEach((s, si) => this.drawStrip(g, s, y, rh, dim, t.strips[si + 1], si === 0 && ch.trackIndex === 0, W));
+        const tw = ad.tweak;
+        const tweakStrip = tw ? ad.nla_tracks[tw.track]?.strips[tw.strip] : null;
+        // in tweak mode the tracks above the edited one are dimmed unless the full stack is evaluated
+        const dim = t.mute || soloed || (!!tw && (ch.trackIndex ?? 0) > tw.track && !tw.upper);
+        t.strips.forEach((s, si) => this.drawStrip(g, s, y, rh, dim, t.strips[si + 1], si === 0 && ch.trackIndex === 0, W, s === tweakStrip));
       }
     }
     g.textBaseline = 'alphabetic';
   }
 
-  private drawStrip(g: CanvasRenderingContext2D, s: NlaStrip, y: number, rh: number, dim: boolean, next: NlaStrip | undefined, first: boolean, W: number) {
+  private drawStrip(g: CanvasRenderingContext2D, s: NlaStrip, y: number, rh: number, dim: boolean, next: NlaStrip | undefined, first: boolean, W: number, tweaked = false) {
     const v = this.view;
     const x0 = v.fx(s.frame_start),
       x1 = v.fx(s.frame_end);
     const top = y + 2,
       hh = rh - 5;
     // extrapolation (hold) regions
+    const base = s.type === 'TRANSITION' ? ['#3e5979', '#77a0d8'] : s.type === 'META' ? ['#5a436d', '#a26ecd'] : s.type === 'SOUND' ? ['#2d5c58', '#4fb3a6'] : tweaked ? ['#406f43', '#65c06a'] : ['#574a39', C.nlaStripSelected];
     if (!s.mute && s.extrapolation !== 'NOTHING') {
-      g.fillStyle = s.select ? 'rgba(255,140,0,0.12)' : 'rgba(255,255,255,0.05)';
+      // held regions in a faint version of the strip's colour
+      g.fillStyle = withAlpha(s.select ? base[1] : base[0], s.select ? 0.28 : 0.45);
       if (s.extrapolation === 'HOLD' && first) g.fillRect(0, top, Math.max(0, x0), hh);
       const endX = next ? v.fx(next.frame_start) : W;
       if (endX > x1) g.fillRect(x1, top, endX - x1, hh);
@@ -433,15 +472,34 @@ export class NlaEditor extends AnimEditor {
     if (x1 < 0 || x0 > W) return;
     g.globalAlpha = dim || s.mute ? 0.45 : 1;
     roundRect(g, x0, top, Math.max(2, x1 - x0), hh, 3);
-    g.fillStyle = s.select ? C.nlaStripSelected : '#594a3a';
+    g.fillStyle = s.select ? base[1] : base[0];
     g.fill();
-    g.strokeStyle = s === this.activeStrip ? '#ffffff' : '#000';
+    if (s.type === 'TRANSITION') {
+      // a diagonal shows the blend from one strip to the next
+      g.strokeStyle = 'rgba(255, 255, 255,0.5)';
+      g.beginPath();
+      g.moveTo(x0, top + hh);
+      g.lineTo(x1, top);
+      g.stroke();
+    } else if (s.type === 'META' && s.strips) {
+      // inner strip boundaries
+      g.strokeStyle = 'rgba(0, 0, 0,0.45)';
+      const k = (s.frame_end - s.frame_start) / Math.max(1e-6, s.action_frame_end - s.action_frame_start);
+      for (const c of s.strips.slice(1)) {
+        const x = Math.round(v.fx(s.frame_start + (c.frame_start - s.action_frame_start) * k)) + 0.5;
+        g.beginPath();
+        g.moveTo(x, top + 2);
+        g.lineTo(x, top + hh - 2);
+        g.stroke();
+      }
+    }
+    g.strokeStyle = s === this.activeStrip ? '#ffffff' : '#000000';
     if (s.mute) g.setLineDash([4, 3]);
     g.lineWidth = 1;
     g.stroke();
     g.setLineDash([]);
     // blend in/out ramps
-    g.strokeStyle = s.select ? 'rgba(0,0,0,0.6)' : 'rgba(255,255,255,0.55)';
+    g.strokeStyle = s.select ? 'rgba(0, 0, 0,0.6)' : 'rgba(255, 255, 255,0.55)';
     if (s.blend_in > 0) {
       g.beginPath();
       g.moveTo(x0, top + hh);
@@ -456,7 +514,7 @@ export class NlaEditor extends AnimEditor {
     }
     // repeat boundaries
     if (s.repeat > 1) {
-      g.strokeStyle = 'rgba(0,0,0,0.45)';
+      g.strokeStyle = 'rgba(0, 0, 0,0.45)';
       const per = stripLen(s) / s.repeat;
       for (let r = 1; r < s.repeat; r++) {
         const x = Math.round(v.fx(s.frame_start + per * r)) + 0.5;
@@ -466,12 +524,51 @@ export class NlaEditor extends AnimEditor {
         g.stroke();
       }
     }
+    // animated influence (View ▸ Show Control F-Curves)
+    if (this.showStripCurves && s.influence !== undefined && x1 - x0 > 4) {
+      g.save();
+      g.beginPath();
+      g.rect(x0, top, x1 - x0, hh);
+      g.clip();
+      g.strokeStyle = s.select ? 'rgba(0, 0, 0,0.75)' : 'rgba(255, 255, 255,0.8)';
+      g.lineWidth = 1.5;
+      g.beginPath();
+      influenceSamples(s).forEach(([f, w], i) => {
+        const x = v.fx(f),
+          yy = top + hh - 1 - w * (hh - 2);
+        if (i) g.lineTo(x, yy);
+        else g.moveTo(x, yy);
+      });
+      g.stroke();
+      g.restore();
+    }
+    // the action's markers on the strip (View ▸ Show Local Markers)
+    const markers = this.showLocalMarkers && s.type !== 'TRANSITION' && s.type !== 'META' ? app.doc.actions[s.action]?.pose_markers : undefined;
+    if (markers?.length) {
+      const span = Math.max(1e-6, s.action_frame_end - s.action_frame_start);
+      const per = (s.frame_end - s.frame_start) / Math.max(1e-6, s.repeat);
+      g.fillStyle = s.select ? 'rgba(0, 0, 0,0.7)' : 'rgba(255, 255, 255,0.75)';
+      for (let r = 0; r < Math.ceil(s.repeat - 1e-6); r++)
+        for (const m of markers) {
+          const t = (m.frame - s.action_frame_start) / span;
+          if (t < 0 || t > 1) continue;
+          const f = s.frame_start + r * per + t * per;
+          if (f > s.frame_end + 1e-6) continue;
+          const x = Math.round(v.fx(f)) + 0.5;
+          g.fillRect(x - 0.5, top + 2, 1, hh - 4);
+          g.beginPath();
+          g.moveTo(x - 3, top + hh - 1);
+          g.lineTo(x + 3, top + hh - 1);
+          g.lineTo(x, top + hh - 5);
+          g.fill();
+        }
+    }
     // name
     g.save();
     g.beginPath();
     g.rect(x0 + 2, top, Math.max(0, x1 - x0 - 4), hh);
     g.clip();
-    g.fillStyle = s.select ? '#ffffff' : '#e6e6e6';
+    g.fillStyle = s.select ? '#ffffff' : '#e8e9ea';
     g.textAlign = 'left';
     g.fillText(s.name, Math.max(x0, 0) + 5, top + hh / 2 + 1);
     g.restore();
@@ -553,9 +650,14 @@ export class NlaEditor extends AnimEditor {
     app.changed('doc');
   }
 
-  /** Interactive move (TRANSLATION) or scale (RESIZE) of the selected strips. */
-  startTransform(mode: 'TRANSLATION' | 'RESIZE', start: { x: number; y: number }, releaseConfirm = false, onCancel?: () => void): boolean {
-    const sel = this.selectedStrips();
+  /**
+   * Interactive move (TRANSLATION), scale (RESIZE) or extend (TIME_EXTEND: only the selected
+   * strips on the mouse's side of the current frame move) of the selected strips.
+   */
+  startTransform(mode: 'TRANSLATION' | 'RESIZE' | 'TIME_EXTEND', start: { x: number; y: number }, releaseConfirm = false, onCancel?: () => void): boolean {
+    let sel = this.selectedStrips();
+    const side = this.view.xf(this.local({ clientX: start.x, clientY: start.y }).x) >= app.doc.scene.frame_current ? 'RIGHT' : 'LEFT';
+    if (mode === 'TIME_EXTEND') sel = extendStrips(sel, side, app.doc.scene.frame_current);
     if (!sel.length) return false;
     const orig = sel.map((r) => ({
       s: r.strip,
@@ -571,13 +673,17 @@ export class NlaEditor extends AnimEditor {
     const apply = (mx: number) => {
       const snap = this.autoSnap !== snapToggle;
       const num = numeric && numeric !== '-' ? Number(numeric) : NaN;
-      if (mode === 'TRANSLATION') {
+      if (mode === 'TRANSLATION' || mode === 'TIME_EXTEND') {
         let d = Number.isFinite(num) ? num : (mx - start.x) / this.view.ppf;
-        if (snap && !Number.isFinite(num)) d = Math.round(d);
+        const st = this.snapTo();
+        const perStrip = snap && !Number.isFinite(num) && (st.absolute || st.mode === 'MARKER');
+        if (snap && !Number.isFinite(num) && !perStrip) d = st.mode === 'SECOND' ? Math.round(d / st.fps) * st.fps : Math.round(d);
         value = d;
         for (const o of orig) {
-          o.s.frame_start = o.a + d;
-          o.s.frame_end = o.b + d;
+          // absolute snapping moves each strip's start onto the snap target
+          const dd = perStrip ? snapFrameTo(o.a + d, st) - o.a : d;
+          o.s.frame_start = o.a + dd;
+          o.s.frame_end = o.b + dd;
         }
       } else {
         const d0 = start.x - pivotX;
@@ -596,13 +702,14 @@ export class NlaEditor extends AnimEditor {
           updateStripScale(o.s);
         }
       }
-      app.changed('doc');
+      if (this.realtimeUpdates) app.changed('doc');
+      else this.draw();
     };
     let lastX = start.x;
     const handler: ModalHandler = {
-      label: mode === 'TRANSLATION' ? 'Move' : 'Scale',
+      label: mode === 'TRANSLATION' ? 'Move' : mode === 'TIME_EXTEND' ? 'Extend' : 'Scale',
       cursor: 'ew-resize',
-      header: () => (mode === 'TRANSLATION' ? `Delta: ${value.toFixed(2)}` : `Scale: ${value.toFixed(3)}`) + (numeric ? ` [${numeric}|]` : ''),
+      header: () => (mode !== 'RESIZE' ? `Delta: ${value.toFixed(2)}` : `Scale: ${value.toFixed(3)}`) + (numeric ? ` [${numeric}|]` : ''),
       status: () => [
         ['LMB', 'Confirm'],
         ['RMB/Esc', 'Cancel'],
@@ -634,7 +741,7 @@ export class NlaEditor extends AnimEditor {
       },
       finish: () => {
         resolveOverlaps(sel);
-        handler.redoOp = { idname: 'nla.transform', props: { mode, value } };
+        handler.redoOp = { idname: 'nla.transform', props: { mode, value, side } };
       },
     };
     app.startModal(handler);
@@ -671,6 +778,7 @@ export class NlaEditor extends AnimEditor {
     return [
       { id: 'strip', label: 'Strip', draw: () => this.stripTab() },
       { id: 'action', label: 'Edited Action', draw: () => this.actionTab() },
+      ...nlaSidebarTabs.map((t) => ({ id: t.id, label: t.label, draw: () => t.draw(this) })),
     ];
   }
 
@@ -764,7 +872,7 @@ export class NlaEditor extends AnimEditor {
           }),
         ),
       ]),
-      panel('nla-clip', 'Action Clip', () => [
+      s.type === 'TRANSITION' || s.type === 'META' || s.type === 'SOUND' ? null : panel('nla-clip', 'Action Clip', () => [
         row(
           'Action',
           h(
@@ -775,6 +883,8 @@ export class NlaEditor extends AnimEditor {
                 e.preventDefault(),
                 browseActions(ref.ob, e.currentTarget as HTMLElement, (id) => {
                   s.action = id;
+                  // the slot is looked up again for the new action
+                  delete s.action_slot_handle;
                   const a = app.doc.actions[id];
                   if (a) {
                     [s.action_frame_start, s.action_frame_end] = actionRange(a);
@@ -789,6 +899,7 @@ export class NlaEditor extends AnimEditor {
             h('span', { class: 'em-arrow' }, icon('down_arrow_hlt')),
           ),
         ),
+        this.stripSlotRow(ref.ob, s),
         row(
           'Frame Start',
           numberField({
@@ -840,24 +951,73 @@ export class NlaEditor extends AnimEditor {
       panel(
         'nla-infl',
         'Animated Influence',
-        () =>
-          row(
-            'Influence',
-            numberField({
-              id: 'nla-influence',
-              value: s.influence ?? 1,
-              min: 0,
-              max: 1,
-              slider: true,
-              disabled: s.influence === undefined,
-              set: (v, f) => ((s.influence = v), commit('Change Influence', f)),
-            }),
-          ),
+        () => {
+          const frame = app.doc.scene.frame_current;
+          const keyed = influenceKeyed(s, frame);
+          const animated = s.influence !== undefined;
+          return h(
+            'div',
+            { class: 'split-row' },
+            h('div', { class: 'sr-label' }, 'Influence'),
+            h(
+              'div',
+              { class: 'sr-value' },
+              numberField({
+                id: 'nla-influence',
+                value: animated ? stripInfluence(s, frame) : 1,
+                min: 0,
+                max: 1,
+                slider: true,
+                disabled: !animated,
+                set: (v, f) => {
+                  s.influence = v;
+                  // a key on this frame follows the field
+                  if (keyed) keyStripInfluence(s, frame, v);
+                  commit('Change Influence', f);
+                },
+              }),
+            ),
+            h(
+              'button',
+              {
+                class: { 'decorator-space': true, 'anim-tg': true, on: keyed },
+                disabled: !animated,
+                'data-tip': 'Insert Keyframe\nKey the influence on the current frame',
+                onclick: () => {
+                  if (!animated) return;
+                  keyStripInfluence(s, frame, stripInfluence(s, frame));
+                  commit('Insert Influence Keyframe');
+                },
+              },
+              icon(keyed ? 'decorate_keyframe' : 'decorate_animate'),
+            ),
+          );
+        },
         {
-          header: checkbox('nla-use-infl', '', s.influence !== undefined, (v) => ((s.influence = v ? 1 : undefined), commit('Toggle Animated Influence'))),
+          header: checkbox('nla-use-infl', '', s.influence !== undefined, (v) => (setAnimatedInfluence(s, v), commit('Toggle Animated Influence'))),
         },
       ),
     ];
+  }
+
+  /** Slot selector of an action clip strip (actions with slots). */
+  private stripSlotRow(ob: ObjectData, s: NlaStrip): Child {
+    const act = app.doc.actions[s.action];
+    if (!act || !isSlotted(act)) return null;
+    const ad = ob.animation_data!;
+    const track = ad.nla_tracks.findIndex((t) => t.strips.includes(s));
+    const b: SlotBinding = {
+      act,
+      owner: ob,
+      current: findSlot(act, stripSlot(act, s, ob)),
+      assign: (slot) => {
+        s.action_slot_handle = slot ? slot.handle : 0;
+        app.pushUndo('Assign Slot');
+        app.changed('doc');
+      },
+      unassign: ['anim.slot_unassign_from_nla_strip', { object: ob.id, track, strip: track >= 0 ? ad.nla_tracks[track].strips.indexOf(s) : -1 }],
+    };
+    return h('div', { class: 'split-row' }, h('div', { class: 'sr-label' }, 'Slot'), h('div', { class: 'sr-value' }, slotSelector('nla-strip-slot', b, 'panel')), h('span', { class: 'decorator-space' }));
   }
 
   private actionTab(): Child {
@@ -880,6 +1040,7 @@ export class NlaEditor extends AnimEditor {
           h('span', { class: 'em-arrow' }, icon('down_arrow_hlt')),
         ),
       ),
+      objectSlotBinding(ob) ? row('Slot', slotSelector('nla-ad-slot', objectSlotBinding(ob)!, 'panel')) : null,
       h(
         'div',
         { class: 'anim-sb-btns' },
@@ -914,6 +1075,26 @@ export class NlaEditor extends AnimEditor {
   }
 }
 
+/** A '#rrggbb' (or rgb()) colour with an alpha. */
+function withAlpha(c: string, a: number): string {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i.exec(c);
+  if (m) return `rgba(${parseInt(m[1], 16)}, ${parseInt(m[2], 16)}, ${parseInt(m[3], 16)}, ${a})`;
+  const r = /rgba?\(([^)]+)\)/.exec(c);
+  if (r) {
+    const [x, y, z] = r[1].split(',').map((v) => v.trim());
+    return `rgba(${x}, ${y}, ${z}, ${a})`;
+  }
+  return c;
+}
+
+/** Strips that Extend moves: the selected ones on one side of the current frame. */
+function extendStrips(sel: StripRef[], side: 'LEFT' | 'RIGHT', frame: number) {
+  return sel.filter((r) => (side === 'RIGHT' ? r.strip.frame_start >= frame - 1e-6 : r.strip.frame_end <= frame + 1e-6));
+}
+
+/** Extra sidebar tabs of the NLA editor (e.g. strip Modifiers, nlamods.ts). */
+export const nlaSidebarTabs: { id: string; label: string; draw: (ed: NlaEditor) => Child }[] = [];
+
 /** Strips that overlap others in their track move to the track above (created when needed). */
 export function resolveOverlaps(refs: StripRef[]) {
   for (const r of refs) {
@@ -932,6 +1113,15 @@ export function resolveOverlaps(refs: StripRef[]) {
     track.strips.push(strip);
     sortStrips(track);
   }
+}
+
+function snapItems(): MenuItem[] {
+  return [
+    { label: 'Selection to Current Frame', op: 'nla.snap', props: { type: 'CFRA' } },
+    { label: 'Selection to Nearest Frame', op: 'nla.snap', props: { type: 'NEAREST_FRAME' } },
+    { label: 'Selection to Nearest Second', op: 'nla.snap', props: { type: 'NEAREST_SECOND' } },
+    { label: 'Selection to Nearest Marker', op: 'nla.snap', props: { type: 'NEAREST_MARKER' } },
+  ];
 }
 
 function actionClipMenu(): MenuItem[] {
@@ -986,15 +1176,16 @@ registerOperators([
     idname: 'nla.select_box',
     label: 'Box Select',
     description: 'Use box selection to grab NLA-Strips',
+    props: [{ id: 'axis_range', label: 'Axis Range', type: 'bool', default: false }],
     poll,
     undo: false,
-    invoke: (ctx) => {
+    invoke: (ctx, p) => {
       const ed = nlaEd(ctx)!;
       app.startModal({
         label: 'Box Select',
         cursor: 'crosshair',
         onPointerDown: (e) => {
-          if (e.button === 0) ed.boxGesture(e, (r, mode) => ed.boxSelect(r, mode === 'SET' ? 'ADD' : 'SUB'));
+          if (e.button === 0) ed.boxGesture(e, (r, mode) => ed.boxSelect(p.axis_range ? { ...r, y0: RULER_H, y1: 1e6 } : r, mode === 'SET' ? 'ADD' : 'SUB'));
           return 'CANCELLED';
         },
         onKey: (e) => (e.key === 'Escape' ? 'CANCELLED' : true),
@@ -1042,20 +1233,22 @@ registerOperators([
         default: 'TRANSLATION',
         items: [
           ['TRANSLATION', 'Move'],
+          ['TIME_EXTEND', 'Extend'],
           ['RESIZE', 'Scale'],
         ],
       },
       { id: 'value', label: 'Value', type: 'float', default: 0 },
+      { id: 'side', label: 'Side', type: 'enum', default: 'RIGHT', items: [['LEFT', 'Left'], ['RIGHT', 'Right']], showIf: (p) => p.mode === 'TIME_EXTEND' },
     ],
     poll: pollSel,
     invoke: (ctx, p) => (nlaEd(ctx)!.startTransform(p.mode as 'TRANSLATION', { ...app.pointer }) ? 'RUNNING_MODAL' : 'CANCELLED'),
     exec: (ctx, p) => {
       const ed = nlaEd(ctx)!;
-      const sel = ed.selectedStrips();
       const v = p.value as number;
       const c = ctx.doc.scene.frame_current;
+      const sel = p.mode === 'TIME_EXTEND' ? extendStrips(ed.selectedStrips(), p.side as 'LEFT', c) : ed.selectedStrips();
       for (const r of sel) {
-        if (p.mode === 'TRANSLATION') {
+        if (p.mode === 'TRANSLATION' || p.mode === 'TIME_EXTEND') {
           r.strip.frame_start += v;
           r.strip.frame_end += v;
         } else if (v > 0) {
@@ -1065,23 +1258,6 @@ registerOperators([
         }
       }
       resolveOverlaps(sel);
-    },
-  },
-  {
-    idname: 'nla.duplicate_move',
-    label: 'Duplicate Strips',
-    description: 'Duplicate selected NLA-Strips, adding the new strips to new track(s)',
-    poll: pollSel,
-    invoke: (ctx) => {
-      const ed = nlaEd(ctx)!;
-      const copies = duplicateStrips(ed);
-      if (!copies.length) return 'CANCELLED';
-      ed.refresh();
-      const ok = ed.startTransform('TRANSLATION', { ...app.pointer }, false);
-      return ok ? 'RUNNING_MODAL' : 'FINISHED';
-    },
-    exec: (ctx) => {
-      if (!duplicateStrips(nlaEd(ctx)!).length) return 'CANCELLED';
     },
   },
   {
@@ -1307,26 +1483,6 @@ registerOperators([
   },
 ]);
 
-function duplicateStrips(ed: NlaEditor): NlaStrip[] {
-  const sel = ed.selectedStrips();
-  const out: NlaStrip[] = [];
-  for (const r of sel) {
-    const c: NlaStrip = { ...r.strip, select: true };
-    r.strip.select = false;
-    // place the copy in a new track above the original
-    const idx = r.ad.nla_tracks.indexOf(r.track);
-    let target = r.ad.nla_tracks[idx + 1];
-    if (!target || target.lock || !stripFits(target, c.frame_start, c.frame_end)) {
-      target = newTrack(r.ad);
-      r.ad.nla_tracks.splice(idx + 1, 0, target);
-    }
-    target.strips.push(c);
-    sortStrips(target);
-    out.push(c);
-  }
-  return out;
-}
-
 function addActionClip(ctx: OpContext, actionId: string) {
   const ed = nlaEd(ctx);
   const act = ctx.doc.actions[actionId];
@@ -1383,6 +1539,7 @@ addKeys('NLA Editor', [
     when: overMain,
   },
   { key: 'B', op: 'nla.select_box', when: overMain },
+  { key: 'B', alt: true, op: 'nla.select_box', props: { axis_range: true }, when: overMain },
   { key: 'LEFT_BRACKET', op: 'nla.select_leftright', props: { mode: 'LEFT' } },
   {
     key: 'RIGHT_BRACKET',
@@ -1396,40 +1553,15 @@ addKeys('NLA Editor', [
     when: overMain,
   },
   { key: 'S', op: 'nla.transform', props: { mode: 'RESIZE' }, when: overMain },
-  { key: 'D', shift: true, op: 'nla.duplicate_move', when: overMain },
+  { key: 'E', op: 'nla.transform', props: { mode: 'TIME_EXTEND' }, when: overMain },
+  { key: 'D', shift: true, op: 'nla.duplicate_linked_move', when: overMain },
   { key: 'X', op: 'nla.delete', when: overMain },
   { key: 'DEL', op: 'nla.delete', when: overMain },
   { key: 'H', op: 'nla.mute_toggle' },
   { key: 'Y', op: 'nla.split' },
   { key: 'A', shift: true, op: 'nla.actionclip_add' },
   { key: 'S', alt: true, op: 'nla.clear_scale' },
-  {
-    key: 'S',
-    shift: true,
-    menu: () => [
-      {
-        label: 'Selection to Current Frame',
-        op: 'nla.snap',
-        props: { type: 'CFRA' },
-      },
-      {
-        label: 'Selection to Nearest Frame',
-        op: 'nla.snap',
-        props: { type: 'NEAREST_FRAME' },
-      },
-      {
-        label: 'Selection to Nearest Second',
-        op: 'nla.snap',
-        props: { type: 'NEAREST_SECOND' },
-      },
-      {
-        label: 'Selection to Nearest Marker',
-        op: 'nla.snap',
-        props: { type: 'NEAREST_MARKER' },
-      },
-    ],
-    menuTitle: 'Snap',
-  },
+  { key: 'S', shift: true, menu: snapItems, menuTitle: 'Snap' },
   { key: 'HOME', op: 'nla.view_all' },
   { key: 'NUMPAD_PERIOD', op: 'nla.view_selected' },
   { key: 'NUMPAD_0', op: 'nla.view_frame' },

@@ -1,5 +1,6 @@
 // Original icons for the sequencer (16×16 grid, theme-coloured through the f/s classes).
 import { registerIcons } from '../ui/icons';
+import { TAG_COLORS } from './theme';
 
 registerIcons({
   // editor & view types
@@ -10,7 +11,7 @@ registerIcons({
   // strip types
   file_movie: '<rect class="s" x="2" y="3" width="12" height="10" rx="1" fill="none" stroke-width="1.2"/><path class="f" d="M2 3h2v2H2zM2 7h2v2H2zM2 11h2v2H2zM12 3h2v2h-2zM12 7h2v2h-2zM12 11h2v2h-2z"/>',
   file_sound: '<path class="f" d="M3 6h2.5L9 3v10L5.5 10H3z"/><path class="s" d="M11 5.5c1 .8 1 4.2 0 5M12.8 4c1.8 1.6 1.8 6.4 0 8" fill="none" stroke-width="1.2" stroke-linecap="round"/>',
-  seq_color: '<rect class="f" x="2.5" y="2.5" width="11" height="11" rx="2"/><path d="M4 12 12 4" stroke="#1d1d1d" stroke-width="1.2" opacity=".35"/>',
+  seq_color: '<rect class="f" x="2.5" y="2.5" width="11" height="11" rx="2"/><path d="M4 12 12 4" stroke="#1a1b1c" stroke-width="1.2" opacity=".35"/>',
   seq_text: '<path class="f" d="M3 3h10v2.6h-1.4L11 4.5H9V12l1.4.6V14H5.6v-1.4L7 12V4.5H5l-.6 1.1H3z"/>',
   seq_adjustment: '<rect class="s" x="2" y="2.5" width="12" height="11" rx="1.5" fill="none" stroke-width="1.2"/><path class="s" d="M5 5v6M8 5v6M11 5v6" stroke-width="1.2"/><circle class="f" cx="5" cy="9" r="1.3"/><circle class="f" cx="8" cy="6.5" r="1.3"/><circle class="f" cx="11" cy="8.5" r="1.3"/>',
   seq_meta: '<rect class="s" x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke-width="1.2"/><rect class="f" x="3.5" y="5" width="5" height="2" rx=".5"/><rect class="f" x="7" y="9" width="5.5" height="2" rx=".5"/>',
@@ -22,4 +23,21 @@ registerIcons({
   seq_split: '<rect class="f" x="1" y="5" width="6" height="6" rx="1"/><rect class="f" x="9" y="5" width="6" height="6" rx="1" opacity=".7"/><path class="s" d="M8 2v12" stroke-width="1.2"/>',
   mute_on: '<rect class="s" x="2.5" y="2.5" width="11" height="11" rx="2" fill="none" stroke-width="1.2"/>',
   file_add_media: '<path class="s" d="M4 2h5l3 3v9H4z" fill="none" stroke-width="1.2" stroke-linejoin="round"/><path class="s" d="M8 7v5M5.5 9.5h5" stroke-width="1.4"/>',
+});
+
+// strip colour tags: a rounded swatch in the tag colour, and a chain link for connected strips
+registerIcons(
+  Object.fromEntries(
+    Object.entries(TAG_COLORS).map(([tag, color]) => [`seq_tag_${tag.slice(6)}`, `<rect x="2.5" y="2.5" width="11" height="11" rx="2.5" fill="${color}"/><rect x="2.5" y="2.5" width="11" height="11" rx="2.5" fill="none" stroke="#000000" stroke-opacity=".35"/>`]),
+  ),
+);
+registerIcons({
+  linked: '<path class="s" d="M7 9.5 9.5 7M6.3 7.2 4.6 8.9a2.3 2.3 0 0 0 3.3 3.3l1.7-1.7M9.7 8.8l1.7-1.7a2.3 2.3 0 0 0-3.3-3.3L6.4 5.5" fill="none" stroke-width="1.4" stroke-linecap="round"/>',
+});
+
+// preview display modes
+registerIcons({
+  seq_histogram: '<path class="f" d="M2 14V11l2-3 2 2 2-6 2 4 2-2 2 3v5z" opacity=".85"/><path class="s" d="M1.5 14.5h13" stroke-width="1"/>',
+  seq_luma_waveform: '<rect class="s" x="1.5" y="2.5" width="13" height="11" rx="1" fill="none" stroke-width="1"/><path class="s" d="M3 10c1-4 2 0 3-3s2 2 3-1 2 2 4 0" fill="none" stroke-width="1.3"/>',
+  seq_chroma_scope: '<circle class="s" cx="8" cy="8" r="6" fill="none" stroke-width="1.1"/><path class="s" d="M8 2v12M2 8h12" stroke-width=".7" opacity=".6"/><circle class="f" cx="10" cy="6" r="1.4"/><circle class="f" cx="6.5" cy="9.5" r="1"/>',
 });

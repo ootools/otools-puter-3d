@@ -1,6 +1,7 @@
 // One compositing run: evaluate the scene's compositing tree on the GPU and read back the
 // composite (render size) and the active Viewer image, plus an 8-bit display copy of the viewer
 // for the node editor backdrop.
+import { viewerRegion, maskToRegion } from './viewregion';
 import type { DocumentData, NodeData, NodeTreeData } from '../data/types';
 import { renderSize } from '../render/final/units';
 import { displayGLSL, VIEW_INDEX, type ViewSettings } from '../render/final/colormanage';
@@ -136,6 +137,8 @@ export function runCompositor(doc: DocumentData, opts: RunOptions): RunResult {
           node: v.id,
           display: opts.view ? displayCanvas(g, t, opts.view) : null,
         };
+        const region = viewerRegion(tree);
+        if (region) maskToRegion(res.viewer, region);
       }
     }
   } catch (e) {
@@ -149,4 +152,41 @@ export function runCompositor(doc: DocumentData, opts: RunOptions): RunResult {
   }
   res.time = performance.now() - t0;
   return res;
+}
+
+/**
+ * Run a compositing node group on one image: the first color input of the group's interface
+ * receives the image (premultiplied float RGBA, rows bottom-up) and the result of its Group
+ * Output is read back the same way at the same size. Returns null without WebGL 2 or output.
+ */
+export function runCompositorGroup(doc: DocumentData, group: { tree: NodeTreeData }, image: { data: Float32Array; width: number; height: number }, frame = doc.scene.frame_current): { data: Float32Array; errors: Map<string, string> } | null {
+  const g = gpu();
+  if (!g) return null;
+  const { width: W, height: H } = image;
+  const fps = doc.scene.render.fps / (doc.scene.render.fps_base || 1);
+  beginGeneration();
+  const full: Domain = { w: W, h: H, xf: [...IDENTITY] as Xform };
+  const input = (group.tree.interface ?? []).find((i) => i.in_out === 'INPUT' && /Color/.test(i.socket_type));
+  const ev = new Evaluator(g, { doc, renderSize: [W, H], frame, fps, layers: null, viewer: null, composite: true, groupInputs: {} });
+  try {
+    if (input) {
+      const tex = g.upload(image.data, W, H, 'strip');
+      ev.env.groupInputs![input.identifier] = Result.image('RGBA', tex, full);
+      ev.keep(tex);
+      try {
+        const r = ev.compositeOutput(group.tree);
+        if (!r) return null;
+        const t = ev.realize(r, full);
+        return { data: g.read(t), errors: new Map(ev.errors) };
+      } finally {
+        g.free(tex);
+      }
+    }
+    const r = ev.compositeOutput(group.tree);
+    if (!r) return null;
+    return { data: g.read(ev.realize(r, full)), errors: new Map(ev.errors) };
+  } finally {
+    ev.finish();
+    sweepCache(g);
+  }
 }

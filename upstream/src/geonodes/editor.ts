@@ -10,15 +10,16 @@ import { registerNodeEditorProvider } from '../nodes/editor/context';
 import { dataBlockSelector } from '../editors/properties/tabs';
 import { newNodeGroup, uid } from '../data/defaults';
 import { newModifier } from '../eval/modifiers';
-import { getNodeType, nodeSockets, findSocket } from '../nodes/registry';
+import { getNodeType, nodeSockets } from '../nodes/registry';
 import { addNode, connect, ctxOf, nodeById, uniqueGroupName } from '../nodes/tree';
 import type { ModifierBase, NodeData, NodeGroupData, NodeTreeData, ObjectData, SocketValue } from '../data/types';
 import { VIEWER, isActiveViewer } from './nodes/output';
-import { captureItems, ITEM_SOCKET, captureIn, captureOut, type CaptureItem } from './nodes/geometry';
-import { viewerState } from './results';
+import { captureItems, captureIn, captureOut, type CaptureItem } from './nodes/geometry';
+import { itemListUI, registerItemNode, type ItemListDef, type NodeItem } from './nodes/items';
+import { gnResults, viewerState } from './results';
 import { setModifierNameHook } from './modifier';
 import { interfaceSocketType } from '../nodes/registry';
-import { enumMenu, textField, button } from '../ui/widgets';
+import { button } from '../ui/widgets';
 import type { NodeDrawContext } from '../nodes/types';
 
 export const GN_OBJECT_TYPES = ['MESH', 'CURVE', 'FONT'];
@@ -45,7 +46,7 @@ function uniqueModifierName(ob: ObjectData | null, base = 'GeometryNodes') {
     if (!names.has(n)) return n;
   }
 }
-// new NODES modifiers are named like the reference ("GeometryNodes")
+// new NODES modifiers are named "GeometryNodes"
 setModifierNameHook(() => uniqueModifierName(app.activeObject));
 
 /** Fill missing modifier input values from the group interface defaults. */
@@ -86,35 +87,31 @@ function changed(label: string) {
 export class GeometryNodeEditor extends NodeEditor {
   keymaps = ['Geometry Node Editor', 'Node Editor', 'Node Generic'];
   pinned: string | null = null;
+  /** what the editor shows: the active object's modifier group, or a node group used as a tool */
+  gnType: 'MODIFIER' | 'TOOL' = 'MODIFIER';
+  toolGroup: string | null = null;
   constructor(area: Area, state: unknown) {
     super(area, state, 'GEOMETRY');
-    const st = (state ?? {}) as { pinned?: string | null };
+    const st = (state ?? {}) as { pinned?: string | null; gnType?: 'MODIFIER' | 'TOOL'; toolGroup?: string | null };
     if (st.pinned) this.pinned = st.pinned;
-    // Ctrl Shift click: link the clicked node to the viewer
-    this.el.addEventListener(
-      'pointerdown',
-      (e) => {
-        if (e.button !== 0 || !e.shiftKey || !(e.ctrlKey || e.metaKey) || app.modal) return;
-        const n = this.hitNode(e.clientX, e.clientY, false);
-        if (!n) return;
-        e.preventDefault();
-        e.stopPropagation();
-        linkToViewer(this, n);
-      },
-      true,
-    );
+    if (st.gnType === 'TOOL') this.gnType = 'TOOL';
+    if (st.toolGroup) this.toolGroup = st.toolGroup;
   }
   serialize() {
-    return { ...super.serialize(), pinned: this.pinned };
+    return { ...super.serialize(), pinned: this.pinned, gnType: this.gnType, toolGroup: this.toolGroup };
   }
 }
 
-function editorGroup(ed: GeometryNodeEditor): {
+export function editorGroup(ed: GeometryNodeEditor): {
   group: NodeGroupData | undefined;
   ob: ObjectData | null;
   mod: ModifierBase | undefined;
 } {
   const doc = app.doc;
+  if (ed.gnType === 'TOOL') {
+    const g = ed.toolGroup ? doc.node_groups[ed.toolGroup] : undefined;
+    return { group: g?.is_tool ? g : undefined, ob: null, mod: undefined };
+  }
   if (ed.pinned) {
     const g = doc.node_groups[ed.pinned];
     if (!g) ed.pinned = null;
@@ -156,7 +153,7 @@ function newGroupFor(ed: GeometryNodeEditor) {
 registerNodeEditorProvider({
   id: 'GEOMETRY',
   label: 'Geometry Node Editor',
-  icon: 'geometry_nodes',
+  icon: 'editor_geometry',
   treeType: () => 'GEOMETRY',
   root: (e) => {
     const ed = e as unknown as GeometryNodeEditor;
@@ -170,10 +167,24 @@ registerNodeEditorProvider({
             ['node_tree', group.name],
           ]
         : [['node_tree', group.name]];
-    return { tree: group.tree, key: `ng:${group.id}`, crumbs };
+    return { tree: group.tree, key: `ng:${group.id}`, crumbs, groupId: group.id };
   },
   emptyMessage: () => '',
   menuPoll: (idname) => !!getNodeType(idname)?.treeTypes.includes('GEOMETRY'),
+  // messages from the last evaluation of the active object's modifier (nested groups by node path)
+  nodeWarnings: (e, node) => {
+    const ed = e as GeometryNodeEditor;
+    const { ob, mod } = editorGroup(ed);
+    const r = ob && mod ? gnResults.get(ob.id) : undefined;
+    if (!r || r.modifierId !== mod!.id) return undefined;
+    const key = [ob!.id, mod!.id, ...ed.path.map((p) => p.node), node.id].join('/');
+    const messages = r.warnings.get(key);
+    if (!messages?.length) return undefined;
+    const kinds = messages.map((m) => r.warningKinds?.get(`${key}\n${m}`) ?? 'WARNING');
+    return { messages, kind: kinds.includes('ERROR') ? 'ERROR' : kinds.includes('WARNING') ? 'WARNING' : 'INFO' };
+  },
+  // Ctrl Shift click / node.link_viewer: link the node to the viewer
+  linkViewer: (ed, node, socket) => linkToViewer(ed as NodeEditor, node, socket),
   headerRight: (e) => {
     const ed = e as GeometryNodeEditor;
     const doc = app.doc;
@@ -245,7 +256,7 @@ registerNodeEditorProvider({
 registerEditor({
   id: 'GEOMETRY',
   label: 'Geometry Node Editor',
-  icon: 'geometry_nodes',
+  icon: 'editor_geometry',
   group: 'General',
   create: (a, s) => new GeometryNodeEditor(a, s),
 });
@@ -299,25 +310,25 @@ function geometrySourceFor(tree: NodeTreeData, start: NodeData): { node: string;
   return null;
 }
 
-export function linkToViewer(ed: NodeEditor, node: NodeData) {
+export function linkToViewer(ed: NodeEditor, node: NodeData, socket?: string): boolean {
   const tree = ed.tree();
-  if (!tree) return;
+  if (!tree) return false;
   const ctx = ctxOf(app.doc, tree);
   if (node.type === VIEWER) {
     activateViewer(tree, isActiveViewer(node) ? null : node);
-    changed('Toggle Viewer');
-    return;
+    app.changed('doc');
+    return true;
   }
   const outs = nodeSockets(node, ctx).outputs.filter((s) => s.type !== 'CUSTOM' && (s.type === 'GEOMETRY' || VIEW_DATA_TYPE[s.type]));
-  if (!outs.length) return;
+  if (!outs.length) return false;
   let viewer = tree.nodes.find((n) => n.type === VIEWER);
   if (!viewer) {
     viewer = addNode(tree, VIEWER, [node.location[0] + (node.width ?? 140) + 80, node.location[1]]);
   }
-  // cycle through the node's outputs on repeated clicks
+  // a clicked socket is viewed directly; otherwise cycle through the node's outputs on repeated clicks
   const cur = tree.links.find((l) => l.from_node === node.id && l.to_node === viewer!.id);
   const i = cur ? outs.findIndex((s) => s.identifier === cur.from_socket) : -1;
-  const sock = outs[(i + 1) % outs.length];
+  const sock = outs.find((s) => s.identifier === socket) ?? outs[(i + 1) % outs.length];
   if (sock.type === 'GEOMETRY') {
     tree.links = tree.links.filter((l) => !(l.to_node === viewer!.id && l.to_socket === 'Value'));
     connect(ctx, node.id, sock.identifier, viewer.id, 'Geometry');
@@ -330,7 +341,8 @@ export function linkToViewer(ed: NodeEditor, node: NodeData) {
     }
   }
   activateViewer(tree, viewer);
-  changed('Link to Viewer');
+  app.changed('doc');
+  return true;
 }
 
 // viewer node body: activation toggle
@@ -357,125 +369,43 @@ export function linkToViewer(ed: NodeEditor, node: NodeData) {
 }
 
 // ---------------------------------------------------------------------------
-// Capture Attribute items
+// Capture Attribute items (list in the sidebar, operators, links to the item socket)
 
-const ITEM_TYPE: Record<string, string> = {
+const CAPTURE_TYPES: [string, string][] = [
+  ['FLOAT', 'Float'],
+  ['INT', 'Integer'],
+  ['BOOLEAN', 'Boolean'],
+  ['FLOAT_VECTOR', 'Vector'],
+  ['FLOAT_COLOR', 'Color'],
+  ['QUATERNION', 'Rotation'],
+  ['FLOAT4X4', 'Matrix'],
+];
+const CAPTURE_TYPE_OF: Record<string, string> = {
   FLOAT: 'FLOAT',
   INT: 'INT',
   BOOLEAN: 'BOOLEAN',
   VECTOR: 'FLOAT_VECTOR',
   RGBA: 'FLOAT_COLOR',
   ROTATION: 'QUATERNION',
+  MATRIX: 'FLOAT4X4',
 };
+export const CAPTURE_DEF: ItemListDef = {
+  prop: 'capture_items',
+  title: 'Capture Items',
+  inSocket: (it) => captureIn(it as unknown as CaptureItem),
+  outSocket: (it) => captureOut(it as unknown as CaptureItem),
+  types: CAPTURE_TYPES,
+  typeKey: 'data_type',
+  typeFor: (s) => CAPTURE_TYPE_OF[s.type],
+  defaultName: () => 'Value',
+  ops: 'capture_attribute',
+  opLabel: 'Capture Attribute',
+};
+registerItemNode('GeometryNodeCaptureAttribute', CAPTURE_DEF, (n) => captureItems(n) as unknown as NodeItem[]);
+getNodeType('GeometryNodeCaptureAttribute')!.drawOptions = (ctx: NodeDrawContext) => itemListUI(ctx, CAPTURE_DEF);
 
-function addCaptureItem(node: NodeData, dataType: string, name: string): CaptureItem {
-  const items = captureItems(node);
-  let id = 0;
-  while (items.some((i) => i.id === id)) id++;
-  const it = { id, name: name || 'Value', data_type: dataType };
-  items.push(it);
-  node.props.capture_items = JSON.stringify(items);
-  return it;
-}
-
-/** Turn links made to/from the "extend" socket of Capture Attribute into real items. */
-function resolveItemLinks(): boolean {
-  let any = false;
-  const doc = app.doc;
-  for (const g of Object.values(doc.node_groups)) {
-    const tree = g.tree;
-    if (tree.type !== 'GEOMETRY') continue;
-    for (const l of [...tree.links]) {
-      const toItem = l.to_socket === ITEM_SOCKET,
-        fromItem = l.from_socket === ITEM_SOCKET;
-      if (!toItem && !fromItem) continue;
-      const cap = nodeById(tree, toItem ? l.to_node : l.from_node);
-      const other = nodeById(tree, toItem ? l.from_node : l.to_node);
-      if (!cap || cap.type !== 'GeometryNodeCaptureAttribute' || !other) continue;
-      const ctx = ctxOf(doc, tree);
-      const s = findSocket(other, toItem ? l.from_socket : l.to_socket, toItem, ctx);
-      const dt = s ? ITEM_TYPE[s.type] : undefined;
-      tree.links = tree.links.filter((x) => x !== l);
-      any = true;
-      if (!dt) continue;
-      const it = addCaptureItem(cap, dt, s!.name);
-      if (toItem) tree.links.push({ ...l, id: uid('link'), to_socket: captureIn(it) });
-      else tree.links.push({ ...l, id: uid('link'), from_socket: captureOut(it) });
-    }
-  }
-  return any;
-}
-
-let subscribed = false;
-export function installItemResolver() {
-  if (subscribed || !app) return;
-  subscribed = true;
-  app.subscribe((kinds) => {
-    if (!kinds.has('doc')) return;
-    if (resolveItemLinks()) app.changed('doc');
-  });
-}
-
-{
-  const d = getNodeType('GeometryNodeCaptureAttribute')!;
-  d.drawOptions = (ctx: NodeDrawContext) => {
-    const items = captureItems(ctx.node);
-    const set = (list: CaptureItem[], label: string) => {
-      ctx.node.props.capture_items = JSON.stringify(list);
-      ctx.changed(label, true);
-    };
-    return h(
-      'div',
-      { class: 'gn-items' },
-      h('div', { class: 'sub-label' }, 'Capture Items'),
-      items.map((it, i) =>
-        h(
-          'div',
-          { key: String(it.id), class: 'gn-item-row' },
-          textField(`${ctx.key}:it-name:${it.id}`, it.name, (v) =>
-            set(
-              items.map((x) => (x === it ? { ...x, name: v || x.name } : x)),
-              'Rename Item',
-            ),
-          ),
-          enumMenu(
-            `${ctx.key}:it-type:${it.id}`,
-            [
-              { value: 'FLOAT', label: 'Float' },
-              { value: 'INT', label: 'Integer' },
-              { value: 'BOOLEAN', label: 'Boolean' },
-              { value: 'FLOAT_VECTOR', label: 'Vector' },
-              { value: 'FLOAT_COLOR', label: 'Color' },
-              { value: 'QUATERNION', label: 'Rotation' },
-            ],
-            it.data_type,
-            (v) =>
-              set(
-                items.map((x) => (x === it ? { ...x, data_type: v } : x)),
-                'Change Item Type',
-              ),
-          ),
-          button(
-            `${ctx.key}:it-del:${it.id}`,
-            icon('remove'),
-            () => {
-              ctx.tree.links = ctx.tree.links.filter((l) => !((l.to_node === ctx.node.id && l.to_socket === captureIn(it)) || (l.from_node === ctx.node.id && l.from_socket === captureOut(it))));
-              set(
-                items.filter((_, k) => k !== i),
-                'Remove Item',
-              );
-            },
-            { tip: 'Remove item' },
-          ),
-        ),
-      ),
-      button(`${ctx.key}:it-add`, [icon('add'), 'Add Item'], () => {
-        addCaptureItem(ctx.node, 'FLOAT', 'Value');
-        ctx.changed('Add Item', true);
-      }),
-    );
-  };
-}
+/** Kept for module initialization order (item links are resolved by the shared item resolver). */
+export function installItemResolver() {}
 
 // ---------------------------------------------------------------------------
 // Operators and keys
@@ -508,19 +438,6 @@ registerOperators([
       const g = newNodeGroup(uniqueGroupName(doc, 'Geometry Nodes'));
       doc.node_groups[g.id] = g;
       m.node_group = g.id;
-    },
-  },
-  {
-    idname: 'node.link_viewer',
-    label: 'Link to Viewer Node',
-    description: 'Link the active node to a viewer node',
-    poll: (ctx) => ctx.area?.editor instanceof GeometryNodeEditor && !!(ctx.area.editor as GeometryNodeEditor).tree()?.active_node,
-    exec: (ctx) => {
-      const ed = ctx.area!.editor as GeometryNodeEditor;
-      const tree = ed.tree()!;
-      const n = nodeById(tree, tree.active_node!);
-      if (!n) return 'CANCELLED';
-      linkToViewer(ed, n);
     },
   },
   {

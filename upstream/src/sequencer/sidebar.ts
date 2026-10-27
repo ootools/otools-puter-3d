@@ -2,15 +2,25 @@
 import { h, type Child } from '../ui/h';
 import { icon } from '../ui/icons';
 import { app } from '../app/app';
+import { sceneByName, sceneObjects, scenesByName } from '../scenes/scenes';
 import { num, bool, enumProp, splitRow, oid, type PropOpts } from '../ui/props';
 import { panel, numberField, colorSwatch, checkbox, textField, enumMenu, button, opButton } from '../ui/widgets';
-import { openMenu } from '../ui/menu';
+import { openMenu, promptText } from '../ui/menu';
 import type { Strip, StripModifier, ColorBalanceData } from './types';
 import { BLEND_ITEMS, inputCount, isStill, finalStart, finalEnd, finalDuration, setLeftHandle, setRightHandle, translateStrip, isVisual, TRANSITIONS, findStrip, resolveOverlap } from './strips';
 import { activeStrip, afterEdit, seqEditor, seqList, toolSettings, hasEditor, sceneFps } from './context';
 import { stripIcon } from './theme';
+import { DEFAULT_SAFE_AREAS } from '../render/final/cameraoverlay';
+import type { PreviewGuides } from './preview';
 import { restartPlayback } from './audio';
 import { movieCacheStats } from './media';
+import { pickFiles, fileBytes } from './add';
+import { drawCurves } from '../nodes/editor/rampui';
+import { extraModifierUI, modifierAddItems } from './modextra';
+import { proxyPanel } from './proxyui';
+import { stylePresetMenu } from './textpresets';
+import { EQUALIZER_LAYOUTS } from './modops';
+import type { NodeData, NodeTreeData } from '../data/types';
 
 const edited: PropOpts = { onChange: () => (afterEdit(), restartPlayback()) };
 
@@ -76,6 +86,8 @@ export function rename(s: Strip, name: string) {
     for (const x of l) {
       if (x.input_1 === old) x.input_1 = name;
       if (x.input_2 === old) x.input_2 = name;
+      if (x.connections) x.connections = x.connections.map((n) => (n === old ? name : n));
+      for (const m of x.modifiers ?? []) if (m.input_mask_strip === old) m.input_mask_strip = name;
       if (x.strips) walk(x.strips);
     }
   };
@@ -131,6 +143,7 @@ function effectPanel(s: Strip): Child {
       num(s, 'quality', 'Quality', { int: true, min: 1, max: 5 }),
       bool(s, 'use_only_boost', 'Only Boost'),
     );
+  if (t === 'MULTICAM') rows.push(num(s, 'multicam_source', 'Source Channel', { int: true, min: 0, max: 127 }), h('div', { class: 'seq-sb-note' }, 'Cut to another camera with the number keys (1–9, 0) while hovering the timeline.'));
   if (t === 'GAUSSIAN_BLUR') rows.push(num(s, 'size_x', 'Size X', { min: 0, softMax: 200, precision: 1 }), num(s, 'size_y', 'Y', { min: 0, softMax: 200, precision: 1 }));
   if (t === 'SPEED') {
     rows.push(enumProp(s, 'speed_control', 'Speed Control', [['STRETCH', 'Stretch'], ['MULTIPLY', 'Multiply'], ['FRAME_NUMBER', 'Frame Number'], ['LENGTH', 'Length']]));
@@ -166,10 +179,45 @@ function effectPanel(s: Strip): Child {
   return panel('seq-effect', t === 'TEXT' ? 'Effect Strip' : 'Effect Strip', () => rows);
 }
 
+function pickFont(s: Strip) {
+  void pickFiles('.ttf,.otf,.woff,.woff2,font/*', false).then(async (files) => {
+    if (!files.length) return;
+    s.font_file = await fileBytes(files[0]);
+    app.pushUndo('Load Font');
+    app.changed('doc');
+  });
+}
+
 function textStylePanels(s: Strip): Child {
   if (s.type !== 'TEXT') return null;
   return [
     panel('seq-text-style', 'Style', () => [
+      splitRow(
+        'Presets',
+        h(
+          'button',
+          {
+            class: 'btn seq-style-presets',
+            'data-tip': 'Text style presets: apply one to the selected text strips, or save this style',
+            onpointerdown: (e: PointerEvent) => {
+              e.preventDefault();
+              openMenu(stylePresetMenu((cb) => promptText('Preset Name', 'Style', (v) => v && cb(v))), e.currentTarget as HTMLElement);
+            },
+          },
+          'Presets',
+          icon('down_arrow_hlt', 'tiny'),
+        ),
+      ),
+      splitRow(
+        'Font',
+        h(
+          'div',
+          { class: 'row-aligned' },
+          h('span', { class: 'seq-src' }, s.font_file ? s.font_file.filepath : 'Default (sans-serif)'),
+          button(`seq-font-${oid(s)}`, icon('file_folder'), () => pickFont(s), { tip: 'Load Font\nUse a font file (TTF, OTF, WOFF) for this text' }),
+          s.font_file ? button(`seq-font-x-${oid(s)}`, icon('x'), () => ((s.font_file = null), app.pushUndo('Default Font'), app.changed('doc')), { tip: 'Use the default font' }) : null,
+        ),
+      ),
       num(s, 'font_size', 'Size', { min: 0, softMax: 2000, precision: 1 }),
       splitRow('', h('div', { class: 'row-aligned' }, checkbox(`seq-bold-${oid(s)}`, 'Bold', !!s.use_bold, (v) => ((s.use_bold = v), app.pushUndo('Bold'), app.changed('doc'))), checkbox(`seq-italic-${oid(s)}`, 'Italic', !!s.use_italic, (v) => ((s.use_italic = v), app.pushUndo('Italic'), app.changed('doc'))))),
       color(s as never, 'color', 'Color', true),
@@ -190,17 +238,28 @@ function textStylePanels(s: Strip): Child {
   ];
 }
 
+/** A faded property shows its key count and a button to remove the fade instead of a plain value. */
+function fadeRow(s: Strip, prop: 'blend_alpha' | 'volume', label: string): Child {
+  const keys = s.keys?.[prop];
+  if (!keys?.length) return null;
+  return splitRow(label, h('div', { class: 'row-aligned' }, h('span', { class: 'seq-src' }, `Faded (${keys.length} keys)`), opButton('sequencer.fades_clear', 'Clear')));
+}
+
 function compositingPanel(s: Strip): Child {
   if (!isVisual(s)) return null;
-  return panel('seq-compositing', 'Compositing', () => [enumProp(s, 'blend_type', 'Blend', BLEND_ITEMS), num(s, 'blend_alpha', 'Opacity', { min: 0, max: 1, slider: true, precision: 3 })]);
+  return panel('seq-compositing', 'Compositing', () => [enumProp(s, 'blend_type', 'Blend', BLEND_ITEMS), fadeRow(s, 'blend_alpha', 'Opacity') ?? num(s, 'blend_alpha', 'Opacity', { min: 0, max: 1, slider: true, precision: 3 })]);
 }
 
 function transformPanels(s: Strip): Child {
   if (!isVisual(s)) return null;
   const t = s.transform,
     c = s.crop;
+  const animated = (['transform.offset_x', 'transform.offset_y', 'transform.rotation', 'transform.scale_x', 'transform.scale_y'] as const).filter((p) => s.keys?.[p]?.length);
   return [
     panel('seq-transform', 'Transform', () => [
+      animated.length
+        ? splitRow('Animated', h('div', { class: 'row-aligned' }, h('span', { class: 'seq-src' }, [...new Set(animated.map((p) => (p.includes('offset') ? 'Position' : p.includes('scale') ? 'Scale' : 'Rotation')))].join(', ')), opButton('sequencer.keyframe_clear', 'Clear')))
+        : null,
       num(t, 'offset_x', 'Position X', { unit: 'pixel', precision: 0 }),
       num(t, 'offset_y', 'Y', { unit: 'pixel', precision: 0 }),
       num(t, 'scale_x', 'Scale X', { precision: 3 }),
@@ -226,7 +285,7 @@ function videoColorPanels(s: Strip): Child {
 function soundPanel(s: Strip): Child {
   if (s.type !== 'SOUND' && s.type !== 'SCENE') return null;
   if (s.type === 'SCENE') return null;
-  return panel('seq-sound', 'Sound', () => [num(s, 'volume', 'Volume', { min: 0, max: 100, softMax: 2, precision: 3, ...edited }), num(s, 'pan', 'Pan', { min: -1, max: 1, slider: true, precision: 3, ...edited }), bool(s, 'show_waveform', 'Display Waveform'), num(s, 'sound_offset', 'Sound Offset', { unit: 'time', precision: 3, ...edited })]);
+  return panel('seq-sound', 'Sound', () => [fadeRow(s, 'volume', 'Volume') ?? num(s, 'volume', 'Volume', { min: 0, max: 100, softMax: 2, precision: 3, ...edited }), num(s, 'pan', 'Pan', { min: -1, max: 1, slider: true, precision: 3, ...edited }), bool(s, 'show_waveform', 'Display Waveform'), num(s, 'sound_offset', 'Sound Offset', { unit: 'time', precision: 3, ...edited })]);
 }
 
 function sourcePanel(s: Strip): Child {
@@ -238,10 +297,50 @@ function sourcePanel(s: Strip): Child {
   }
   if (s.orig_width) rows.push(splitRow('Resolution', h('span', { class: 'seq-src' }, `${s.orig_width} × ${s.orig_height}`)));
   if (s.type === 'MOVIE') rows.push(splitRow('FPS', h('span', { class: 'seq-src' }, s.fps ? `${+s.fps.toFixed(3)}` : '—')));
+  if (s.type === 'MOVIE') rows.push(bool(s, 'use_deinterlace', 'Deinterlace'));
+  if (s.type === 'MOVIECLIP') {
+    const clips = Object.values(app.doc.movieclips ?? {});
+    rows.push(
+      splitRow(
+        'Clip',
+        enumMenu(`seq-clip-${oid(s)}`, [{ value: '', label: '—' }, ...clips.map((c) => ({ value: c.id, label: c.name, icon: 'clip_editor' }))], s.clip ?? '', (v) => {
+          s.clip = v || null;
+          app.pushUndo('Change Clip');
+          app.changed('doc');
+        }),
+      ),
+      splitRow('', checkbox(`seq-stab-${oid(s)}`, 'Use 2D Stabilization', !!s.stabilize2d, (v) => ((s.stabilize2d = v), app.pushUndo('Use 2D Stabilization'), app.changed('doc')))),
+    );
+  }
+  if (s.type === 'MASK') {
+    const masks = Object.values(app.doc.masks ?? {});
+    rows.push(
+      splitRow(
+        'Mask',
+        enumMenu(`seq-mask-${oid(s)}`, [{ value: '', label: '—' }, ...masks.map((m) => ({ value: m.id, label: m.name, icon: 'mod_mask' }))], s.mask ?? '', (v) => {
+          s.mask = v || null;
+          app.pushUndo('Change Mask');
+          app.changed('doc');
+        }),
+      ),
+    );
+  }
   if (s.type === 'SCENE') {
     const doc = app.doc;
-    const cams = doc.object_order.map((id) => doc.objects[id]).filter((o) => o?.type === 'CAMERA');
-    rows.push(splitRow('Scene', h('span', { class: 'seq-src' }, s.scene ?? doc.scene.name)));
+    const target = sceneByName(doc, s.scene) ?? doc.scene;
+    const inScene = sceneObjects(doc, target);
+    const cams = doc.object_order.filter((id) => inScene.has(id)).map((id) => doc.objects[id]).filter((o) => o?.type === 'CAMERA');
+    rows.push(
+      splitRow(
+        'Scene',
+        enumMenu(`seq-scene-${oid(s)}`, scenesByName(doc).map((sc) => ({ value: sc.name, label: sc.name, icon: 'scene_data' })), target.name, (v) => {
+          s.scene = v;
+          s.scene_camera = null;
+          app.pushUndo('Change Scene');
+          app.changed('doc');
+        }),
+      ),
+    );
     rows.push(
       splitRow(
         'Camera',
@@ -330,10 +429,46 @@ function vec3Rows(owner: ColorBalanceData, key: 'lift' | 'gamma' | 'gain' | 'off
   );
 }
 
+/** Mask input of a modifier: none, another strip or a mask data-block. */
+function maskRows(s: Strip, m: StripModifier): Child {
+  const type = m.input_mask_type ?? 'NONE';
+  const set = (label: string) => (app.pushUndo(label), app.changed('doc'));
+  const rows: Child[] = [
+    splitRow(
+      'Mask Input',
+      enumMenu(
+        `seq-modmask-${oid(m)}`,
+        [
+          { value: 'NONE', label: 'None' },
+          { value: 'STRIP', label: 'Strip', description: 'Use another strip’s image as the mask' },
+          { value: 'ID', label: 'Mask', description: 'Use a mask drawn in the clip editor' },
+        ],
+        type,
+        (v) => ((m.input_mask_type = v as 'NONE'), set('Mask Input Type')),
+      ),
+    ),
+  ];
+  if (type === 'STRIP')
+    rows.push(
+      splitRow(
+        'Mask Strip',
+        enumMenu(`seq-modmask-s-${oid(m)}`, [{ value: '', label: '—' }, ...seqList().filter((x) => x !== s && x.type !== 'SOUND').map((x) => ({ value: x.name, label: x.name, icon: stripIcon(x.type) }))], m.input_mask_strip ?? '', (v) => ((m.input_mask_strip = v || null), set('Mask Strip'))),
+      ),
+    );
+  if (type === 'ID')
+    rows.push(
+      splitRow(
+        'Mask',
+        enumMenu(`seq-modmask-m-${oid(m)}`, [{ value: '', label: '—' }, ...Object.values(app.doc.masks ?? {}).map((x) => ({ value: x.id, label: x.name, icon: 'mod_mask' }))], m.input_mask_id ?? '', (v) => ((m.input_mask_id = v || null), set('Mask'))),
+      ),
+    );
+  return rows;
+}
+
 function modifierPanel(s: Strip, m: StripModifier, i: number): Child {
   const header = h(
     'span',
-    { class: 'seq-mod-hd' },
+    { class: 'seq-mod-hd', onpointerdown: () => s.active_modifier !== m.name && app.run('sequencer.strip_modifier_set_active', { modifier: m.name }) },
     h('button', { class: { 'hdr-toggle': true, on: !m.mute }, 'data-tip': 'Mute\nMute this modifier', onclick: () => ((m.mute = !m.mute), app.pushUndo('Mute Modifier'), app.changed('doc')) }, icon(m.mute ? 'checkbox_dehlt' : 'checkbox_hlt')),
     textField(`seq-mod-name-${oid(m)}`, m.name, (v) => {
       if (!v || s.modifiers.some((x) => x !== m && x.name === v)) return;
@@ -343,10 +478,69 @@ function modifierPanel(s: Strip, m: StripModifier, i: number): Child {
     }),
     button(`seq-mod-up-${i}`, icon('triangle_up'), () => app.run('sequencer.strip_modifier_move', { name: m.name, direction: 'UP' }), { tip: 'Move Up', disabled: i === 0 }),
     button(`seq-mod-down-${i}`, icon('triangle_down'), () => app.run('sequencer.strip_modifier_move', { name: m.name, direction: 'DOWN' }), { tip: 'Move Down', disabled: i === s.modifiers.length - 1 }),
+    h(
+      'button',
+      {
+        class: 'icon-btn seq-mod-more',
+        'data-tip': 'More modifier commands',
+        onpointerdown: (e: PointerEvent) => {
+          e.preventDefault();
+          openMenu(
+            [
+              { label: 'Duplicate', icon: 'duplicate', op: 'sequencer.strip_modifier_duplicate', props: { name: m.name } },
+              { label: 'Copy to Selected Strips', op: 'sequencer.strip_modifier_copy', props: { type: 'APPEND' } },
+              { separator: true },
+              { label: 'Move to First', icon: 'triangle_up', op: 'sequencer.strip_modifier_move_to_index', props: { modifier: m.name, index: 0 }, disabled: i === 0 },
+              { label: 'Move to Last', icon: 'triangle_down', op: 'sequencer.strip_modifier_move_to_index', props: { modifier: m.name, index: s.modifiers.length - 1 }, disabled: i === s.modifiers.length - 1 },
+            ],
+            e.currentTarget as HTMLElement,
+          );
+        },
+      },
+      icon('down_arrow_hlt'),
+    ),
     button(`seq-mod-x-${i}`, icon('x'), () => app.run('sequencer.strip_modifier_remove', { name: m.name }), { tip: 'Remove Modifier' }),
   );
   return panel(`seq-mod-${i}-${m.type}`, '', () => {
-    if (m.type === 'BRIGHT_CONTRAST') return [num(m, 'bright', 'Brightness', { precision: 3 }), num(m, 'contrast', 'Contrast', { min: -100, max: 100, precision: 3 })];
+    const extra = extraModifierUI(s, m, maskRows);
+    if (extra !== undefined) return extra;
+    if (m.type === 'BRIGHT_CONTRAST') return [num(m, 'bright', 'Brightness', { precision: 3 }), num(m, 'contrast', 'Contrast', { min: -100, max: 100, precision: 3 }), maskRows(s, m)];
+    if (m.type === 'WHITE_BALANCE') return [color(m as never, 'white_value', 'White Value'), maskRows(s, m)];
+    if (m.type === 'SOUND_EQUALIZER') {
+      const bands = (m.bands ??= []);
+      const ed: PropOpts = { onChange: () => restartPlayback() };
+      const redefine = h(
+        'div',
+        { class: 'row-aligned seq-eq-redefine' },
+        ...EQUALIZER_LAYOUTS.map(([v, l]) => opButton('sequencer.strip_modifier_equalizer_redefine', l, { graphs: v, name: m.name }, { tip: 'Replace the bands with a new set spread over the audible range' })),
+      );
+      return [redefine, bands.map((b, i) =>
+        panel(
+          `seq-eq-${oid(m)}-${i}`,
+          b.type === 'LOWSHELF' ? 'Low Shelf' : b.type === 'HIGHSHELF' ? 'High Shelf' : `Band ${i}`,
+          () => [
+            enumProp(b as never, 'type', 'Type', [
+              ['LOWSHELF', 'Low Shelf'],
+              ['PEAKING', 'Peak'],
+              ['HIGHSHELF', 'High Shelf'],
+            ]),
+            num(b, 'frequency', 'Frequency', { min: 20, max: 20000, precision: 0, ...ed }),
+            num(b, 'gain', 'Gain (dB)', { min: -36, max: 36, precision: 1, ...ed }),
+            b.type === 'PEAKING' ? num(b, 'q', 'Q', { min: 0.1, max: 30, precision: 2, ...ed }) : null,
+          ],
+          { sub: true },
+        ),
+      )];
+    }
+    if (m.type === 'CURVES') {
+      m.curve_mapping ??= {};
+      // the curve widget of the RGB Curves node, drawing into the modifier's mapping
+      const node = { id: oid(m), type: 'ShaderNodeRGBCurve', name: m.name, location: [0, 0], inputs: {}, props: m.curve_mapping } as unknown as NodeData;
+      return [
+        h('div', { class: 'seq-curves' }, drawCurves({ node, tree: { type: 'COMPOSITOR', nodes: [], links: [] } as unknown as NodeTreeData, key: `seq-curve-${oid(m)}`, where: 'sidebar', changed: (label, final) => (app.changed('doc'), final !== false && app.pushUndo(label)) })),
+        maskRows(s, m),
+      ];
+    }
     const cb = m.color_balance!;
     const lgg = cb.correction_method === 'LIFT_GAMMA_GAIN';
     return [
@@ -357,14 +551,14 @@ function modifierPanel(s: Strip, m: StripModifier, i: number): Child {
         lgg ? [vec3Rows(cb, 'lift', 'Lift', 'invert_lift'), vec3Rows(cb, 'gamma', 'Gamma', 'invert_gamma'), vec3Rows(cb, 'gain', 'Gain', 'invert_gain')] : [vec3Rows(cb, 'offset', 'Offset', 'invert_offset'), vec3Rows(cb, 'power', 'Power', 'invert_power'), vec3Rows(cb, 'slope', 'Slope', 'invert_slope')],
       ),
       num(m, 'color_multiply', 'Multiply', { min: 0, max: 20, softMax: 2, precision: 3 }),
+      maskRows(s, m),
     ];
-  }, { header, className: 'seq-mod-panel' });
+  }, { header, className: `seq-mod-panel${(s.active_modifier ?? s.modifiers[s.modifiers.length - 1]?.name) === m.name ? ' active' : ''}` });
 }
 
 export function modifiersTab(): Child {
   const s = hasEditor() ? activeStrip() : null;
   if (!s) return h('div', { class: 'sb-empty' }, 'No active strip');
-  if (s.type === 'SOUND') return h('div', { class: 'sb-empty' }, 'Sound strips have no image modifiers');
   return [
     stripHeader(s),
     h(
@@ -377,13 +571,7 @@ export function modifiersTab(): Child {
           'data-tip': 'Add Modifier\nAdd a modifier to the active strip',
           onpointerdown: (e: PointerEvent) => {
             e.preventDefault();
-            openMenu(
-              [
-                { label: 'Color Balance', icon: 'seq_color', op: 'sequencer.strip_modifier_add', props: { type: 'COLOR_BALANCE' } },
-                { label: 'Brightness/Contrast', icon: 'seq_adjustment', op: 'sequencer.strip_modifier_add', props: { type: 'BRIGHT_CONTRAST' } },
-              ],
-              e.currentTarget as HTMLElement,
-            );
+            openMenu(modifierAddItems(s), e.currentTarget as HTMLElement);
           },
         },
         icon('add'),
@@ -401,7 +589,9 @@ export function modifiersTab(): Child {
 export function cacheTab(info: { previewSize: string; renderMs: number; scale: number }): Child {
   const st = movieCacheStats();
   return [
+    proxyPanel(info.previewSize),
     panel('seq-cache', 'Cache', () => [
+      hasEditor() ? checkbox('seq-cache-final', 'Final Frames', seqEditor().use_cache_final !== false, (v) => ((seqEditor().use_cache_final = v), app.pushUndo('Cache Settings'), app.changed('doc')), { tip: 'Keep composited frames so scrubbing back to them is instant' }) : null,
       splitRow('Movies', h('span', { class: 'seq-src' }, String(st.movies))),
       splitRow('Cached Frames', h('span', { class: 'seq-src' }, String(st.frames))),
       splitRow('', opButton('sequencer.refresh_all', 'Clear Cache', {}, { icon: 'file_refresh' })),
@@ -410,5 +600,136 @@ export function cacheTab(info: { previewSize: string; renderMs: number; scale: n
       splitRow('Preview Size', h('span', { class: 'seq-src' }, info.previewSize === 'AUTO' ? `Automatic (${Math.round(info.scale * 100)}%)` : info.previewSize === 'SCENE' ? 'Scene Size' : `${info.previewSize.slice(6)}%`)),
       splitRow('Last Render', h('span', { class: 'seq-src' }, `${info.renderMs.toFixed(1)} ms`)),
     ]),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// view
+
+/** Frame overlay switch (Shift O) and "reference = current frame" (O). */
+export function toggleFrameOverlay() {
+  const ed = seqEditor();
+  ed.show_overlay_frame = !ed.show_overlay_frame;
+  app.pushUndo(ed.show_overlay_frame ? 'Show Frame Overlay' : 'Hide Frame Overlay');
+  app.changed('doc');
+}
+
+export function setOverlayReference() {
+  const ed = seqEditor();
+  ed.use_overlay_frame_lock = true;
+  ed.overlay_frame = app.doc.scene.frame_current;
+  ed.show_overlay_frame = true;
+  app.pushUndo('Set Overlay Reference');
+  app.changed('doc');
+}
+
+/** View tab: frame overlay and the 2D cursor (safe areas and guides: previewGuidePanels). */
+export function viewTab(): Child {
+  const ed = seqEditor();
+  const ts = toolSettings();
+  const cur = ts.cursor_location ?? [0, 0];
+  const lock = !!ed.use_overlay_frame_lock;
+  const changed = (label: string) => (app.pushUndo(label), app.changed('doc'));
+  return [
+    panel('seq-overlay-frame', 'Frame Overlay', () => [
+      checkbox('seq-ofr-show', 'Show (Shift O)', !!ed.show_overlay_frame, (v) => ((ed.show_overlay_frame = v), changed('Frame Overlay'))),
+      splitRow(
+        lock ? 'Frame' : 'Frame Offset',
+        numberField({ id: 'seq-ofr-frame', value: ed.overlay_frame ?? 0, int: true, set: (v, f) => ((ed.overlay_frame = Math.round(v)), app.changed('doc'), f && app.pushUndo('Overlay Frame')) }),
+      ),
+      checkbox('seq-ofr-lock', 'Lock to Frame', lock, (v) => {
+        // switching keeps the same reference frame
+        const f = app.doc.scene.frame_current;
+        ed.overlay_frame = v ? f + (ed.overlay_frame ?? 0) : (ed.overlay_frame ?? f) - f;
+        ed.use_overlay_frame_lock = v;
+        changed('Overlay Lock');
+      }),
+      splitRow(
+        'Overlay Type',
+        enumMenu(
+          'seq-ofr-type',
+          [
+            { value: 'RECTANGLE', label: 'Rectangle', description: 'The reference frame shows inside a rectangle over the current one' },
+            { value: 'REFERENCE', label: 'Reference', description: 'Only the reference frame shows' },
+            { value: 'CURRENT', label: 'Current', description: 'Only the current frame shows' },
+          ],
+          ed.overlay_frame_type ?? 'RECTANGLE',
+          (v) => ((ed.overlay_frame_type = v as 'RECTANGLE'), changed('Overlay Type')),
+        ),
+      ),
+      splitRow('', button('seq-ofr-ref', 'Reference = Current Frame (O)', () => setOverlayReference())),
+    ]),
+    panel('seq-2dcursor', '2D Cursor', () => [
+      splitRow('Location X', numberField({ id: 'seq-cur-x', value: cur[0], unit: 'pixel', precision: 0, set: (v, f) => ((ts.cursor_location = [v, cur[1]]), app.changed('ui'), f && app.pushUndo('2D Cursor')) })),
+      splitRow('Y', numberField({ id: 'seq-cur-y', value: cur[1], unit: 'pixel', precision: 0, set: (v, f) => ((ts.cursor_location = [cur[0], v]), app.changed('ui'), f && app.pushUndo('2D Cursor')) })),
+    ]),
+  ];
+}
+
+/** View tab: safe areas (shared with the camera's), the 4:3 centre-cut ones and composition guides of the preview. */
+export function previewGuidePanels(pv: { opts: { safeAreas: boolean; safeCenter: boolean; guides: boolean }; composition: PreviewGuides; displayChannel: number; draw(): void; request(): void }, redraw: () => void): Child[] {
+  const sc = app.doc.scene;
+  const sa = () => (sc.safe_areas ??= JSON.parse(JSON.stringify(DEFAULT_SAFE_AREAS)) as NonNullable<typeof sc.safe_areas>);
+  const pair = (key: 'title' | 'action' | 'title_center' | 'action_center', label: string) =>
+    [0, 1].map((i) =>
+      splitRow(
+        i ? 'Y' : label,
+        numberField({
+          id: `seq-sa-${key}-${i}`,
+          value: (sc.safe_areas ?? DEFAULT_SAFE_AREAS)[key][i],
+          min: 0,
+          max: 1,
+          slider: true,
+          unit: 'factor',
+          set: (v, f) => {
+            const a = sa();
+            a[key] = (i ? [a[key][0], v] : [v, a[key][1]]) as [number, number];
+            pv.draw();
+            if (f) app.pushUndo('Safe Areas');
+          },
+        }),
+      ),
+    );
+  const g = pv.composition;
+  const gt = (key: Exclude<keyof PreviewGuides, 'composition_guide_color'>, label: string) => checkbox(`seq-cg-${key}`, label, g[key], (v) => ((g[key] = v), (pv.opts.guides = true), redraw()));
+  return [
+    panel('seq-view-settings', 'View Settings', () => [
+      splitRow(
+        'Channel',
+        numberField({
+          id: 'seq-display-channel',
+          value: pv.displayChannel,
+          int: true,
+          min: 0,
+          max: 128,
+          tip: 'Preview the channels up to this one only (0 shows every channel)',
+          set: (v) => {
+            pv.displayChannel = Math.max(0, Math.round(v));
+            pv.request();
+          },
+        }),
+      ),
+    ]),
+    panel('seq-safe', 'Safe Areas', () => [checkbox('seq-safe-show', 'Show Safe Areas', pv.opts.safeAreas, (v) => ((pv.opts.safeAreas = v), redraw())), ...pair('title', 'Title X'), ...pair('action', 'Action X')]),
+    panel('seq-safe-center', 'Center-Cut Safe Areas', () => [checkbox('seq-safe-cc', 'Show Center-Cut', pv.opts.safeCenter, (v) => ((pv.opts.safeCenter = v), redraw())), ...pair('title_center', 'Title X'), ...pair('action_center', 'Action X')], { closed: true }),
+    panel(
+      'seq-guides',
+      'Composition Guides',
+      () => [
+        gt('show_composition_thirds', 'Thirds'),
+        h('div', { class: 'pop-label' }, 'Center'),
+        gt('show_composition_center', 'Center'),
+        gt('show_composition_center_diagonal', 'Diagonal'),
+        h('div', { class: 'pop-label' }, 'Golden'),
+        gt('show_composition_golden', 'Ratio'),
+        gt('show_composition_golden_tria_a', 'Triangle A'),
+        gt('show_composition_golden_tria_b', 'Triangle B'),
+        h('div', { class: 'pop-label' }, 'Harmony'),
+        gt('show_composition_harmony_tri_a', 'Triangle A'),
+        gt('show_composition_harmony_tri_b', 'Triangle B'),
+        splitRow('Color', colorSwatch('seq-cg-color', g.composition_guide_color, (v) => ((g.composition_guide_color = [v[0], v[1], v[2], v[3] ?? 1]), redraw()))),
+      ],
+      { closed: true },
+    ),
   ];
 }

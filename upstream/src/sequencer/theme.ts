@@ -1,26 +1,26 @@
-// Sequencer colours (values of the reference default theme / sampled from its Video Editing UI).
+// Sequencer colours (default theme values).
 import type { Strip, StripType, ColorTag } from './types';
 
 export const T = {
-  back: '#1c1c1c',
-  rowAlt: '#171717',
-  outOfRange: 'rgba(0,0,0,0.35)',
-  ruler: '#1c1c1c',
-  rulerText: '#a0a0a0',
-  grid: 'rgba(255,255,255,0.045)',
-  channels: '#1c1c1c',
-  playhead: '#4772b3',
+  back: '#181a1b',
+  rowAlt: '#131416',
+  outOfRange: 'rgba(0, 0, 0,0.35)',
+  ruler: '#181a1b',
+  rulerText: '#a0a1a2',
+  grid: 'rgba(255, 255, 255,0.045)',
+  channels: '#181a1b',
+  playhead: '#4b70b5',
   selected: '#ff8f0d',
   active: '#ffffff',
-  outline: 'rgba(0,0,0,0.85)',
+  outline: 'rgba(0, 0, 0,0.85)',
   text: '#ffffff',
-  textDim: 'rgba(255,255,255,0.75)',
-  invalid: '#e03333',
+  textDim: 'rgba(255, 255, 255,0.75)',
+  invalid: '#dc372e',
   previewBack: '#000000',
-  frameRange: '#6b6bd1',
-  marker: 'rgba(255,255,255,0.5)',
-  waveform: 'rgba(255,255,255,0.55)',
-  waveformClip: '#ff4040',
+  frameRange: '#6e69ce',
+  marker: 'rgba(255, 255, 255,0.5)',
+  waveform: 'rgba(255, 255, 255,0.55)',
+  waveformClip: '#fc4239',
 };
 
 const rgb = (r: number, g: number, b: number) => `rgb(${Math.round(r * 255)},${Math.round(g * 255)},${Math.round(b * 255)})`;
@@ -35,7 +35,9 @@ export const TYPE_COLORS: Record<string, string> = {
   color: rgb(0.6, 0.6, 0.361),
   meta: rgb(0.482, 0.6, 0.361),
   text: rgb(0.624, 0.573, 0.435),
-  adjustment: '#645f7f',
+  adjustment: '#645e7d',
+  mask: rgb(0.561, 0.337, 0.337),
+  clip: rgb(0.561, 0.431, 0.337),
 };
 
 /** Strip colour tags (theme.strip_color). */
@@ -69,6 +71,10 @@ export function typeColor(t: StripType): string {
       return TYPE_COLORS.text;
     case 'ADJUSTMENT':
       return TYPE_COLORS.adjustment;
+    case 'MASK':
+      return TYPE_COLORS.mask;
+    case 'MOVIECLIP':
+      return TYPE_COLORS.clip;
     case 'CROSS':
     case 'GAMMA_CROSS':
     case 'WIPE':
@@ -102,6 +108,10 @@ export function stripIcon(t: StripType): string {
       return 'seq_adjustment';
     case 'META':
       return 'seq_meta';
+    case 'MASK':
+      return 'mod_mask';
+    case 'MOVIECLIP':
+      return 'clip_editor';
     case 'CROSS':
     case 'GAMMA_CROSS':
     case 'WIPE':
@@ -111,7 +121,7 @@ export function stripIcon(t: StripType): string {
   }
 }
 
-export function cssColor(c: number[] | undefined, fallback = '#808080') {
+export function cssColor(c: number[] | undefined, fallback = '#7f8082') {
   if (!c) return fallback;
   return rgb(Math.max(0, Math.min(1, c[0])), Math.max(0, Math.min(1, c[1])), Math.max(0, Math.min(1, c[2])));
 }

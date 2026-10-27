@@ -1,5 +1,5 @@
 // .blend import: container parsing, robustness, and a full cross-check of the converted
-// document against the values Blender 5.2 itself reported for the same file
+// document against the expected values for the same file
 // (tests/fixtures/blend/scene.json, written by tests/fixtures/blend/make_scene.py).
 import { describe, it, expect, beforeAll } from 'vitest';
 import { readFileSync, existsSync } from 'node:fs';
@@ -34,7 +34,7 @@ let imp: BlendImport;
 let doc: DocumentData;
 const ob = (n: string) => byName(doc.objects, n);
 
-/** Rewrite a Blender 5.x (large block header) file into the classic 12-byte header / 24-byte BHead layout. */
+/** Rewrite a version 5.x (large block header) file into the classic 12-byte header / 24-byte BHead layout. */
 function toClassic(bytes: Uint8Array): Uint8Array {
   const h = parseHeader(bytes);
   const blocks = readBHeads(bytes, h);
@@ -113,12 +113,12 @@ describe('container', () => {
 
 describe('robustness', () => {
   it('rejects non-blend data with a clear error', async () => {
-    await expect(readBlend(new TextEncoder().encode('hello world, not a blend'))).rejects.toThrow(/Not a Blender file/);
+    await expect(readBlend(new TextEncoder().encode('hello world, not a blend'))).rejects.toThrow(/Not a .blend file/);
     await expect(readBlend(new Uint8Array(0))).rejects.toThrow(BlendError);
   });
   it('rejects truncated files', async () => {
     for (const frac of [0.01, 0.3, 0.7, 0.999]) {
-      await expect(readBlend(raw.slice(0, Math.floor(raw.length * frac)))).rejects.toThrow(/Truncated|extends past end|Not a Blender/);
+      await expect(readBlend(raw.slice(0, Math.floor(raw.length * frac)))).rejects.toThrow(/Truncated|extends past end|Not a .blend file/);
     }
   });
   it('rejects corrupt compressed data and corrupt SDNA', async () => {
@@ -141,7 +141,7 @@ describe('robustness', () => {
   });
 });
 
-describe('scene, collections and objects (vs Blender)', () => {
+describe('scene, collections and objects (vs expected)', () => {
   it('imports every object with type, parent and collection membership', () => {
     const names = Object.values(doc.objects).map((o) => o.name).sort();
     expect(names).toEqual(Object.keys(E.objects).sort());
@@ -170,7 +170,7 @@ describe('scene, collections and objects (vs Blender)', () => {
     }
   });
 
-  it('reproduces Blender world matrices with this app’s transform math', () => {
+  it('reproduces the stored world matrices with this app’s transform math', () => {
     const world = (o: ObjectData): Matrix4 => {
       const local = localMatrix(o);
       if (!o.parent) return local;
@@ -227,7 +227,7 @@ describe('scene, collections and objects (vs Blender)', () => {
   });
 });
 
-describe('meshes (vs Blender)', () => {
+describe('meshes (vs expected)', () => {
   it('matches topology, positions and per-face data', () => {
     for (const [name, e] of Object.entries<any>(E.meshes)) {
       const m = byName(doc.meshes, name);
@@ -289,7 +289,7 @@ describe('meshes (vs Blender)', () => {
   });
 });
 
-describe('materials, images, lights, cameras (vs Blender)', () => {
+describe('materials, images, lights, cameras (vs expected)', () => {
   it('converts node trees with node idnames, socket identifiers, values and links', () => {
     for (const [name, e] of Object.entries<any>(E.materials)) {
       const ma = byName(doc.materials, name);
@@ -373,7 +373,7 @@ describe('materials, images, lights, cameras (vs Blender)', () => {
   });
 });
 
-describe('armature, modifiers, constraints (vs Blender)', () => {
+describe('armature, modifiers, constraints (vs expected)', () => {
   it('imports bones in armature space with matching rest matrices', () => {
     const rig = ob('Rig');
     const arm = doc.armatures[rig.data!];
@@ -387,7 +387,7 @@ describe('armature, modifiers, constraints (vs Blender)', () => {
       expect(b.use_connect).toBe(eb.use_connect);
       expect(b.use_deform).toBe(eb.use_deform);
       expect([b.use_inherit_rotation, b.inherit_scale]).toEqual(e.bone_flags[name]);
-      // rotation part of Blender's bone.matrix_local equals this app's rest matrix (validates roll)
+      // rotation part of the expected bone.matrix_local equals this app's rest matrix (validates roll)
       const m = boneRestMatrix(b).toArray();
       close([...m.slice(0, 3), ...m.slice(4, 7), ...m.slice(8, 11)], [...eb.matrix_local.slice(0, 3), ...eb.matrix_local.slice(4, 7), ...eb.matrix_local.slice(8, 11)], 2e-3);
     }
@@ -458,7 +458,7 @@ describe('armature, modifiers, constraints (vs Blender)', () => {
   });
 });
 
-describe('animation (vs Blender, layered/slotted actions)', () => {
+describe('animation (vs expected, layered/slotted actions)', () => {
   it('assigns actions and converts F-curves from channelbags', () => {
     for (const [name, e] of Object.entries<any>(E.objects)) {
       const o = ob(name);
@@ -496,10 +496,11 @@ describe('animation (vs Blender, layered/slotted actions)', () => {
   });
 });
 
-// A real Blender 4.3 file (classic 12-byte header, 24-byte block headers, CustomData mesh
-// layers) ships with Blender 5.2; expected values were printed by Blender 5.2 for this file.
-const LEGACY_43 = '/Applications/Blender.app/Contents/Resources/5.2/datafiles/assets/brushes/essentials_brushes-mesh_vertex.blend';
-describe.skipIf(!existsSync(LEGACY_43))('Blender 4.3 file bundled with Blender.app', () => {
+// A version 4.3 .blend file (classic 12-byte header, 24-byte block headers, CustomData mesh
+// layers), read from the path in LEGACY_43_BLEND when it is set; the expectations below are for
+// that file (a vertex-paint brush library containing a "Suzanne" preview mesh).
+const LEGACY_43 = process.env.LEGACY_43_BLEND ?? '';
+describe.skipIf(!LEGACY_43 || !existsSync(LEGACY_43))('version 4.3 .blend file (classic layout)', () => {
   it('reads the classic layout and CustomData mesh layers', async () => {
     const r = await readBlend(new Uint8Array(readFileSync(LEGACY_43)));
     expect(r.version).toBe('4.3');
@@ -518,7 +519,9 @@ describe.skipIf(!existsSync(LEGACY_43))('Blender 4.3 file bundled with Blender.a
 
 describe('import modes', () => {
   it('reports what was skipped', () => {
-    expect(imp.warnings.some((w) => w.includes('Additional UV maps') && w.includes('Second'))).toBe(true);
+    // further UV maps are kept (as inactive maps), not dropped
+    expect(imp.warnings.some((w) => w.includes('Additional UV maps'))).toBe(false);
+    expect(Object.values(doc.meshes).some((m) => (m.uv_layers_extra ?? []).some((u) => u.name === 'Second' && u.data.length === m.indices.length * 2))).toBe(true);
     expect(imp.warnings.some((w) => w.includes('Loose edges') && w.includes('SkinMesh'))).toBe(true);
   });
 

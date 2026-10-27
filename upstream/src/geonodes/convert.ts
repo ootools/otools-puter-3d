@@ -1,9 +1,14 @@
 // Conversion between the depsgraph's evaluated meshes (EvalMesh) and geometry sets.
+import { attrWidth, attrDomainSize } from '../mesh/attributes';
 import type { EvalMesh, GeometryInstance } from '../eval/types';
 import type { CurveData, DocumentData, MeshData, ObjectData } from '../data/types';
 import { sampleSpline } from '../eval/curve';
-import { CurvesComponent, GeometrySet, MeshComponent, PointsComponent, mulMat, isIdentity, type AttrMap, type InstancesComponent } from './geometry';
-import { edgeAttrToCorners, faceNormals, smoothFlags } from './meshutil';
+import { CurvesComponent, GeometrySet, MeshComponent, PointsComponent, mulMat, isIdentity, adaptDomain, type AttrMap, type Attribute, type InstancesComponent } from './geometry';
+import { cornerNormals, edgeAttrToCorners, faceNormals, smoothFlags } from './meshutil';
+import { curveObjectToCurves, evaluatedCurves } from './curves/curvedata';
+import { curvesWithGreasePencil } from './curves/gpdata';
+import { VolumeComponent } from '../volume/component';
+import { volumeWire } from '../volume/wire';
 
 export interface GnEvalMesh extends EvalMesh {
   /** materials of the generated geometry by material index (when set by nodes) */
@@ -14,20 +19,32 @@ export const UV_DEFAULT = 'UVMap';
 
 const inputCache = new WeakMap<EvalMesh, GeometrySet>();
 
+/** Register the geometry an evaluated mesh stands for (e.g. hair curves with all their attributes). */
+export const primeGeometry = (m: EvalMesh, g: GeometrySet) => void inputCache.set(m, g);
+
 /** Geometry set of an evaluated mesh (attributes: UV map, sharp_face, material_index, edges flags, vertex groups, colors). */
 export function evalMeshToGeometry(m: EvalMesh, source?: MeshData | null): GeometrySet {
   const hit = inputCache.get(m);
   if (hit) return hit;
+  if (m.volume && m.offsets.length <= 1) {
+    // a volume (its positions are only the display wire)
+    const g = new GeometrySet();
+    g.volume = new VolumeComponent(m.volume);
+    inputCache.set(m, g);
+    return g;
+  }
   const nc = m.indices.length,
     nf = m.offsets.length - 1,
     nv = m.positions.length / 3;
   const attrs: AttrMap = new Map();
   const mesh = new MeshComponent(m.positions, m.offsets, m.indices, m.looseEdges ?? new Uint32Array(0), attrs, source?.materials ? [...source.materials] : []);
+  // (the evaluated corners carry the map marked for rendering; the original mesh has the active one)
+  const ownUVs = !!source && source.indices === m.indices && source.uvs.length === nc * 2;
   if (m.uvs && m.uvs.length === nc * 2 && nc)
     attrs.set(source?.uv_map_name || UV_DEFAULT, {
       domain: 'CORNER',
       type: 'FLOAT2',
-      data: m.uvs,
+      data: ownUVs ? source!.uvs : m.uvs,
     });
   if (nf) {
     let anySharp = !m.smooth;
@@ -55,6 +72,7 @@ export function evalMeshToGeometry(m: EvalMesh, source?: MeshData | null): Geome
     attrs.set(name, { domain: 'EDGE', type, data });
   };
   edgeFlag(m.sharp, 'sharp_edge', 'BOOLEAN');
+  if (m.custom_normals && m.custom_normals.length === nc * 3) attrs.set('custom_normal', { domain: 'CORNER', type: 'FLOAT_VECTOR', data: m.custom_normals });
   edgeFlag(m.creases, 'crease_edge', 'FLOAT');
   edgeFlag(m.seams, '.uv_seam', 'BOOLEAN');
   if (m.vertex_groups && m.weights)
@@ -78,6 +96,23 @@ export function evalMeshToGeometry(m: EvalMesh, source?: MeshData | null): Geome
           data: c.data,
         });
     });
+    // the other UV maps and generic attributes of the original mesh (same topology)
+    if (sameTopo) for (const u of source.uv_layers_extra ?? []) if (u.data.length === nc * 2 && !attrs.has(u.name)) attrs.set(u.name, { domain: 'CORNER', type: 'FLOAT2', data: u.data });
+    if (sameTopo)
+      for (const a of source.attributes ?? []) {
+        const w = attrWidth(a.data_type);
+        if (a.data.length !== attrDomainSize(source, a.domain) * w || attrs.has(a.name)) continue;
+        const type = (a.data_type === 'INT32_2D' ? 'FLOAT2' : a.data_type) as Attribute['type'];
+        if (a.domain !== 'EDGE') {
+          attrs.set(a.name, { domain: a.domain, type, data: type === 'FLOAT2' && a.data_type === 'INT32_2D' ? Float32Array.from(a.data) : a.data });
+          continue;
+        }
+        // edge values live on the corners (then loose edges); gather them per edge
+        const topo = mesh.topology();
+        const data = type === 'BOOLEAN' ? new Uint8Array(topo.edgeCount * w) : type === 'INT' || type === 'INT8' ? new Int32Array(topo.edgeCount * w) : new Float32Array(topo.edgeCount * w);
+        for (let c = 0; c < nc; c++) for (let k = 0; k < w; k++) data[topo.cornerEdge[c] * w + k] = a.data[c * w + k];
+        attrs.set(a.name, { domain: 'EDGE', type, data });
+      }
   } else if (m.colors && m.colors.length === nc * 4)
     attrs.set('Color', {
       domain: 'CORNER',
@@ -114,8 +149,13 @@ export function curvesFromPolylines(list: { points: Float32Array; cyclic: boolea
   return new CurvesComponent(pos, offs, cyc);
 }
 
-/** Poly curves sampled from a curve data-block (object space). */
+/** Curves of a curve data-block (object space) with their spline types and handles. */
 export function curveDataToCurves(cu: CurveData): CurvesComponent {
+  return curveObjectToCurves(cu);
+}
+
+/** Poly curves sampled from a curve data-block (object space). */
+export function sampledCurveData(cu: CurveData): CurvesComponent {
   const sampled = cu.splines.map((s) => sampleSpline(s, cu.resolution_u));
   let total = 0;
   for (const s of sampled) total += s.points.length;
@@ -231,6 +271,28 @@ export function meshToEvalMesh(m: MeshComponent, opts: OutputOptions = {}): GnEv
     looseEdges: m.looseEdges.length ? m.looseEdges : undefined,
   };
   if (gnMaterials) out.gnMaterials = gnMaterials;
+  const cn = m.attrs.get('custom_normal');
+  if (cn && cn.type === 'FLOAT_VECTOR') out.custom_normals = customNormals(m, cn);
+  return out;
+}
+
+/** Per-corner unit custom normals from a custom_normal attribute (zero vectors use the shading normal). */
+function customNormals(m: MeshComponent, a: { domain: string; data: ArrayLike<number> }): Float32Array {
+  const data = a.domain === 'CORNER' ? a.data : adaptDomain(m, a.data as Float32Array, 'FLOAT_VECTOR', a.domain as 'POINT' | 'FACE' | 'EDGE', 'CORNER');
+  const nc = m.cornerCount;
+  const out = new Float32Array(nc * 3);
+  let fallback: Float32Array | null = null;
+  for (let c = 0; c < nc; c++) {
+    const x = data[c * 3],
+      y = data[c * 3 + 1],
+      z = data[c * 3 + 2];
+    const l = Math.hypot(x, y, z);
+    if (l > 1e-12) out.set([x / l, y / l, z / l], c * 3);
+    else {
+      fallback ??= cornerNormals(m);
+      out.set(fallback.subarray(c * 3, c * 3 + 3), c * 3);
+    }
+  }
   return out;
 }
 
@@ -275,8 +337,8 @@ export function geometryToEvalMesh(g: GeometrySet, opts: OutputOptions = {}): Gn
       normals: new Float32Array(0),
       pointRadius: r ? (r.data as Float32Array) : undefined,
     };
-  } else if (g.curves) {
-    const c = g.curves;
+  } else if (g.curves || g.greasePencil) {
+    const c = evaluatedCurves(curvesWithGreasePencil(g) ?? new CurvesComponent(new Float32Array(0), new Uint32Array([0]), new Uint8Array(0)));
     const curves: { points: Float32Array; cyclic: boolean }[] = [];
     for (let k = 0; k < c.curveCount; k++)
       curves.push({
@@ -304,6 +366,15 @@ export function geometryToEvalMesh(g: GeometrySet, opts: OutputOptions = {}): Gn
     flattenInstances(g.instances, null, list, opts, 0);
     out.instances = list;
   }
+  if (g.volume?.grids.length) {
+    out.volume = g.volume.grids;
+    if (!out.positions.length) {
+      // show the volume's bounds as a wire
+      const w = volumeWire(g.volume.grids, { wireframe_type: 'BOUNDS', wireframe_detail: 'COARSE' });
+      out.positions = w.positions;
+      out.looseEdges = w.edges;
+    }
+  }
   return out;
 }
 
@@ -311,7 +382,7 @@ export { isIdentity };
 
 /** Material slots of an object (object-linked slots override data slots). */
 export function materialSlots(doc: DocumentData, ob: ObjectData): (string | null)[] {
-  const data = ob.data ? ((doc.meshes[ob.data] ?? doc.curves[ob.data]) as { materials?: (string | null)[] } | undefined) : undefined;
+  const data = ob.data ? ((doc.meshes[ob.data] ?? doc.curves[ob.data] ?? doc.metaballs?.[ob.data] ?? doc.hair_curves?.[ob.data] ?? doc.volumes?.[ob.data] ?? doc.pointclouds?.[ob.data]) as { materials?: (string | null)[] } | undefined) : undefined;
   const base = data?.materials ?? [];
   if (!ob.object_materials) return [...base];
   return base.map((m, i) => (ob.material_slots_link?.[i] === 'OBJECT' ? (ob.object_materials![i] ?? null) : m));

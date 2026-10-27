@@ -2,9 +2,12 @@
 // ID pass for picking/outlines, and wireframe/overlay line materials.
 import { ShaderMaterial, Color, DoubleSide, FrontSide, Vector3, Vector4, type Side, LineBasicMaterial, MeshBasicMaterial } from 'three';
 
+import { STUDIO_GLSL, studioUniforms } from './studiolights';
+
 const solidVert = /* glsl */ `
   #include <common>
   #include <skinning_pars_vertex>
+  #include <clipping_planes_pars_vertex>
   varying vec3 vNormal;
   varying vec3 vViewPos;
   varying vec3 vWorldNormal;
@@ -23,6 +26,8 @@ const solidVert = /* glsl */ `
     vWorldNormal = normalize(mat3(modelMatrix) * objectNormal);
     vec4 mv = modelViewMatrix * vec4(transformed, 1.0);
     vViewPos = mv.xyz;
+    vec4 mvPosition = mv;
+    #include <clipping_planes_vertex>
     #ifdef USE_VCOLOR
     vColor = color;
     #else
@@ -38,27 +43,33 @@ const solidFrag = /* glsl */ `
   uniform float uSpecular;
   uniform int uLighting; // 0 studio, 1 flat, 2 matcap-ish
   uniform float uCavity;
+  ${STUDIO_GLSL}
   varying vec3 vNormal;
   varying vec3 vViewPos;
   varying vec3 vWorldNormal;
   varying vec4 vColor;
+  #include <clipping_planes_pars_fragment>
   void main() {
+    #include <clipping_planes_fragment>
     vec3 n = normalize(vNormal);
     if (!gl_FrontFacing) n = -n;
     vec3 base = uColor * vColor.rgb;
     vec3 col;
     if (uLighting == 1) {
       col = base;
+    } else if (uLighting == 2 && uMatcapOn == 1) {
+      col = matcapLighting(base, n);
     } else if (uLighting == 2) {
       // clay matcap look: view-space normal lookup approximated analytically
       vec3 l1 = normalize(vec3(-0.4, 0.6, 0.7));
       float d = max(dot(n, l1), 0.0);
       float rim = pow(1.0 - max(n.z, 0.0), 2.0);
       col = base * (0.25 + 0.75 * d) + vec3(0.25) * rim + vec3(0.25) * pow(max(dot(reflect(-l1, n), vec3(0.0, 0.0, 1.0)), 0.0), 18.0);
+    } else if (uStudioCustom == 1) {
+      col = studioLighting(base, n, normalize(-vViewPos), uSpecular);
     } else {
-      // studio lighting: a key light fixed relative to the view plus ambient. The weights were
-      // fitted to the reference application's default Solid shading (measured face brightness of
-      // the default cube from the default view), not copied from its implementation.
+      // studio lighting: a key light fixed relative to the view plus ambient. The weights set
+      // the default Solid shading look (face brightness of the default cube from the default view).
       vec3 v = normalize(-vViewPos);
       vec3 L1 = normalize(vec3(-0.398, 0.455, 0.796));
       float d1 = max(dot(n, L1), 0.0);
@@ -97,6 +108,8 @@ export function solidMaterial(o: SolidOptions): ShaderMaterial {
       uSpecular: { value: o.specular === false ? 0 : 1 },
       uLighting: { value: o.lighting === 'FLAT' ? 1 : o.lighting === 'MATCAP' ? 2 : 0 },
       uCavity: { value: 0 },
+      // shared objects: Preferences ▸ Lights / the viewport's lighting choice update them per view
+      ...studioUniforms,
     },
     defines: o.vertexColors ? { USE_VCOLOR: '' } : {},
     side: o.backfaceCulling ? FrontSide : DoubleSide,
@@ -105,6 +118,7 @@ export function solidMaterial(o: SolidOptions): ShaderMaterial {
     polygonOffset: true,
     polygonOffsetFactor: 1,
     polygonOffsetUnits: 1,
+    clipping: true,
   });
   solidCache.set(key, m);
   return m;
@@ -114,17 +128,24 @@ export function solidMaterial(o: SolidOptions): ShaderMaterial {
 // ID pass: object id encoded in RGB (id+1), alpha = 1
 
 const idVert = /* glsl */ `
+  #include <clipping_planes_pars_vertex>
   void main() {
     vec3 transformed = position;
     #ifdef USE_INSTANCING
     transformed = (instanceMatrix * vec4(position, 1.0)).xyz;
     #endif
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(transformed, 1.0);
+    vec4 mvPosition = modelViewMatrix * vec4(transformed, 1.0);
+    #include <clipping_planes_vertex>
+    gl_Position = projectionMatrix * mvPosition;
   }
 `;
 const idFrag = /* glsl */ `
   uniform vec4 uId;
-  void main() { gl_FragColor = uId; }
+  #include <clipping_planes_pars_fragment>
+  void main() {
+    #include <clipping_planes_fragment>
+    gl_FragColor = uId;
+  }
 `;
 
 const idCache = new Map<number, ShaderMaterial>();
@@ -138,6 +159,7 @@ export function idMaterial(id: number, side: Side = DoubleSide): ShaderMaterial 
     fragmentShader: idFrag,
     uniforms: { uId: { value: new Vector4((v & 255) / 255, ((v >> 8) & 255) / 255, ((v >> 16) & 255) / 255, 1) } },
     side,
+    clipping: true,
   });
   idCache.set(key, m);
   return m;
@@ -155,8 +177,8 @@ export const outlineMaterial = new ShaderMaterial({
     tId: { value: null },
     tSel: { value: null },
     uSize: { value: new Vector3(1, 1, 1) },
-    uSelColor: { value: new Color(0.929, 0.341, 0.0) },
-    uActColor: { value: new Color(1.0, 0.627, 0.157) },
+    uSelColor: { value: new Color(0.884, 0.376, 0.013) },
+    uActColor: { value: new Color(0.987, 0.645, 0.115) },
     uWidth: { value: 1.0 },
   },
   vertexShader: /* glsl */ `
@@ -212,14 +234,14 @@ export const outlineMaterial = new ShaderMaterial({
 
 export const lineMaterials = {
   wire: new LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.6 }),
-  wireSel: new LineBasicMaterial({ color: 0xed5700 }),
-  wireAct: new LineBasicMaterial({ color: 0xffa028 }),
+  wireSel: new LineBasicMaterial({ color: 0xe16003 }),
+  wireAct: new LineBasicMaterial({ color: 0xfca41d }),
 };
 
 export const helperColors = {
   wire: new Color(0, 0, 0),
-  selected: new Color(0.929, 0.341, 0.0),
-  active: new Color(1.0, 0.627, 0.157),
+  selected: new Color(0.884, 0.376, 0.013),
+  active: new Color(0.987, 0.645, 0.115),
   light: new Color(0, 0, 0),
 };
 

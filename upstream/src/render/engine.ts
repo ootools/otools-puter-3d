@@ -1,5 +1,6 @@
 // Shared WebGL2 renderer: a single context draws every 3D viewport into its
 // screen rectangle (scissored) behind the DOM interface, sharing GPU resources.
+import { prefs } from '../app/prefs';
 import {
   WebGLRenderer,
   Scene,
@@ -57,6 +58,8 @@ export class RenderEngine {
   lost = false;
   onLost?: (message: string) => void;
   frameCallbacks = new Set<() => void>();
+  /** called after every redraw of the shared canvas (e.g. to copy a viewport into an area window) */
+  afterDraw = new Set<() => void>();
 
   constructor(container: HTMLElement) {
     this.canvas = document.createElement('canvas');
@@ -64,7 +67,8 @@ export class RenderEngine {
     container.prepend(this.canvas);
     this.renderer = new WebGLRenderer({
       canvas: this.canvas,
-      antialias: true,
+      // multisampling is fixed when the context is created (Preferences ▸ Viewport ▸ Quality)
+      antialias: prefs.viewport_aa !== 'OFF',
       alpha: false,
       powerPreference: 'high-performance',
       preserveDrawingBuffer: false,
@@ -117,7 +121,7 @@ export class RenderEngine {
     const r = this.renderer;
     const base = this.canvas.getBoundingClientRect();
     r.setScissorTest(false);
-    r.setClearColor(0x161616, 1);
+    r.setClearColor(0x121315, 1);
     r.clear(true, true, true);
     for (const v of this.viewports) {
       if (!v.visible()) continue;
@@ -138,6 +142,7 @@ export class RenderEngine {
       r.setRenderTarget(null);
     }
     r.setScissorTest(false);
+    for (const cb of this.afterDraw) cb();
   }
 
   /** Clear the current scissor region. */

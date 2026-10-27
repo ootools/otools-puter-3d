@@ -11,7 +11,8 @@ import type { Gpu, Texture, UniformValue } from '../gpu/gpu';
 import { Result, asVec4, convertValue, domainEqual, xfInvert, xfMul, type DataType, type Domain, IDENTITY, type Xform, type Sampling } from './result';
 import { pack, readAs } from './convert';
 
-export type PassName = 'Combined' | 'Depth' | 'Normal' | 'Mist';
+/** Render passes: the built-in ones plus index, cryptomatte (`CryptoObject00`, …) and AOV (`AOV <name>`) passes. */
+export type PassName = 'Combined' | 'Depth' | 'Normal' | 'Mist' | (string & {});
 
 /** Render Layers data: top-down float passes of the last render. */
 export interface LayerSource {
@@ -20,6 +21,8 @@ export interface LayerSource {
   /** changes whenever the pixels change (texture cache key) */
   version: string;
   passes: Partial<Record<PassName, Float32Array>>;
+  /** other rendered view layers by `<scene name>/<layer name>` (Render Layers nodes pick one) */
+  named?: Record<string, LayerSource>;
 }
 
 export interface EvalEnv {
@@ -33,6 +36,8 @@ export interface EvalEnv {
   viewer: string | null;
   /** evaluate the composite output (Group Output) */
   composite: boolean;
+  /** values of the root tree's Group Input sockets by identifier (node groups run on an image) */
+  groupInputs?: Record<string, Result>;
 }
 
 export interface Scope {
@@ -303,7 +308,8 @@ export class Evaluator {
               continue;
             }
           }
-          outs.set(s.identifier, Result.single(dataTypeOf(s.type), socketDefault(s)));
+          const given = !scope.outer ? this.env.groupInputs?.[s.identifier] : undefined;
+          outs.set(s.identifier, given ?? Result.single(dataTypeOf(s.type), socketDefault(s)));
         }
       } else if (def?.dynamicSockets && node.props.node_tree !== undefined) {
         this.group(scope, node, outs);

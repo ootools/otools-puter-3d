@@ -9,10 +9,10 @@ import { loadRecovery, decodeDocument } from '../io/native';
 import { projectUiState } from '../io/files';
 import { cloneShared } from '../data/cow';
 import { openDialog, closeDialog } from './dialog';
+import { formatDate } from '../app/prefs';
 import { PreferencesEditor, factoryPrefs, saveUserPrefs, itemLabel, type Section } from './prefs_editor';
 import { purgeOrphanData, PURGEABLE } from './api';
 import { PYODIDE_VERSION, PYODIDE_INDEX_URL } from './python';
-import { isActive } from './keymap_prefs';
 import noticesMd from '../../THIRD_PARTY_NOTICES.md?raw';
 import packageJson from '../../package.json?raw';
 
@@ -149,7 +149,7 @@ function keymapReferenceBody(): Child {
     .map(([name, items]) => {
       const seen = new Set<string>();
       const rows = items
-        .filter((k) => isActive(k) && k.key !== 'NONE')
+        .filter((k) => !k.inactive && k.key !== 'NONE')
         .map((k) => ({ label: itemLabel(k), key: keyLabel(k) }))
         .filter((r) => {
           const id = `${r.label}|${r.key}`;
@@ -271,7 +271,7 @@ registerOperators([
     exec: () => saveUserPrefs(),
   },
   {
-    idname: 'wm.read_factory_settings',
+    idname: 'wm.read_factory_userpref',
     label: 'Load Factory Preferences',
     description: 'Load factory default preferences and key bindings (your scene is kept)',
     undo: false,
@@ -279,13 +279,40 @@ registerOperators([
     exec: (_c, p) => {
       if (p.confirm) {
         openMenu(
-          [{ heading: 'Load factory default preferences?' }, { label: 'Load Factory Preferences', icon: 'error', action: () => app.run('wm.read_factory_settings', { confirm: false }) }],
+          [{ heading: 'Load factory default preferences?' }, { label: 'Load Factory Preferences', icon: 'error', action: () => app.run('wm.read_factory_userpref', { confirm: false }) }],
           { x: app.pointer.x, y: app.pointer.y },
         );
         return 'CANCELLED';
       }
       factoryPrefs();
       app.report('INFO', 'Factory preferences loaded');
+    },
+  },
+  {
+    idname: 'wm.read_factory_settings',
+    label: 'Load Factory Settings',
+    description: 'Start over with the factory default scene, workspaces and preferences (your saved startup file is kept)',
+    undo: false,
+    props: [
+      { id: 'confirm', label: 'Confirm', type: 'bool', default: true, hidden: true },
+      { id: 'use_empty', label: 'Empty', type: 'bool', default: false },
+    ],
+    exec: (_c, p) => {
+      if (p.confirm) {
+        openMenu(
+          [{ heading: 'Load factory settings? Unsaved changes are lost.' }, { label: 'Load Factory Settings', icon: 'error', action: () => app.run('wm.read_factory_settings', { confirm: false, use_empty: p.use_empty }) }],
+          { x: app.pointer.x, y: app.pointer.y },
+        );
+        return 'CANCELLED';
+      }
+      factoryPrefs();
+      app.run('wm.read_homefile', { use_factory_startup: true });
+      if (p.use_empty) {
+        app.run('object.select_all', { action: 'SELECT' }, { invoke: false });
+        app.run('object.delete', { confirm: false }, { invoke: false });
+        app.undo.reset(app.doc);
+      }
+      app.report('INFO', 'Factory settings loaded');
     },
   },
   {
@@ -304,7 +331,7 @@ registerOperators([
           app.setDocument(doc);
           app.filename = rec.name;
           if (extra.ui && typeof extra.ui === 'object') projectUiState.load(extra.ui as Record<string, unknown>);
-          app.report('INFO', `Recovered session from ${new Date(rec.time).toLocaleString()}`);
+          app.report('INFO', `Recovered session from ${formatDate(rec.time)}`);
         } catch (e) {
           app.report('ERROR', `The autosaved session could not be recovered: ${(e as Error).message}`);
         }
@@ -316,6 +343,8 @@ registerOperators([
     label: 'Purge Unused Data',
     description: 'Remove all unused data-blocks (meshes, materials, images, actions, node groups, textures…) without a fake user',
     props: [
+      { id: 'do_local_ids', label: 'Local Data-blocks', type: 'bool', default: true },
+      { id: 'do_linked_ids', label: 'Linked Data-blocks', type: 'bool', default: true },
       { id: 'do_recursive', label: 'Recursive Delete', type: 'bool', default: true },
       { id: 'confirm', label: 'Confirm', type: 'bool', default: true, hidden: true },
     ],
@@ -331,14 +360,14 @@ registerOperators([
           { heading: `Purge Unused Data (${prev.total} data-block${prev.total === 1 ? '' : 's'})` },
           ...prev.byType.map(([t, n]) => ({ label: `${n} ${t}`, disabled: true })),
           { separator: true },
-          { label: 'Delete', icon: 'trash', action: () => app.run('outliner.orphans_purge', { do_recursive: p.do_recursive, confirm: false }, { invoke: false }) },
+          { label: 'Delete', icon: 'trash', action: () => app.run('outliner.orphans_purge', { do_recursive: p.do_recursive, do_local_ids: p.do_local_ids, do_linked_ids: p.do_linked_ids, confirm: false }, { invoke: false }) },
         ],
         { x: app.pointer.x, y: app.pointer.y },
       );
       return 'CANCELLED';
     },
     exec: (ctx, p) => {
-      const n = purgeOrphanData(ctx.doc, !!p.do_recursive);
+      const n = purgeOrphanData(ctx.doc, !!p.do_recursive, { local: p.do_local_ids !== false, linked: p.do_linked_ids !== false });
       if (!n) {
         app.report('INFO', 'No orphaned data-blocks to purge');
         return 'CANCELLED';

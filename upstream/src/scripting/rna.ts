@@ -6,6 +6,9 @@ import { app } from '../app/app';
 import { cow } from '../data/cow';
 import type { DocumentData } from '../data/types';
 import { Vector, VecBase, Euler, Quaternion, Color, Matrix, type EulerOrder } from './mathutils';
+import { Euler as TEuler } from 'three';
+import type { RotationMode, Vec3, Vec4 } from '../data/types';
+import { compatibleEuler, rotationQuaternion, threeOrder } from '../eval/transform';
 
 export type Raw = Record<string, unknown>;
 
@@ -23,6 +26,8 @@ export const scriptState = {
 /** Called by every API write. */
 export function touched(kind: 'doc' | 'geometry' | 'select' | 'frame' = 'doc') {
   scriptState.mutated = true;
+  // arrays written in place keep their identity, which the evaluated-mesh cache keys on
+  if (kind === 'geometry') app.graph?.invalidate();
   if (typeof requestAnimationFrame === 'function') app.changed(kind === 'geometry' ? 'geometry' : kind, 'doc');
   else app.revision++;
 }
@@ -87,13 +92,28 @@ export const ID_TABLES: [keyof DocumentData, string][] = [
   ['curves', 'Curve'],
   ['armatures', 'Armature'],
   ['lattices', 'Lattice'],
+  ['metaballs', 'MetaBall'],
   ['particles', 'ParticleSettings'],
   ['brushes', 'Brush'],
 ];
 
 const EMPTY: Record<string, Raw> = Object.freeze({}) as Record<string, Raw>;
+/**
+ * Data-blocks that exist only for scripts (e.g. the meshes `Object.to_mesh()` returns): found by
+ * id like the document's own, but not listed in bpy.data and never saved.
+ */
+export const scriptOnlyData: Record<string, Record<string, Raw>> = {};
+
 export function tableOf(doc: DocumentData, kind: string): Record<string, Raw> {
-  return (doc as unknown as Record<string, Record<string, Raw> | undefined>)[kind] ?? EMPTY;
+  const t = (doc as unknown as Record<string, Record<string, Raw> | undefined>)[kind] ?? EMPTY;
+  const extra = scriptOnlyData[kind];
+  if (!extra) return t;
+  for (const _k in extra)
+    return new Proxy(t, {
+      get: (target, p) => (typeof p === 'string' && !(p in target) && p in extra ? extra[p] : (target as Record<string | symbol, unknown>)[p]),
+      has: (target, p) => p in target || (typeof p === 'string' && p in extra),
+    });
+  return t;
 }
 
 /** Find the table holding an id string (ids are globally unique). */
@@ -141,7 +161,7 @@ export function toPlain(v: unknown, current?: unknown): unknown {
 const INT_KEY = /(^|_)(levels|count|segments|iterations|resolution(_[uvxy])?|samples|steps|seed|subdivisions|vertices|rings|frame(_start|_end|_step|_current|_offset)?|index|bounces|order_u|render_levels|quality|width|height|percentage|fps|offset_u|axis)$/;
 export const isIntKey = (key: string) => INT_KEY.test(key) && !/factor|offset$|size/.test(key);
 
-/** Assign a script value to a document field with type coercion like the reference API. */
+/** Assign a script value to a document field with type coercion. */
 export function assignField(raw: Raw, key: string, value: unknown, typeName = 'struct') {
   const cur = raw[key];
   let v = toPlain(value, cur);
@@ -178,6 +198,8 @@ export function assignField(raw: Raw, key: string, value: unknown, typeName = 's
 
 const HIDDEN = new Set(['id', 'tree', 'custom', 'users', '__proto__']);
 const READONLY = new Set(['type', 'bl_idname']);
+/** Struct types whose `type` field is a plain setting scripts may change (e.g. the multires bake type). */
+export const writableTypeStructs = new Set<string>();
 
 export class Struct {
   readonly __kind: string = 'struct';
@@ -297,6 +319,30 @@ function writeIndex(getRaw: () => Raw | null | undefined, key: string, i: number
   touched();
 }
 
+/**
+ * Switch an object's / pose bone's rotation mode the way the property does in the desktop API:
+ * the current rotation is converted into the new representation (so the pose does not change).
+ */
+export function setRotationMode(raw: Raw, mode: string) {
+  const MODES = ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX', 'QUATERNION', 'AXIS_ANGLE'];
+  if (!MODES.includes(mode)) throw pyError('TypeError', `bpy_struct: item.attr = val: enum "${mode}" not found in (${MODES.map((m) => `'${m}'`).join(', ')})`);
+  const old = String(raw.rotation_mode ?? 'XYZ');
+  if (old === mode) return;
+  const q = rotationQuaternion(old as RotationMode, (raw.rotation_euler ?? [0, 0, 0]) as Vec3, (raw.rotation_quaternion ?? [1, 0, 0, 0]) as Vec4, (raw.rotation_axis_angle ?? [0, 0, 1, 0]) as Vec4);
+  if (mode === 'QUATERNION') raw.rotation_quaternion = [q.w, q.x, q.y, q.z];
+  else if (mode === 'AXIS_ANGLE') {
+    const w = Math.max(-1, Math.min(1, q.w));
+    const angle = 2 * Math.acos(w);
+    const s = Math.sqrt(Math.max(0, 1 - w * w));
+    raw.rotation_axis_angle = s < 1e-8 ? [0, 0, 1, 0] : [angle, q.x / s, q.y / s, q.z / s];
+  } else {
+    const e = new TEuler().setFromQuaternion(q, threeOrder(mode as RotationMode));
+    raw.rotation_euler = compatibleEuler([e.x, e.y, e.z], (raw.rotation_euler ?? [0, 0, 0]) as Vec3);
+  }
+  raw.rotation_mode = mode;
+  touched();
+}
+
 const camel = (k: string) => k.replace(/(^|_)(\w)/g, (_, __, c: string) => c.toUpperCase());
 
 function subtypeFor(key: string): 'EULER' | 'QUATERNION' | 'COLOR' | 'VECTOR' {
@@ -333,6 +379,14 @@ export function boundVector(subtype: 'EULER' | 'QUATERNION' | 'COLOR' | 'VECTOR'
   return v;
 }
 
+/** Properties scripts declared on struct types (typeprops.ts): looked up after the stored fields. */
+export const NOT_DECLARED = Symbol('not declared');
+export const structTypeProps: {
+  get: (t: Struct, key: string) => unknown;
+  set: (t: Struct, key: string, v: unknown) => boolean;
+  has: (t: Struct, key: string) => boolean;
+} = { get: () => NOT_DECLARED, set: () => false, has: () => false };
+
 /** Proxy a struct so raw document fields are readable/writable as properties. */
 export function proxify<T extends Struct>(s: T): T {
   return new Proxy(s, {
@@ -343,7 +397,8 @@ export function proxify<T extends Struct>(s: T): T {
       if (Object.prototype.hasOwnProperty.call(raw, p) && !t.__hidden().has(p)) return wrapField(t, p, () => t.__resolve());
       const ex = t.__extra();
       if (ex && Object.prototype.hasOwnProperty.call(ex, p)) return wrapField(t, p, () => (t.__resolve() ? t.__extra() : null));
-      return undefined;
+      const declared = structTypeProps.get(t, p);
+      return declared === NOT_DECLARED ? undefined : declared;
     },
     set(t, p, v, r) {
       if (typeof p === 'symbol' || p in t) {
@@ -352,7 +407,7 @@ export function proxify<T extends Struct>(s: T): T {
         return true;
       }
       const raw = t.__raw;
-      if (READONLY.has(p)) throw pyError('AttributeError', `bpy_struct: attribute "${p}" from "${t.__type}" is read-only`);
+      if (READONLY.has(p) && !(p === 'type' && writableTypeStructs.has(t.__type))) throw pyError('AttributeError', `bpy_struct: attribute "${p}" from "${t.__type}" is read-only`);
       if (Object.prototype.hasOwnProperty.call(raw, p) && !t.__hidden().has(p)) {
         assignField(raw, p, v, t.__type);
         touched();
@@ -364,19 +419,27 @@ export function proxify<T extends Struct>(s: T): T {
         touched();
         return true;
       }
+      if (structTypeProps.set(t, p, v)) return true;
       throw pyError('AttributeError', `'${t.__type}' object has no attribute '${p}'`);
     },
     has(t, p) {
       if (p in t) return true;
       if (typeof p === 'symbol') return false;
       const raw = t.__resolve();
-      return !!raw && ((Object.prototype.hasOwnProperty.call(raw, p) && !t.__hidden().has(p)) || !!(t.__extra() && p in t.__extra()!));
+      return !!raw && ((Object.prototype.hasOwnProperty.call(raw, p) && !t.__hidden().has(p)) || !!(t.__extra() && p in t.__extra()!) || structTypeProps.has(t, p));
     },
   });
 }
 
 // ---------------------------------------------------------------------------
 // Bound arrays (lists of structs or primitives inside the document)
+
+/**
+ * How to make items for lists reached through the generic wrappers, by path shape (indices and
+ * keys replaced with `[]`, e.g. `bpy.data.masks[].layers[].splines`): enables new() / add() /
+ * remove() / clear() on them.
+ */
+export const arrayFactories: { match: RegExp; make: (args: unknown[], list: unknown[]) => unknown }[] = [];
 
 export class BoundArray {
   readonly __kind = 'array';
@@ -472,6 +535,49 @@ export class BoundArray {
       return def;
     }
   }
+  private factory() {
+    const shape = this.__path.replace(/\[[^\]]*\]/g, '[]');
+    const f = arrayFactories.find((x) => x.match.test(shape));
+    if (!f) throw pyError('TypeError', `${this.__path}: items can't be added or removed from scripts here`);
+    return f;
+  }
+  /** Adds an item (lists the app knows how to fill, e.g. mask layers, splines, selection sets). */
+  new(...args: unknown[]) {
+    const a = this.arr();
+    const item = this.factory().make(args, a);
+    a.push(item);
+    touched();
+    return this.getItem(a.length - 1);
+  }
+  /** Appends `count` default items (points etc.); returns the last one. */
+  add(count: unknown = 1) {
+    const f = this.factory();
+    const a = this.arr();
+    const n = typeof count === 'number' ? Math.max(0, Math.round(count)) : 1;
+    for (let i = 0; i < n; i++) a.push(f.make(typeof count === 'number' ? [] : [count], a));
+    touched();
+    return a.length ? this.getItem(a.length - 1) : null;
+  }
+  remove(item: unknown) {
+    this.factory();
+    const a = this.arr();
+    const raw = item instanceof Struct ? item.__resolve() : typeof item === 'number' ? a[item] : item;
+    const i = a.indexOf(raw as never);
+    if (i < 0) throw pyError('ValueError', `${this.__path}.remove(): item not found`);
+    a.splice(i, 1);
+    touched();
+  }
+  clear() {
+    this.factory();
+    this.arr().length = 0;
+    touched();
+  }
+  move(from: number, to: number) {
+    const a = this.arr();
+    const [x] = a.splice(Number(from), 1);
+    if (x !== undefined) a.splice(Number(to), 0, x);
+    touched();
+  }
   toString() {
     return `<bpy_prop_collection ${this.__path}>`;
   }
@@ -525,10 +631,10 @@ export abstract class PropCollection<T = unknown> {
     if (typeof key === 'string') return this.list().some((x) => this.nameOf(x) === key);
     return this.list().some((x) => same(x, key));
   }
-  find(name: string) {
+  find(name: string, ..._rest: unknown[]): unknown {
     return this.list().findIndex((x) => this.nameOf(x) === name);
   }
-  keys() {
+  keys(): unknown[] {
     return this.list().map((x) => this.nameOf(x));
   }
   values() {
@@ -565,3 +671,48 @@ export function expectId(v: unknown, table: string, what: string): string {
   }
   throw pyError('TypeError', `expected a ${what}, got ${v === null ? 'None' : typeof v === 'object' ? (v as { __type?: string }).__type ?? 'object' : typeof v}`);
 }
+
+// ---------------------------------------------------------------------------
+// extension helpers
+
+/**
+ * Copies the getters, setters and methods of `source` (a class) onto `target` (a class), so
+ * feature files can add members to the wrappers defined in api.ts. Existing members are kept
+ * unless `override` is set.
+ */
+export function mixin(target: { prototype: object }, source: { prototype: object }, override = false) {
+  for (const k of Object.getOwnPropertyNames(source.prototype)) {
+    if (k === 'constructor') continue;
+    if (!override && Object.prototype.hasOwnProperty.call(target.prototype, k)) continue;
+    Object.defineProperty(target.prototype, k, Object.getOwnPropertyDescriptor(source.prototype, k)!);
+  }
+}
+
+/** Steps through a data path (`modifiers["Bevel"].width`, `location[2]`) from a script value. */
+export function resolvePath(root: unknown, path: string): unknown {
+  const tokens = path.match(/[A-Za-z_][A-Za-z0-9_]*|\[\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|-?\d+)\s*\]/g) ?? [];
+  if (tokens.join('').replace(/\s/g, '') !== path.replace(/\./g, '').replace(/\s/g, '')) throw pyError('ValueError', `Path could not be resolved: "${path}"`);
+  let cur: unknown = root;
+  for (const t of tokens) {
+    if (cur === null || cur === undefined) throw pyError('ValueError', `Path could not be resolved: "${path}"`);
+    const o = cur as Record<string, unknown> & { getItem?: (k: unknown) => unknown; get?: (i: number) => unknown };
+    if (t.startsWith('[')) {
+      const inner = t.slice(1, -1).trim();
+      const key: string | number = /^-?\d+$/.test(inner) ? Number(inner) : JSON.parse(inner.startsWith("'") ? `"${inner.slice(1, -1).replace(/"/g, '\\"')}"` : inner);
+      if (typeof o.getItem === 'function') cur = o.getItem(key);
+      else if (typeof key === 'number' && cur instanceof VecBase) cur = cur.get(key < 0 ? cur.size + key : key);
+      else if (Array.isArray(cur) && typeof key === 'number') cur = cur[key < 0 ? cur.length + key : key];
+      else throw pyError('ValueError', `Path could not be resolved: "${path}"`);
+    } else {
+      if (!(t in (o as object))) throw pyError('ValueError', `Path could not be resolved: "${path}" ("${t}" not found)`);
+      cur = o[t];
+    }
+  }
+  return cur;
+}
+
+/** Set by api_anim.ts: animate `key` of a raw record (used by structs built as plain objects, e.g. node sockets). */
+export const structHooks: {
+  keyframe?: (raw: object, key: string, index: number, frame: unknown) => boolean;
+  driver?: (raw: object, key: string, index: number) => unknown;
+} = {};

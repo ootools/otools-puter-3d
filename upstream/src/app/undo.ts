@@ -71,6 +71,36 @@ export class UndoStack {
     return cloneShared(this.steps[i].doc);
   }
 
+  /** A handle on the current step, to return to or merge from later (it survives steps trimmed off the start). */
+  mark(): object | null {
+    return this.steps[this.index] ?? null;
+  }
+
+  /** Whether `mark` is the current step. */
+  isCurrent(mark: object | null) {
+    return !!mark && this.steps[this.index] === mark;
+  }
+
+  /** Make `mark` current again and drop the steps after it; its document, or null when it is gone. */
+  revertTo(mark: object | null): DocumentData | null {
+    const i = this.steps.indexOf(mark as Step);
+    if (i < 0) return null;
+    this.steps.length = i + 1;
+    this.index = i;
+    sealArrays();
+    return cloneShared(this.steps[i].doc);
+  }
+
+  /** Merge the steps after `mark` up to the current one into a single step named `label`. */
+  squash(mark: object | null, label: string): boolean {
+    const i = this.steps.indexOf(mark as Step);
+    if (i < 0 || i >= this.index) return false;
+    const top = this.steps[this.index];
+    this.steps.splice(i + 1, this.index - i, { label, doc: top.doc });
+    this.index = i + 1;
+    return true;
+  }
+
   get history() {
     return this.steps.map((s, i) => ({ label: s.label, active: i === this.index }));
   }

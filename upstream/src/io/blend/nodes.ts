@@ -1,16 +1,25 @@
 // Node tree conversion (material / world / group trees) into NodeTreeData.
-// Node types keep the reference idnames; inputs are keyed by socket identifier.
+// Node types keep the idnames stored in the file; inputs are keyed by socket identifier.
+import { TEX_MAPPING_NODES, setTexMapping, texMapping, isIdentityMapping } from '../../nodes/texmapping';
 import type { NodeData, NodeTreeData, SocketValue, LinkData } from '../../data/types';
 import { uid } from '../../data/defaults';
 import type { BStruct } from './reader';
 import type { Ctx } from './context';
 import { NODE_PROP_RULES } from './nodeprops.gen';
+import { GEO_NODE_PROP_RULES } from './nodeprops_geo.gen';
+import { newZonePending, readZoneNode, finishZones } from './zones';
 
 const NODE_HIDDEN = 8;
 const NODE_DO_OUTPUT = 64;
 const NODE_MUTED = 512;
 
 function readField(node: BStruct, path: string): number | null {
+  if (path.startsWith('socket.')) {
+    // value of a menu socket
+    const sock = node.list('inputs', 1000).find((s) => s.str('identifier') === path.slice(7));
+    const dv = sock?.ref('default_value');
+    return dv && dv.has('value') ? dv.num('value') : null;
+  }
   if (path.startsWith('storage.')) {
     let s: BStruct | null = node.ref('storage');
     const parts = path.slice(8).split('.');
@@ -75,8 +84,8 @@ function curveMapping(cm: BStruct, kind: 'RGB' | 'VECTOR' | 'FLOAT', props: Reco
   const n = kind === 'RGB' ? 4 : kind === 'VECTOR' ? 3 : 1;
   props.curve_kind = kind;
   props.curve_active = 0;
-  // flag bit 1<<? for extrapolation is not relied upon: default horizontal
-  props.curve_extend = 'HORIZONTAL';
+  // flag bit 16: extend by extrapolating the end tangents
+  props.curve_extend = cm.num('flag') & 16 ? 'EXTRAPOLATED' : 'HORIZONTAL';
   for (let i = 0; i < n; i++) {
     // RGB curves store C in slot 3 and R,G,B in 0..2
     const map = cm.sub('cm', kind === 'RGB' ? (i === 0 ? 3 : i - 1) : i);
@@ -103,6 +112,7 @@ export function convertNodeTree(nt: BStruct, type: NodeTreeData['type'], ctx: Ct
   const byOffset = new Map<number, NodeData>();
   const parents: [NodeData, BStruct][] = [];
   const unknownStorage: string[] = [];
+  const zones = newZonePending();
   for (const n of nt.list('nodes', 100_000)) {
     const idname = n.str('idname');
     const flag = n.num('flag');
@@ -132,7 +142,7 @@ export function convertNodeTree(nt: BStruct, type: NodeTreeData['type'], ctx: Ct
         if (v !== undefined) node.props[`outputs.${s.str('identifier')}`] = v;
       }
     }
-    const rules = NODE_PROP_RULES[idname];
+    const rules = NODE_PROP_RULES[idname] ?? GEO_NODE_PROP_RULES[idname];
     if (rules) {
       for (const [prop, r] of Object.entries(rules)) {
         const raw = readField(n, r.f);
@@ -155,11 +165,27 @@ export function convertNodeTree(nt: BStruct, type: NodeTreeData['type'], ctx: Ct
     } else if (idname === 'ShaderNodeGroup' || idname === 'GeometryNodeGroup') {
       node.props.node_tree = id ? convertGroup(id, type, ctx, groupStack) : null;
     }
+    readZoneNode(n, node, zones);
     if (storage) {
       // string settings stored by name (attribute / UV map / color layer names)
       if (idname === 'ShaderNodeAttribute' && storage.has('name')) node.props.attribute_name = storage.str('name');
       for (const k of ['uv_map', 'layer_name']) if (storage.has(k)) node.props[k] = storage.str(k);
-    } else if (!rules && n.ptr('storage') !== 0) unknownStorage.push(idname);
+      // texture nodes: the coordinate mapping stored with the texture settings
+      const tm = TEX_MAPPING_NODES.has(idname) ? storage.sub('base')?.sub('tex_mapping') : null;
+      if (tm) {
+        const axes = ['NONE', 'X', 'Y', 'Z'] as const;
+        setTexMapping(node, {
+          vector_type: (['POINT', 'TEXTURE', 'VECTOR', 'NORMAL'] as const)[tm.num('type')] ?? 'POINT',
+          translation: tm.nums('loc', 3) as [number, number, number],
+          rotation: tm.nums('rot', 3) as [number, number, number],
+          scale: tm.nums('size', 3) as [number, number, number],
+          mapping_x: axes[tm.num('projx')] ?? 'X',
+          mapping_y: axes[tm.num('projy')] ?? 'Y',
+          mapping_z: axes[tm.num('projz')] ?? 'Z',
+        });
+        if (isIdentityMapping(texMapping(node))) for (const k of Object.keys(node.props)) if (k.startsWith('tm_')) delete node.props[k];
+      }
+    } else if (!rules && n.ptr('storage') !== 0 && !idname.match(/^GeometryNode(Repeat|Simulation|ForeachGeometryElement)(Input|Output)$|^GeometryNode(Bake|CaptureAttribute)$/)) unknownStorage.push(idname);
     tree.nodes.push(node);
     byOffset.set(n.offset, node);
     const parent = n.ref('parent');
@@ -181,6 +207,7 @@ export function convertNodeTree(nt: BStruct, type: NodeTreeData['type'], ctx: Ct
     if (l.num('flag') & 16) link.is_muted = true;
     tree.links.push(link);
   }
+  finishZones(tree, zones);
   if (unknownStorage.length) ctx.warn.add('Node settings not read', [...new Set(unknownStorage)].join(', '));
   return tree;
 }
@@ -189,8 +216,13 @@ function socketTypeFromIdname(idname: string) {
   return idname || 'NodeSocketFloat';
 }
 
+/** A node group used outside node trees (geometry nodes modifiers); returns its id. */
+export function convertGroupTree(gt: BStruct, type: NodeTreeData['type'], ctx: Ctx): string | null {
+  return convertGroup(gt, type, ctx, new Set());
+}
+
 /** Node groups become NodeGroupData; returns its id. */
-function convertGroup(gt: BStruct, parentType: NodeTreeData['type'], ctx: Ctx, stack: Set<number>): string | null {
+export function convertGroup(gt: BStruct, parentType: NodeTreeData['type'], ctx: Ctx, stack: Set<number>): string | null {
   const done = ctx.ids.get(gt.offset);
   if (done) return done;
   if (stack.has(gt.offset)) {
@@ -200,7 +232,7 @@ function convertGroup(gt: BStruct, parentType: NodeTreeData['type'], ctx: Ctx, s
   stack.add(gt.offset);
   const tree = convertNodeTree(gt, parentType === 'WORLD' ? 'SHADER' : parentType, ctx, stack);
   stack.delete(gt.offset);
-  // interface from the group input/output nodes' sockets (stable across Blender versions)
+  // interface from the group input/output nodes' sockets (stable across file versions)
   const iface: NonNullable<NodeTreeData['interface']> = [];
   for (const n of gt.list('nodes', 100_000)) {
     const idn = n.str('idname');

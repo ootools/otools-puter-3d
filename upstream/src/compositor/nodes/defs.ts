@@ -3,6 +3,23 @@
 // the compositor (Math, Map Range, Mix, Color Ramp, …) get the COMPOSITOR tree type added.
 import type { NodeData } from '../../data/types';
 import { app } from '../../app/app';
+import type { DocumentData, RenderSettings } from '../../data/types';
+import { openMenu, type MenuItem } from '../../ui/menu';
+import { sceneById, scenesByName } from '../../scenes/scenes';
+import { ensureViewLayers, layerRender } from '../../scenes/viewlayers';
+
+/** View layer settings of the scene / layer a Render Layers node reads (its passes decide the outputs). */
+function rlLayer(n: NodeData, doc: DocumentData = app.doc) {
+  const props = n.props ?? {};
+  const sc = sceneById(doc, String(props.scene ?? '')) ?? doc.scene;
+  const layers = ensureViewLayers(sc);
+  const i = props.layer ? layers.findIndex((l) => l.name === props.layer) : (sc.active_view_layer ?? 0);
+  return { sc, index: i < 0 ? (sc.active_view_layer ?? 0) : i, layer: layers[i < 0 ? (sc.active_view_layer ?? 0) : i] };
+}
+function rlRender(n: NodeData, doc: DocumentData = app.doc): Partial<RenderSettings> {
+  const { sc, index } = rlLayer(n, doc);
+  return layerRender(sc, index);
+}
 import { h } from '../../ui/h';
 import { icon } from '../../ui/icons';
 import { getNodeType, propValue, registerNodeMenu, registerNodeType } from '../../nodes/registry';
@@ -258,18 +275,76 @@ function availability(d: NodeTypeDef, rules: Record<string, (n: NodeData) => boo
   const d = cdef('CompositorNodeRLayers', 'input', {
     description: 'Input render passes of the scene',
   });
-  // scene / view layer (one of each here) and a button rendering the scene
+  // scene and view layer to read (empty: the active scene / its active layer), a button rendering the scene
+  d.props = [
+    { id: 'scene', name: 'Scene', type: 'STRING', d: '', visible: () => false },
+    { id: 'layer', name: 'Layer', type: 'STRING', d: '', visible: () => false },
+  ];
   d.bodyHeight = () => 48;
-  d.drawBody = () =>
-    h(
+  d.drawBody = (ctx) => {
+    const n = ctx.node;
+    const doc = app.doc;
+    const sc = sceneById(doc, String(n.props.scene ?? '')) ?? doc.scene;
+    const layers = ensureViewLayers(sc);
+    const layerName = String(n.props.layer ?? '') || layers[sc.active_view_layer ?? 0]?.name || 'ViewLayer';
+    const pick = (e: PointerEvent, items: MenuItem[]) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openMenu(items, e.currentTarget as HTMLElement);
+    };
+    return h(
       'div',
       { class: 'cmp-rl-body' },
-      h('div', { class: 'cmp-rl-row' }, icon('scene_data'), h('span', null, app.doc.scene.name)),
+      h(
+        'div',
+        {
+          class: 'cmp-rl-row cmp-rl-pick cmp-rl-scene',
+          'data-tip': 'Scene\nScene whose render passes the node outputs',
+          onpointerdown: (e: PointerEvent) =>
+            pick(
+              e,
+              scenesByName(doc).map((s) => ({
+                label: s.name,
+                icon: 'scene_data',
+                active: s === sc,
+                action: () => {
+                  n.props.scene = s === doc.scene ? '' : s.id!;
+                  n.props.layer = '';
+                  ctx.changed('Render Layers Scene', true);
+                },
+              })),
+            ),
+        },
+        icon('scene_data'),
+        h('span', null, sc.name),
+        icon('down_arrow_hlt', 'tiny'),
+      ),
       h(
         'div',
         { class: 'cmp-rl-row' },
-        icon('view_layer'),
-        h('span', null, 'ViewLayer'),
+        h(
+          'div',
+          {
+            class: 'cmp-rl-pick cmp-rl-layer',
+            'data-tip': 'View Layer\nView layer whose render passes the node outputs',
+            onpointerdown: (e: PointerEvent) =>
+              pick(
+                e,
+                layers.map((l) => ({
+                  label: l.name,
+                  icon: 'view_layer',
+                  active: l.name === layerName,
+                  action: () => {
+                    n.props.layer = l.name;
+                    ctx.changed('Render Layers Layer', true);
+                  },
+                })),
+              ),
+          },
+          icon('view_layer'),
+          h('span', null, layerName),
+          icon('down_arrow_hlt', 'tiny'),
+        ),
         h(
           'button',
           {
@@ -281,22 +356,62 @@ function availability(d: NodeTypeDef, rules: Record<string, (n: NodeData) => boo
         ),
       ),
     );
-  // all supported passes; availability follows the View Layer ▸ Passes settings
+  };
   d.outputs = [
     { name: 'Image', identifier: 'Image', type: 'RGBA' },
     { name: 'Alpha', identifier: 'Alpha', type: 'FLOAT' },
     { name: 'Depth', identifier: 'Depth', type: 'FLOAT' },
     { name: 'Normal', identifier: 'Normal', type: 'VECTOR' },
     { name: 'Mist', identifier: 'Mist', type: 'FLOAT' },
+    { name: 'AO', identifier: 'AO', type: 'FLOAT' },
   ];
-  d.available = (_n, s, out) => {
+  d.available = (n, s, out) => {
     if (!out) return true;
-    const r = app?.doc?.scene.render;
+    const r = app?.doc ? rlRender(n) : null;
     if (!r) return true;
     if (s.identifier === 'Depth') return !!r.use_pass_z;
     if (s.identifier === 'Normal') return !!r.use_pass_normal;
     if (s.identifier === 'Mist') return !!r.use_pass_mist;
+    if (s.identifier === 'IndexOB') return !!r.use_pass_object_index;
+    if (s.identifier === 'Vector') return !!r.use_pass_vector;
+    if (s.identifier === 'IndexMA') return !!r.use_pass_material_index;
+    if (s.identifier === 'Position') return !!r.use_pass_position;
+    if (s.identifier === 'UV') return !!r.use_pass_uv;
+    if (s.identifier === 'DiffCol') return !!r.use_pass_diffuse_color;
+    if (s.identifier === 'Emit') return !!r.use_pass_emit;
+    if (s.identifier === 'AO') return !!r.use_pass_ambient_occlusion;
     return true;
+  };
+  d.outputs.push(
+    { name: 'Position', identifier: 'Position', type: 'VECTOR' },
+    { name: 'Vector', identifier: 'Vector', type: 'VECTOR', dimensions: 4 },
+    { name: 'UV', identifier: 'UV', type: 'VECTOR' },
+    { name: 'DiffCol', identifier: 'DiffCol', type: 'RGBA' },
+    { name: 'Emit', identifier: 'Emit', type: 'RGBA' },
+    { name: 'IndexOB', identifier: 'IndexOB', type: 'FLOAT' },
+    { name: 'IndexMA', identifier: 'IndexMA', type: 'FLOAT' },
+  );
+  // shader AOVs and cryptomatte layers follow the View Layer settings
+  d.dynamicSockets = (n, ctx) => {
+    const r = rlRender(n, ctx.doc);
+    const outputs = [...d.outputs];
+    for (const a of r.aovs ?? []) if (a.name) outputs.push({ name: a.name, identifier: `AOV ${a.name}`, type: a.type === 'VALUE' ? 'FLOAT' : 'RGBA' });
+    // light groups: the image lit by each group
+    for (const g of rlLayer(n, ctx.doc).layer?.lightgroups ?? []) if (g.name) outputs.push({ name: `Combined_${g.name}`, identifier: `Combined_${g.name}`, type: 'RGBA' });
+    // lines drawn as their own pass (View Layer ▸ Freestyle ▸ As Render Pass)
+    if (r.use_freestyle && r.freestyle_settings?.as_render_pass) outputs.push({ name: 'Freestyle', identifier: 'Freestyle', type: 'RGBA' });
+    // light passes of View Layer ▸ Passes ▸ Light (render/final/extrapasses.ts)
+    if (r.use_pass_transmission_color) outputs.push({ name: 'TransCol', identifier: 'TransCol', type: 'RGBA' });
+    if (r.use_pass_environment) outputs.push({ name: 'Env', identifier: 'Env', type: 'RGBA' });
+    const depth = Math.max(2, Math.min(16, Math.round(r.pass_cryptomatte_depth ?? 6)));
+    for (const [layer, on] of [
+      ['CryptoObject', r.use_pass_cryptomatte_object],
+      ['CryptoMaterial', r.use_pass_cryptomatte_material],
+      ['CryptoAsset', r.use_pass_cryptomatte_asset],
+    ] as const)
+      if (on) for (let i = 0; i < Math.ceil(depth / 2); i++) outputs.push({ name: `${layer}${String(i).padStart(2, '0')}`, identifier: `${layer}${String(i).padStart(2, '0')}`, type: 'RGBA' });
+    void n;
+    return { inputs: d.inputs, outputs };
   };
 }
 {
@@ -771,6 +886,21 @@ const SHARED = [
   'ShaderNodeVectorMath',
   'ShaderNodeVectorCurve',
   'ShaderNodeVectorRotate',
+  'ShaderNodeRadialTiling',
+  'ShaderNodeTexBrick',
+  'ShaderNodeTexChecker',
+  'ShaderNodeTexGabor',
+  'ShaderNodeTexGradient',
+  'ShaderNodeTexMagic',
+  'ShaderNodeTexNoise',
+  'ShaderNodeTexVoronoi',
+  'ShaderNodeTexWave',
+  'ShaderNodeTexWhiteNoise',
+  'FunctionNodeInputBool',
+  'FunctionNodeInputInt',
+  'FunctionNodeInputVector',
+  'FunctionNodeInputRotation',
+  'FunctionNodeInputString',
 ];
 
 /** Add the compositor tree type to node types defined elsewhere (idempotent, re-run after late registrations). */
@@ -790,7 +920,7 @@ setTimeout(shareNodeTypes, 0);
 makeGroupNodeType('CompositorNodeGroup', CMP);
 groupNodeIdnames.COMPOSITOR = 'CompositorNodeGroup';
 
-// ramps of new compositor Color Ramp nodes start like the reference (black → white)
+// ramps of new compositor Color Ramp nodes start black → white
 void defaultRamp;
 
 // ---------------------------------------------------------------------------
@@ -808,24 +938,41 @@ export const COMPOSITOR_MENU: MenuCategory[] = [
     items: [
       {
         label: 'Constant',
-        items: [e('CompositorNodeRGB'), e('ShaderNodeValue')],
+        items: [
+          e('FunctionNodeInputBool'),
+          e('CompositorNodeRGB'),
+          e('FunctionNodeInputInt'),
+          e('CompositorNodeNormal'),
+          e('FunctionNodeInputRotation'),
+          e('FunctionNodeInputString'),
+          e('ShaderNodeValue'),
+          e('FunctionNodeInputVector'),
+        ],
       },
+      'SEPARATOR',
+      e('CompositorNodeBlankImage'),
+      e('CompositorNodeBokehImage'),
+      e('NodeGroupInput', 'Group Input'),
+      e('CompositorNodeImage'),
+      e('CompositorNodeImageInfo'),
+      e('CompositorNodeImageCoordinates'),
+      e('CompositorNodeMask'),
+      e('CompositorNodeMovieClip'),
+      e('CompositorNodeStringToImage'),
+      'SEPARATOR',
       {
         label: 'Scene',
         items: [e('CompositorNodeRLayers'), e('CompositorNodeSceneTime'), e('CompositorNodeTime')],
       },
-      'SEPARATOR',
-      e('CompositorNodeBokehImage'),
-      e('CompositorNodeImage'),
     ],
   },
   {
     label: 'Output',
-    items: [e('NodeGroupOutput', 'Group Output'), e('CompositorNodeViewer')],
+    items: [e('CompositorNodeOutputFile'), e('NodeGroupOutput', 'Group Output'), e('CompositorNodeViewer')],
   },
-  'SEPARATOR' as never,
   {
     label: 'Color',
+    separatorBefore: true,
     items: [
       {
         label: 'Adjust',
@@ -835,14 +982,11 @@ export const COMPOSITOR_MENU: MenuCategory[] = [
           e('CompositorNodeColorCorrection'),
           e('CompositorNodeExposure'),
           e('ShaderNodeGamma'),
+          e('CompositorNodeHueCorrect'),
           e('CompositorNodeHueSat'),
           e('CompositorNodeCurveRGB'),
           e('CompositorNodeTonemap'),
         ],
-      },
-      {
-        label: 'Mix',
-        items: [e('ShaderNodeMix', 'Mix Color', { data_type: 'RGBA' })],
       },
       'SEPARATOR',
       e('CompositorNodePremulKey'),
@@ -853,9 +997,12 @@ export const COMPOSITOR_MENU: MenuCategory[] = [
       e('CompositorNodeSeparateColor'),
       'SEPARATOR',
       e('CompositorNodeZcombine'),
+      e('ShaderNodeMix', 'Mix Color', { data_type: 'RGBA' }),
       'SEPARATOR',
       e('ShaderNodeBlackbody'),
       e('ShaderNodeValToRGB'),
+      e('CompositorNodeConvertColorSpace'),
+      e('CompositorNodeConvertToDisplay'),
       'SEPARATOR',
       e('CompositorNodeInvert'),
       e('CompositorNodeRGBToBW'),
@@ -870,14 +1017,17 @@ export const COMPOSITOR_MENU: MenuCategory[] = [
     items: [
       {
         label: 'Blur',
-        items: [e('CompositorNodeBilateralblur'), e('CompositorNodeBlur'), e('CompositorNodeBokehBlur'), e('CompositorNodeDefocus'), e('CompositorNodeDBlur')],
+        items: [e('CompositorNodeBilateralblur'), e('CompositorNodeBlur'), e('CompositorNodeBokehBlur'), e('CompositorNodeDefocus'), e('CompositorNodeDBlur'), e('CompositorNodeVecBlur')],
       },
       'SEPARATOR',
       e('CompositorNodeAntiAliasing'),
+      e('CompositorNodeConvolve'),
       e('CompositorNodeDenoise'),
       e('CompositorNodeDespeckle'),
       'SEPARATOR',
       e('CompositorNodeDilateErode'),
+      e('CompositorNodeMaskToSDF'),
+      e('CompositorNodeInpaint'),
       'SEPARATOR',
       e('CompositorNodeFilter'),
       e('CompositorNodeGlare'),
@@ -885,6 +1035,7 @@ export const COMPOSITOR_MENU: MenuCategory[] = [
   },
   {
     label: 'Keying',
+    separatorBefore: true,
     items: [
       e('CompositorNodeChannelMatte'),
       e('CompositorNodeChromaMatte'),
@@ -892,12 +1043,43 @@ export const COMPOSITOR_MENU: MenuCategory[] = [
       e('CompositorNodeColorSpill'),
       e('CompositorNodeDiffMatte'),
       e('CompositorNodeDistanceMatte'),
+      e('CompositorNodeKeying'),
+      e('CompositorNodeKeyingScreen'),
       e('CompositorNodeLumaMatte'),
     ],
   },
   {
     label: 'Mask',
-    items: [e('CompositorNodeBoxMask'), e('CompositorNodeEllipseMask')],
+    items: [
+      e('CompositorNodeCryptomatteV2'),
+      e('CompositorNodeCryptomatte'),
+      'SEPARATOR',
+      e('CompositorNodeBoxMask'),
+      e('CompositorNodeEllipseMask'),
+      'SEPARATOR',
+      e('CompositorNodeDoubleEdgeMask'),
+      e('CompositorNodeIDMask'),
+    ],
+  },
+  {
+    label: 'Tracking',
+    separatorBefore: true,
+    items: [e('CompositorNodeStabilize'), e('CompositorNodeTrackPos')],
+  },
+  {
+    label: 'Texture',
+    separatorBefore: true,
+    items: [
+      e('ShaderNodeTexBrick'),
+      e('ShaderNodeTexChecker'),
+      e('ShaderNodeTexGabor'),
+      e('ShaderNodeTexGradient'),
+      e('ShaderNodeTexMagic'),
+      e('ShaderNodeTexNoise'),
+      e('ShaderNodeTexVoronoi'),
+      e('ShaderNodeTexWave'),
+      e('ShaderNodeTexWhiteNoise'),
+    ],
   },
   {
     label: 'Transform',
@@ -915,6 +1097,7 @@ export const COMPOSITOR_MENU: MenuCategory[] = [
       e('CompositorNodeMapUV'),
       'SEPARATOR',
       e('CompositorNodeLensdist'),
+      e('CompositorNodeMovieDistortion'),
     ],
   },
   {
@@ -932,6 +1115,7 @@ export const COMPOSITOR_MENU: MenuCategory[] = [
           e('ShaderNodeMix', 'Mix Vector', { data_type: 'VECTOR' }),
           e('ShaderNodeSeparateXYZ'),
           'SEPARATOR',
+          e('ShaderNodeRadialTiling'),
           e('ShaderNodeVectorCurve'),
           e('ShaderNodeVectorMath'),
           e('ShaderNodeVectorRotate'),
@@ -943,13 +1127,23 @@ export const COMPOSITOR_MENU: MenuCategory[] = [
       'SEPARATOR',
       e('CompositorNodeSplit'),
       e('GeometryNodeSwitch'),
+      e('CompositorNodeSwitchView', 'Switch Stereo View'),
       'SEPARATOR',
       e('CompositorNodeRelativeToPixel'),
     ],
   },
 ];
 
-registerNodeMenu(
-  ['COMPOSITOR'],
-  COMPOSITOR_MENU.filter((c) => (c as unknown) !== 'SEPARATOR'),
-);
+/** Add-menu poll: entries whose node type exists and runs in the compositor. */
+export function compositorEntryPoll(idname: string): boolean {
+  const d = getNodeType(idname);
+  if (!d || !d.treeTypes.includes('COMPOSITOR')) return false;
+  return !compositorEntryCheck || compositorEntryCheck(idname);
+}
+let compositorEntryCheck: ((idname: string) => boolean) | null = null;
+/** Set by the evaluator module: whether a node type has an implementation. */
+export function setCompositorEntryCheck(f: (idname: string) => boolean) {
+  compositorEntryCheck = f;
+}
+
+registerNodeMenu(['COMPOSITOR'], COMPOSITOR_MENU);

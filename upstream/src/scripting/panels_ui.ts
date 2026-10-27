@@ -1,12 +1,13 @@
 // Draws script-registered panels (bpy.types.Panel subclasses) into the 3D viewport sidebar.
 // Categories become sidebar tabs; panels for an existing tab (Item / Tool / View) are
 // appended to it.
+import { openScriptMenu, scriptMenus } from './menus';
 import { h, type Child } from '../ui/h';
 import { icon, iconNames } from '../ui/icons';
 import { app, operators } from '../app/app';
 import { numberField, checkbox, textField, colorSwatch, panel } from '../ui/widgets';
 import { sidebarTabs } from '../editors/view3d/sidebar';
-import { scriptPanels, panelListeners, UILayout, type LayoutItem, type ScriptPanelSpec } from './registry';
+import { scriptPanels, panelListeners, panelVisibility, UILayout, type LayoutItem, type ScriptPanelSpec } from './registry';
 import { VecBase, Color, Euler } from './mathutils';
 import { isIntKey, isIdWrapper } from './rna';
 import { output } from './runner';
@@ -21,7 +22,7 @@ const pretty = (s: string) => s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toU
 
 function panelsFor(category: string): ScriptPanelSpec[] {
   return [...scriptPanels.values()]
-    .filter((p) => p.category === category)
+    .filter((p) => p.category === category && panelVisibility.test(p.idname))
     .filter((p) => {
       try {
         return !p.poll || p.poll();
@@ -79,6 +80,16 @@ function renderItem(it: LayoutItem, pid: string, key: string, parent: UILayout):
         },
         it.icon && iconNames.includes(it.icon.toLowerCase()) ? icon(it.icon.toLowerCase()) : null,
         label,
+      );
+    }
+    case 'menu': {
+      const m = scriptMenus.get(it.idname);
+      return h(
+        'button',
+        { key, class: 'btn sp-op', disabled: !m || disabled, 'data-tip': m ? `Open the "${m.label}" menu` : `Unknown menu: ${it.idname}`, onclick: (e: MouseEvent) => openScriptMenu(it.idname, e.currentTarget as HTMLElement) },
+        it.icon && iconNames.includes(it.icon.toLowerCase()) ? icon(it.icon.toLowerCase()) : null,
+        it.text ?? m?.label ?? it.idname,
+        icon('down_arrow_hlt'),
       );
     }
     case 'layout': {

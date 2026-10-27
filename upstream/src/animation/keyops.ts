@@ -5,7 +5,8 @@ import { addKeys, type KeyItem } from '../app/keymap';
 import { openMenu, type MenuItem } from '../ui/menu';
 import type { Interpolation, KeyHandleType, Keyframe } from '../data/types';
 import { AnimEditor, overChannels, overMain, hoverEditor } from './animeditor';
-import { channelState, channelSelected, setChannelSelected, groupKey, setExpanded, isExpanded, shapeKeyPath, type CurveRef } from './channels';
+import { removeSlot } from '../anim/slots';
+import { channelState, channelSelected, setChannelSelected, curveGroupKey, setExpanded, isExpanded, shapeKeyPath, type CurveRef } from './channels';
 import { keyProperty } from '../anim/keyframes';
 import { getValue } from '../data/rna';
 import * as K from './keyedit';
@@ -25,6 +26,7 @@ import {
   type Prefix,
 } from './menus';
 import { KEY_TYPES } from './footer';
+import { boxRegionSelect } from './selecttools';
 import type { EditorTypeId } from '../ui/screen';
 
 /** Interface implemented by the Dope Sheet and the Graph Editor. */
@@ -37,6 +39,8 @@ export interface KeyEditor extends AnimEditor {
   activeCurve?(): CurveRef | null;
   toDispValue?(r: CurveRef, v: number): number;
   fromDispValue?(r: CurveRef, d: number): number;
+  /** editors whose x axis isn't time insert keys themselves (returns true when handled) */
+  insertKeys?(curves: CurveRef[], type: Keyframe['type']): boolean;
 }
 
 function keyEditor(ctx: OpContext, p: Prefix): KeyEditor | null {
@@ -80,22 +84,47 @@ function keyOps(p: Prefix): Operator[] {
       idname: `${p}.select_box`,
       label: 'Box Select',
       description: 'Select all keyframes within the specified region',
+      props: [
+        { id: 'axis_range', label: 'Axis Range', type: 'bool', default: false },
+        ...(p === 'graph' ? [{ id: 'include_handles', label: 'Include Handles', type: 'bool' as const, default: true }] : []),
+        {
+          id: 'mode',
+          label: 'Mode',
+          type: 'enum',
+          default: 'SET',
+          items: [
+            ['SET', 'Set'],
+            ['ADD', 'Extend'],
+            ['SUB', 'Subtract'],
+          ],
+        },
+        { id: 'xmin', label: 'X Min', type: 'int', default: 0, hidden: true },
+        { id: 'xmax', label: 'X Max', type: 'int', default: 0, hidden: true },
+        { id: 'ymin', label: 'Y Min', type: 'int', default: 0, hidden: true },
+        { id: 'ymax', label: 'Y Max', type: 'int', default: 0, hidden: true },
+      ],
       poll,
-      undo: false,
-      invoke: (ctx) => {
+      invoke: (ctx, pr) => {
         const e = ed(ctx);
         app.startModal({
           label: 'Box Select',
           cursor: 'crosshair',
-          header: () => 'Box Select: drag to select (Shift/Ctrl to deselect)',
+          header: () => (pr.axis_range ? 'Box Select (Axis Range)' : 'Box Select') + ': drag to select (Shift extends, Ctrl deselects)',
           onPointerDown: (ev) => {
-            if (ev.button === 0) e.boxGesture(ev, (r, mode) => e.boxSelect(r, mode === 'SET' ? 'ADD' : 'SUB'));
+            if (ev.button === 0)
+              e.boxGesture(ev, (r, mode) => {
+                const m = mode === 'SET' ? (pr.mode as string) : mode;
+                app.run(`${p}.select_box`, { ...pr, mode: m, xmin: Math.round(r.x0), xmax: Math.round(r.x1), ymin: Math.round(r.y0), ymax: Math.round(r.y1) }, { area: e.area, invoke: false });
+              });
             return 'CANCELLED';
           },
           onKey: (ev) => (ev.key === 'Escape' ? 'CANCELLED' : true),
           cancel: () => {},
         });
         return 'RUNNING_MODAL';
+      },
+      exec: (ctx, pr) => {
+        boxRegionSelect(ed(ctx), { x0: pr.xmin as number, x1: pr.xmax as number, y0: pr.ymin as number, y1: pr.ymax as number }, pr.mode as 'SET', !!pr.axis_range, pr.include_handles !== false);
       },
     },
     {
@@ -489,7 +518,7 @@ function keyOps(p: Prefix): Operator[] {
         }
         let c = curves(ctx);
         if (type === 'SEL' || type === 'CURSOR_SEL') c = c.filter((r) => r.fc.select);
-        else if (type === 'GROUP') c = c.filter((r) => r.fc.group && channelState.selectedGroups.has(groupKey(r.action, r.fc.group)));
+        else if (type === 'GROUP') c = c.filter((r) => r.fc.group && channelState.selectedGroups.has(curveGroupKey(r.action, r.fc)));
         else if (type === 'ACTIVE' || type === 'CURSOR_ACTIVE') {
           const a = e.activeCurve?.();
           c = a ? [a] : [];
@@ -500,6 +529,7 @@ function keyOps(p: Prefix): Operator[] {
         }
         const frame = ctx.doc.scene.frame_current;
         const kt = ctx.doc.scene.tool_settings.keyframe_type;
+        if (e.insertKeys?.(c, kt)) return;
         K.insertKeysAt(c, frame, kt, (r) => {
           const v = getValue(ctx.doc, r.ob, r.fc.data_path, r.fc.array_index);
           return typeof v === 'number' ? v : typeof v === 'boolean' ? +v : undefined;
@@ -619,6 +649,7 @@ function keyOps(p: Prefix): Operator[] {
                   ['TIME_TRANSLATE', 'Time Translate'],
                   ['TIME_EXTEND', 'Time Extend'],
                   ['TIME_SCALE', 'Time Scale'],
+                  ['TIME_SLIDE', 'Time Slide'],
                 ]
               : [
                   ['TRANSLATION', 'Translate'],
@@ -682,7 +713,7 @@ function animEd(ctx: OpContext): AnimEditor | null {
 
 /** F-Curves of selected channels (selected curves and curves in selected groups). */
 export function selectedChannelCurves(ed: AnimEditor): CurveRef[] {
-  return ed.list.curves.filter((r) => r.fc.select || (r.fc.group && channelState.selectedGroups.has(groupKey(r.action, r.fc.group))));
+  return ed.list.curves.filter((r) => r.fc.select || (r.fc.group && channelState.selectedGroups.has(curveGroupKey(r.action, r.fc))));
 }
 
 const settingProp: PropDef = {
@@ -769,6 +800,11 @@ const channelOps: Operator[] = [
         }
         if (ch.kind === 'NLA_TRACK' && ch.track?.select && ch.ob?.animation_data) {
           ch.ob.animation_data.nla_tracks = ch.ob.animation_data.nla_tracks.filter((t) => t !== ch.track);
+          n++;
+        }
+        // a selected slot row removes the slot with its animation
+        if (ch.kind === 'SLOT' && ch.slot?.select && ch.action?.slots?.includes(ch.slot)) {
+          removeSlot(ctx.doc, ch.action, ch.slot);
           n++;
         }
       }
@@ -1025,30 +1061,24 @@ addKeys('Animation Channels', [
   },
 ]);
 
+const overMarkers = () => hoverEditor()?.hover === 'markers';
 addKeys('Animation', [
   { key: 'P', alt: true, op: 'anim.previewrange_clear' },
-  { key: 'M', op: 'screen.marker_add' },
-  {
-    key: 'F2',
-    op: 'marker.rename',
-    when: () => hoverEditor()?.hover === 'markers',
-  },
-  {
-    key: 'G',
-    op: 'marker.move',
-    when: () => hoverEditor()?.hover === 'markers',
-  },
-  {
-    key: 'D',
-    shift: true,
-    op: 'marker.duplicate',
-    when: () => hoverEditor()?.hover === 'markers',
-  },
-  {
-    key: 'X',
-    op: 'screen.marker_delete',
-    when: () => hoverEditor()?.hover === 'markers',
-  },
+  { key: 'M', op: 'marker.add' },
+  { key: 'B', ctrl: true, op: 'marker.camera_bind' },
+]);
+addKeys('Markers', [
+  { key: 'F2', op: 'marker.rename', when: overMarkers },
+  { key: 'G', op: 'marker.move', when: overMarkers },
+  { key: 'D', shift: true, op: 'marker.duplicate', when: overMarkers },
+  { key: 'X', op: 'marker.delete', when: overMarkers },
+  { key: 'DEL', op: 'marker.delete', props: { confirm: false }, when: overMarkers },
+  { key: 'A', op: 'marker.select_all', props: { action: 'SELECT' }, when: overMarkers },
+  { key: 'A', alt: true, op: 'marker.select_all', props: { action: 'DESELECT' }, when: overMarkers },
+  { key: 'I', ctrl: true, op: 'marker.select_all', props: { action: 'INVERT' }, when: overMarkers },
+  { key: 'B', op: 'marker.select_box', when: overMarkers },
+  { key: 'LEFT_BRACKET', op: 'marker.select_leftright', props: { mode: 'LEFT' }, when: overMarkers },
+  { key: 'RIGHT_BRACKET', op: 'marker.select_leftright', props: { mode: 'RIGHT' }, when: overMarkers },
 ]);
 
 function keyEditorKeys(p: Prefix, name: string) {
@@ -1180,6 +1210,7 @@ function keyEditorKeys(p: Prefix, name: string) {
         menu: () => keyTypeMenu('action'),
         menuTitle: 'Set Keyframe Type',
       },
+      { key: 'N', op: 'anim.region_ui_toggle' },
     );
   } else {
     items.push(

@@ -7,8 +7,12 @@ import { num, splitRow } from '../ui/props';
 import { icon } from '../ui/icons';
 import type { ObjectData } from '../data/types';
 import { caches } from './common';
+import { uiList } from '../editors/properties/uilist';
+import { cacheOwners } from './ops';
+import { switchCache } from './ptcaches';
+import { FIELD_TYPES } from './types';
 
-/** Register a properties tab right after another one (keeps the reference tab order). */
+/** Register a properties tab right after another one (keeps the default tab order). */
 export function insertTabAfter(afterId: string, tab: PropertiesTab) {
   const i = propertiesTabs.findIndex((t) => t.id === afterId);
   if (i >= 0) propertiesTabs.splice(i + 1, 0, tab);
@@ -80,7 +84,36 @@ export function cachePanel(id: string, key: string, pc: { frame_start: number; f
       if (c) for (const f of c.frames.values()) bytes += byteSize(f);
       const mem = bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(bytes > 1024 * 1024 * 10 ? 0 : 1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
       const status = pc.is_baked ? `${frames} frames baked (${mem})` : frames ? `${frames} frames in memory (${mem})` : 'Not cached yet: play from the start frame';
+      const owner = cacheOwners(app.doc).find((o) => o.key === key);
+      const holder = owner?.holder;
+      const list = holder ? ((holder.point_caches as { name?: string }[] | undefined) ?? [{ name: (pc as { name?: string }).name ?? 'Cache' }]) : null;
+      const ai = holder ? Math.min((holder.point_cache_index as number) ?? 0, (list?.length ?? 1) - 1) : 0;
       return [
+        holder && list
+          ? h(
+              'div',
+              { style: { padding: '4px 0' } },
+              uiList(
+                `ptc-${key}`,
+                list.map((c, i) => ({ key: `${i}`, label: (i === ai ? (pc as { name?: string }).name : c.name) ?? 'Cache', icon: 'physics' })),
+                ai,
+                (i) => {
+                  switchCache(owner!, i);
+                  changed('Set Active Cache');
+                },
+                {
+                  add: () => app.run('ptcache.add', { cache: key }),
+                  remove: () => app.run('ptcache.remove', { cache: key }),
+                  rename: (i, name) => {
+                    if (i === ai) (pc as { name?: string }).name = name;
+                    else list[i].name = name;
+                    changed('Rename Cache');
+                  },
+                  rows: 2,
+                },
+              ),
+            )
+          : null,
         num(pc, 'frame_start', 'Simulation Start', { int: true, disabled: pc.is_baked }),
         num(pc, 'frame_end', 'End', { int: true, min: pc.frame_start, disabled: pc.is_baked }),
         h('div', { class: 'prop-note' }, status),
@@ -90,22 +123,42 @@ export function cachePanel(id: string, key: string, pc: { frame_start: number; f
           pc.is_baked ? opButton('ptcache.free_bake', 'Delete Bake', { cache: key }) : opButton('ptcache.bake', 'Bake', { cache: key }),
           pc.is_baked ? null : opButton('ptcache.free', 'Free Cache', { cache: key }, { tip: 'Free this cache so it is recomputed' }),
         ),
+        pc.is_baked
+          ? null
+          : h(
+              'div',
+              { class: 'row-aligned' },
+              opButton('ptcache.bake', 'Calculate to Frame', { cache: key, bake: false }, { tip: 'Simulate up to the current frame without baking' }),
+              opButton('ptcache.bake_from_cache', 'Current Cache to Bake', { cache: key }),
+            ),
         h('div', { class: 'row-aligned' }, opButton('ptcache.bake_all', 'Bake All Dynamics'), opButton('ptcache.free_bake_all', 'Delete All Bakes')),
+        h('div', { class: 'row-aligned' }, opButton('ptcache.bake_all', 'Update All to Frame', { bake: false }, { tip: 'Simulate every cache up to the current frame without baking' })),
       ];
     },
     { closed: opts.closed },
   );
 }
 
-/** Field weights panel (gravity + all). */
-export function fieldWeightsPanel(id: string, owner: { effector_weights_gravity?: number; effector_weights_all?: number }, disabled = false): Child {
+/** Field weights panel: gravity, all fields, and each field type. */
+export function fieldWeightsPanel(id: string, owner: { effector_weights_gravity?: number; effector_weights_all?: number; effector_weights_types?: Record<string, number> }, disabled = false, sub = false): Child {
   return panel(
     id,
     'Field Weights',
-    () => [
-      num(owner as Record<string, number>, 'effector_weights_gravity', 'Gravity', { min: 0, max: 1, slider: true, disabled }),
-      owner.effector_weights_all !== undefined ? num(owner as Record<string, number>, 'effector_weights_all', 'All', { min: 0, max: 1, slider: true, disabled }) : null,
-    ],
-    { closed: true },
+    () => {
+      const types = (owner.effector_weights_types ??= {});
+      for (const [t] of FIELD_TYPES) if (types[t] === undefined) types[t] = 1;
+      return [
+        num(owner as Record<string, number>, 'effector_weights_gravity', 'Gravity', { min: 0, max: 1, slider: true, disabled }),
+        owner.effector_weights_all !== undefined ? num(owner as Record<string, number>, 'effector_weights_all', 'All', { min: 0, max: 1, slider: true, disabled }) : null,
+        FIELD_TYPES.map(([t, label]) => num(types, t, label, { min: 0, max: 1, slider: true, disabled })),
+      ];
+    },
+    { closed: true, sub },
   );
+}
+
+/** Collection selector bound to owner[key] (empty = no collection). */
+export function collectionRow(id: string, owner: Record<string, unknown>, key: string, label: string, none = '—', disabled = false): Child {
+  const items = [{ value: '', label: none }, ...Object.values(app.doc.collections).filter((c) => c.id !== app.doc.scene.collection).map((c) => ({ value: c.id, label: c.name, icon: 'collection' }))];
+  return splitRow(label, enumMenu(id, items, String(owner[key] ?? ''), (v) => ((owner[key] = v || null), changed(`Set ${label}`)), { disabled }));
 }

@@ -3,17 +3,25 @@ import { Vector3 } from 'three';
 import { h, type Child } from '../../ui/h';
 import { icon } from '../../ui/icons';
 import { app } from '../../app/app';
+import { prefs } from '../../app/prefs';
 import type { View3D } from './view3d';
 import type { ViewName } from '../../render/navcam';
 
 const AX = [
-  { v: new Vector3(1, 0, 0), label: 'X', color: '#ff3352', view: 'RIGHT' as ViewName },
-  { v: new Vector3(0, 1, 0), label: 'Y', color: '#8bdc00', view: 'BACK' as ViewName },
-  { v: new Vector3(0, 0, 1), label: 'Z', color: '#2890ff', view: 'TOP' as ViewName },
-  { v: new Vector3(-1, 0, 0), label: '', color: '#ff3352', view: 'LEFT' as ViewName },
-  { v: new Vector3(0, -1, 0), label: '', color: '#8bdc00', view: 'FRONT' as ViewName },
-  { v: new Vector3(0, 0, -1), label: '', color: '#2890ff', view: 'BOTTOM' as ViewName },
+  { v: new Vector3(1, 0, 0), label: 'X', color: '#fc364b', view: 'RIGHT' as ViewName },
+  { v: new Vector3(0, 1, 0), label: 'Y', color: '#84e003', view: 'BACK' as ViewName },
+  { v: new Vector3(0, 0, 1), label: 'Z', color: '#398efc', view: 'TOP' as ViewName },
+  { v: new Vector3(-1, 0, 0), label: '', color: '#fc364b', view: 'LEFT' as ViewName },
+  { v: new Vector3(0, -1, 0), label: '', color: '#84e003', view: 'FRONT' as ViewName },
+  { v: new Vector3(0, 0, -1), label: '', color: '#398efc', view: 'BOTTOM' as ViewName },
 ];
+
+/** A darker shade of a #rrggbb colour (the letters on the axis bubbles). */
+function shade(hex: string, k: number) {
+  const n = parseInt(hex.slice(1), 16);
+  const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((x) => Math.round(x * k));
+  return `rgb(${c.join(',')})`;
+}
 
 export function navGizmo(v: View3D): Child {
   // nav.rot is valid before the first draw; the scene camera is only set while looking through it
@@ -25,6 +33,8 @@ export function navGizmo(v: View3D): Child {
   }).sort((a, b) => a.z - b.z);
   const startDrag = (e: PointerEvent) => {
     e.preventDefault();
+    // Quad View's fixed views cannot be turned
+    if (v.lockRotation) return;
     const target = (e.target as Element).closest('[data-axis]') as Element | null;
     const axis = target ? Number(target.getAttribute('data-axis')) : -1;
     let moved = false;
@@ -58,21 +68,27 @@ export function navGizmo(v: View3D): Child {
   return h(
     'div',
     { key: 'navgizmo', class: 'nav-gizmo-wrap' },
-    h(
+    // Preferences ▸ Viewport ▸ Mini Axes: the interactive gizmo, a small axes corner (drawn elsewhere) or nothing
+    prefs.mini_axis_type !== 'GIZMO'
+      ? null
+      : h(
       'svg',
-      { class: 'nav-gizmo', width: 80, height: 80, viewBox: '0 0 80 80', onpointerdown: startDrag },
+      { class: 'nav-gizmo', width: prefs.gizmo_size_navigate_v3d, height: prefs.gizmo_size_navigate_v3d, viewBox: '0 0 80 80', onpointerdown: startDrag },
       h('circle', { class: 'ng-bg', cx: 40, cy: 40, r: 38 }),
       items.map((it) =>
         h(
           'g',
           { key: it.i, 'data-axis': it.i, class: 'ng-axis' },
           it.label ? h('line', { x1: 40, y1: 40, x2: it.x, y2: it.y, stroke: it.color, 'stroke-width': 2, opacity: it.z < 0 ? 0.55 : 1 }) : null,
-          h('circle', { cx: it.x, cy: it.y, r: it.label ? 8 : 7, fill: it.label ? it.color : 'none', stroke: it.color, 'stroke-width': it.label ? 0 : 1.6, opacity: it.z < 0 ? (it.label ? 0.75 : 0.6) : 1, class: it.label ? '' : 'neg' }),
-          it.label ? h('text', { x: it.x, y: it.y + 3.6, 'text-anchor': 'middle', class: 'ng-label' }, it.label) : null,
+          // negative axes: a tinted disc inside a coloured ring
+          h('circle', { cx: it.x, cy: it.y, r: it.label ? 8 : 7, fill: it.color, 'fill-opacity': it.label ? 1 : 0.28, stroke: it.color, 'stroke-width': it.label ? 0 : 1.6, opacity: it.z < 0 ? (it.label ? 0.75 : 0.6) : 1, class: it.label ? '' : 'neg' }),
+          it.label ? h('text', { x: it.x, y: it.y + 3.6, 'text-anchor': 'middle', class: 'ng-label', style: `fill: ${shade(it.color, 0.38)}` }, it.label) : null,
         ),
       ),
     ),
-    h(
+    !prefs.show_navigate_ui
+      ? null
+      : h(
       'div',
       { class: 'nav-buttons' },
       h('button', { class: 'nav-btn', 'data-tip': 'Zoom\nZoom in/out in the view (drag)', onpointerdown: (e: PointerEvent) => v.navDrag(e, 'zoom') }, icon('view_zoom')),

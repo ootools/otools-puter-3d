@@ -11,11 +11,19 @@ export interface EvalMesh {
   normals: Float32Array; // flat, per corner (tool compatible)
   /** custom split normals per corner (e.g. Weighted Normal modifier); overrides computed shading normals */
   custom_normals?: Float32Array;
+  /** per face: quads split along the other diagonal */
+  quad_flip?: Uint8Array;
+  /** per face strength (0 weak, 1 medium, 2 strong) */
+  face_strength?: Uint8Array;
   smooth?: Uint8Array;
   material_index?: Uint16Array;
   seams?: Uint32Array;
   sharp?: Uint32Array;
   creases?: Float32Array;
+  /** per-corner edge bevel weight, per-vertex bevel weight and per-vertex crease (when the mesh has them) */
+  bevel_weight_edge?: Float32Array;
+  bevel_weight_vert?: Float32Array;
+  crease_vert?: Float32Array;
   /** vertex colors per corner RGBA (active color attribute) */
   colors?: Float32Array;
   /** per-vertex weights for each vertex group (aligned with MeshData.vertex_groups) */
@@ -32,6 +40,8 @@ export interface EvalMesh {
   instances?: GeometryInstance[];
   /** Curves (polylines) to draw as wires */
   curves?: { points: Float32Array; cyclic: boolean }[];
+  /** Volume grids (object space) of volume objects and geometry nodes output (src/volume) */
+  volume?: import('../volume/types').VolumeGrid[];
 }
 
 export interface GeometryInstance {
@@ -55,8 +65,10 @@ export interface ModifierContext {
 export interface ModifierType {
   type: string;
   label: string;
-  category: 'EDIT' | 'GENERATE' | 'DEFORM' | 'NORMALS' | 'PHYSICS';
+  category: 'EDIT' | 'GENERATE' | 'DEFORM' | 'NORMALS' | 'PHYSICS' | 'COLOR';
   icon: string;
+  /** object types the modifier can be added to (default: meshes, curves, text, lattices) */
+  objectTypes?: string[];
   defaults: () => Record<string, unknown>;
   /** Object ids this modifier depends on (targets) */
   deps?: (m: ModifierBase) => (string | null | undefined)[];
@@ -75,6 +87,21 @@ export interface ConstraintContext {
   graph: Depsgraph;
   ob: ObjectData;
   frame: number;
+  /** Set when the owner is a pose bone (bone constraints). */
+  pchan?: BoneOwner;
+  /** Target matrix converted to the constraint's target space (set by the solver; null when the target is missing). */
+  target?: Matrix4 | null;
+  /** World matrix of a target object/bone, taking the pose being evaluated into account. */
+  targetWorld?: (id: string | null | undefined, bone?: string, headTail?: number) => Matrix4 | null;
+}
+
+/** Pose bone owner of a constraint: the armature pose being evaluated. */
+export interface BoneOwner {
+  name: string;
+  bones: Map<string, import('./armature').BoneEval>;
+  arm: import('../data/types').ArmatureData;
+  /** world matrix of the armature object */
+  armWorld: Matrix4;
 }
 
 export interface ConstraintType {
@@ -82,8 +109,18 @@ export interface ConstraintType {
   label: string;
   category: 'MOTION_TRACKING' | 'TRANSFORM' | 'TRACKING' | 'RELATIONSHIP';
   defaults: () => Record<string, unknown>;
-  /** Mutates `owner` (world-space matrix of the owner) in place. */
+  /** Mutates `owner` (the owner's matrix in the constraint's owner space) in place. */
   apply: (owner: Matrix4, c: Constraint, ctx: ConstraintContext) => void;
   /** Extra objects (besides `target`) that must be evaluated before the owner */
   deps?: (c: Constraint, doc: DocumentData) => (string | null | undefined)[];
+  /** Only available on pose bones (solved by the armature evaluation). */
+  boneOnly?: boolean;
+  /** Owner/target space conversion: which spaces the constraint offers (default none: always world space). */
+  spaces?: { owner?: boolean; target?: boolean };
+  /** The standard `target` (+ bone subtarget) is resolved by the solver into `ctx.target`. */
+  usesTarget?: boolean;
+  /** The target's evaluated geometry is read (it must be evaluated before the owner). */
+  needsTargetData?: boolean;
+  /** Whether the constraint can do something with its current settings (invalid ones are drawn in red). */
+  isValid?: (c: Constraint, ctx: { doc: DocumentData; ob: ObjectData; bone?: string }) => boolean;
 }

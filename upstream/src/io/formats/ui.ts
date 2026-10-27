@@ -1,16 +1,21 @@
-// Small modal dialogs for format options (like the reference app's file-browser side panel)
-// and for picking companion files (external glTF buffers/textures, OBJ materials).
+// Small modal dialogs for format options and for picking companion files (external glTF buffers/textures, OBJ materials).
 
 export interface FormatOption {
   id: string;
   label: string;
-  type: 'bool' | 'enum' | 'float';
+  type: 'bool' | 'enum' | 'float' | 'int' | 'string';
   default: boolean | string | number;
   items?: [string, string][];
+  /** scripting property name when it differs from `id` */
+  bpy?: string;
+  /** scripting enum values accepted for this option, mapped to ours */
+  bpyItems?: Record<string, string>;
   min?: number;
   max?: number;
   step?: number;
   description?: string;
+  /** default computed when the dialog opens or a script leaves the option out (e.g. the scene's frame range) */
+  dynamicDefault?: () => boolean | string | number;
   /** visible only when the predicate holds */
   showIf?: (v: Record<string, unknown>) => boolean;
 }
@@ -74,6 +79,8 @@ function dialog(title: string, onCancel: () => void): DialogParts {
   const parts: DialogParts = { root, body, close: () => {} };
   // modal key handling regardless of focus: Escape cancels, Enter confirms, app shortcuts are blocked
   const onKey = (e: KeyboardEvent) => {
+    // menus and prompts opened from the dialog (e.g. its preset menu) handle their own keys
+    if ((e.target as Element | null)?.closest?.('.popup-layer') || document.querySelector('.popup-layer .menu')) return;
     const inside = root.contains(e.target as Node);
     if (e.key === 'Escape') {
       e.preventDefault();
@@ -127,28 +134,64 @@ function buttonRow(parts: DialogParts, okLabel: string, ok: () => void, cancel: 
   return o;
 }
 
-/** Show options; resolves with the chosen values or rejects with AbortError. */
-export function optionsDialog(title: string, key: string, options: FormatOption[], okLabel: string, intro?: string): Promise<Record<string, unknown>> {
-  const values = loadOptions(key, options);
-  if (!options.length) return Promise.resolve(values);
+/** Rows other modules put at the top of options dialogs (the preset menu); `sync` redraws the inputs. */
+export const optionsDialogHooks: ((key: string, values: Record<string, unknown>, sync: () => void) => HTMLElement | null)[] = [];
+
+/**
+ * Show options; resolves with the chosen values or rejects with AbortError. `initial` replaces
+ * the remembered values; `selection` adds a "Selected Only" toggle (its value is `__selection`).
+ */
+export function optionsDialog(
+  title: string,
+  key: string,
+  options: FormatOption[],
+  okLabel: string,
+  intro?: string,
+  initial?: Record<string, unknown>,
+  selection?: { id: string; label: string; value: boolean },
+): Promise<Record<string, unknown>> {
+  const values = initial ? { ...loadOptions(key, options), ...initial } : loadOptions(key, options);
+  if (!options.length && !selection) return Promise.resolve(values);
   return new Promise((resolve, reject) => {
     const parts = dialog(title, () => reject(new AbortError()));
-    if (intro) {
+    if (selection) values.__selection = selection.value;
+    if (intro && !selection) {
       const p = document.createElement('div');
       p.style.cssText = 'color:var(--c-text-dim);margin-bottom:4px;';
       p.textContent = intro;
       parts.body.append(p);
     }
-    const rows: { o: FormatOption; el: HTMLElement }[] = [];
+    const rows: { o: FormatOption; el: HTMLElement; input?: HTMLInputElement | HTMLSelectElement }[] = [];
     const refresh = () => rows.forEach(({ o, el }) => (el.style.display = !o.showIf || o.showIf(values) ? '' : 'none'));
-    for (const o of options) {
+    const sync = () => {
+      for (const r of rows) {
+        if (!r.input) continue;
+        if (r.input instanceof HTMLInputElement && r.input.type === 'checkbox') r.input.checked = !!values[r.o.id];
+        else r.input.value = String(values[r.o.id]);
+      }
+      refresh();
+    };
+    for (const f of optionsDialogHooks) {
+      const el = f(key, values, sync);
+      if (el) parts.body.append(el);
+    }
+    const shown: FormatOption[] = selection ? [{ id: '__selection', label: selection.label, type: 'bool', default: false, description: 'Only export the objects that are selected' }, ...options] : options;
+    for (const o of shown) {
       const row = document.createElement('label');
       row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:var(--row);';
       if (o.description) row.title = o.description;
       const name = document.createElement('span');
       name.textContent = o.label;
       let input: HTMLInputElement | HTMLSelectElement;
-      if (o.type === 'bool') {
+      if (o.type === 'string') {
+        const t = document.createElement('input');
+        t.type = 'text';
+        t.value = String(values[o.id] ?? '');
+        t.style.cssText = 'background:var(--w-text, var(--w-num));color:var(--c-text);border:none;border-radius:var(--radius);height:var(--row);width:160px;padding:0 6px;';
+        t.onchange = () => (values[o.id] = t.value);
+        input = t;
+        row.append(name, t);
+      } else if (o.type === 'bool') {
         const cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.checked = !!values[o.id];
@@ -178,7 +221,7 @@ export function optionsDialog(title: string, key: string, options: FormatOption[
       } else {
         const num = document.createElement('input');
         num.type = 'number';
-        num.step = String(o.step ?? 0.01);
+        num.step = String(o.step ?? (o.type === 'int' ? 1 : 0.01));
         if (o.min !== undefined) num.min = String(o.min);
         if (o.max !== undefined) num.max = String(o.max);
         num.value = String(values[o.id]);
@@ -188,6 +231,7 @@ export function optionsDialog(title: string, key: string, options: FormatOption[
           if (!Number.isFinite(v)) v = o.default as number;
           if (o.min !== undefined) v = Math.max(o.min, v);
           if (o.max !== undefined) v = Math.min(o.max, v);
+          if (o.type === 'int') v = Math.round(v);
           values[o.id] = v;
           num.value = String(v);
         };
@@ -195,7 +239,7 @@ export function optionsDialog(title: string, key: string, options: FormatOption[
         row.append(name, num);
       }
       input.setAttribute('aria-label', o.label);
-      rows.push({ o, el: row });
+      rows.push({ o, el: row, input });
       parts.body.append(row);
     }
     refresh();
@@ -203,7 +247,8 @@ export function optionsDialog(title: string, key: string, options: FormatOption[
       parts,
       okLabel,
       () => {
-        saveOptions(key, values);
+        const { __selection: _sel, ...keep } = values;
+        saveOptions(key, keep);
         resolve(values);
       },
       () => reject(new AbortError()),

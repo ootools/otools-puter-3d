@@ -5,6 +5,7 @@ import type { DocumentData, ObjectData } from '../data/types';
 import type { Depsgraph } from '../eval/depsgraph';
 import { localMatrix, toMatrix4 } from '../eval/transform';
 import { evaluateFCurve } from '../anim/fcurve';
+import { objectCurves } from '../anim/slots';
 
 // ---------------------------------------------------------------------------
 // Deterministic hashing / random numbers
@@ -52,8 +53,7 @@ export function arrayChecksum(a: ArrayLike<number>): number {
 const TRANSFORM_PATHS = new Set(['location', 'rotation_euler', 'rotation_quaternion', 'rotation_axis_angle', 'scale', 'delta_location', 'delta_rotation_euler', 'delta_scale']);
 
 function transformFCurves(doc: DocumentData, ob: ObjectData) {
-  const act = ob.animation_data?.action ? doc.actions[ob.animation_data.action] : undefined;
-  return act ? act.fcurves.filter((fc) => !fc.mute && fc.keyframe_points.length && TRANSFORM_PATHS.has(fc.data_path)) : [];
+  return objectCurves(doc, ob).filter((fc) => !fc.mute && fc.keyframe_points.length && TRANSFORM_PATHS.has(fc.data_path));
 }
 
 /**
@@ -217,3 +217,18 @@ export function freeCache(key: string) {
 
 /** Clamp to integer frame. */
 export const frameOf = (graph: { frame: number }) => Math.floor(graph.frame + 1e-6);
+
+/** Objects in a collection and its child collections (null when no collection is given). */
+export function collectionMembers(doc: DocumentData, cid: string | null | undefined): Set<string> | null {
+  const c = cid ? doc.collections[cid] : undefined;
+  if (!c) return null;
+  const out = new Set<string>();
+  const visit = (id: string, depth: number) => {
+    const cc = doc.collections[id];
+    if (!cc || depth > 32) return;
+    for (const o of cc.objects) out.add(o);
+    for (const ch of cc.children) visit(ch, depth + 1);
+  };
+  visit(c.id, 0);
+  return out;
+}

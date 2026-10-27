@@ -1,9 +1,12 @@
-// Core document model. Field names follow the publicly documented RNA property
-// names of the reference application (snake_case) so animation data paths, the
+// Core document model. Field names follow the publicly documented `bpy` RNA property
+// naming conventions (snake_case) so animation data paths, the
 // scripting API and file importers can map 1:1 without translation tables.
 // All typed arrays are treated as immutable once committed to the undo history:
 // edits replace arrays instead of writing into them (see data/cow.ts).
 
+import type { RealtimeRenderSettings, RealtimeLightSettings, RealtimeMaterialSettings, RealtimeWorldSettings, LightProbeSettings } from '../render/realtime/types';
+import type { MultiviewSettings, CameraStereoData } from '../render/final/stereo';
+import type { OutputViewSettings } from '../render/final/outputview';
 export type ID = string;
 export type Vec2 = [number, number];
 export type Vec3 = [number, number, number];
@@ -16,13 +19,19 @@ export type ObjectType =
   | 'MESH'
   | 'CURVE'
   | 'FONT'
+  | 'SURFACE'
   | 'EMPTY'
   | 'LIGHT'
   | 'CAMERA'
   | 'ARMATURE'
   | 'LATTICE'
   | 'POINTCLOUD'
-  | 'GREASEPENCIL';
+  | 'GREASEPENCIL'
+  | 'SPEAKER'
+  | 'META'
+  | 'CURVES'
+  | 'LIGHT_PROBE'
+  | 'VOLUME';
 
 export type RotationMode = 'XYZ' | 'XZY' | 'YXZ' | 'YZX' | 'ZXY' | 'ZYX' | 'QUATERNION' | 'AXIS_ANGLE';
 
@@ -35,7 +44,11 @@ export type Mode =
   | 'TEXTURE_PAINT'
   | 'POSE'
   | 'PAINT_GREASE_PENCIL'
-  | 'SCULPT_GREASE_PENCIL';
+  | 'SCULPT_GREASE_PENCIL'
+  | 'VERTEX_GREASE_PENCIL'
+  | 'WEIGHT_GREASE_PENCIL'
+  | 'SCULPT_CURVES'
+  | 'PARTICLE_EDIT';
 
 export type SelectMode = 'VERT' | 'EDGE' | 'FACE';
 
@@ -61,6 +74,12 @@ export interface ShapeKey {
   mute: boolean;
   relative_key: string; // name of the basis key
   vertex_group?: string;
+  /** protected from edits (Edit Mode shape editing, sculpting) */
+  lock_shape?: boolean;
+  /** absolute shape keys: the evaluation time at which this key is reached */
+  frame?: number;
+  /** absolute shape keys: interpolation from this key to the next */
+  interpolation?: 'KEY_LINEAR' | 'KEY_CARDINAL' | 'KEY_CATMULL_ROM' | 'KEY_BSPLINE';
 }
 
 export interface ColorAttribute {
@@ -68,6 +87,17 @@ export interface ColorAttribute {
   domain: 'POINT' | 'CORNER';
   /** RGBA, linear. */
   data: Float32Array;
+}
+
+/** Data types of generic mesh attributes (colors live in color_attributes, the UV map in uvs). */
+export type AttributeType = 'FLOAT' | 'INT' | 'INT8' | 'BOOLEAN' | 'FLOAT2' | 'INT32_2D' | 'FLOAT_VECTOR' | 'QUATERNION' | 'FLOAT4X4';
+
+/** A named data layer on one domain. EDGE values are stored per face corner (the edge starting there), then per loose edge. */
+export interface MeshAttribute {
+  name: string;
+  domain: 'POINT' | 'EDGE' | 'FACE' | 'CORNER';
+  data_type: AttributeType;
+  data: Float32Array | Int32Array | Uint8Array;
 }
 
 export interface MeshData {
@@ -89,6 +119,18 @@ export interface MeshData {
   sharp?: Uint32Array;
   /** per-corner edge crease weight (0..1) for subdivision */
   creases?: Float32Array;
+  /** per-corner edge bevel weight (0..1), the edge starting at this corner (Bevel modifier "Weight" limit) */
+  bevel_weight_edge?: Float32Array;
+  /** per-vertex bevel weight (0..1) for vertex bevels limited by weight */
+  bevel_weight_vert?: Float32Array;
+  /** per-vertex subdivision crease (0..1): sharpens the subdivided surface at the vertex */
+  crease_vert?: Float32Array;
+  /** custom split normals, xyz per face corner (overrides the computed shading normals) */
+  custom_normals?: Float32Array;
+  /** per face: split this quad along the other diagonal than the automatic choice */
+  quad_flip?: Uint8Array;
+  /** per face strength for the Weighted Normal modifier's face influence: 0 weak, 1 medium, 2 strong */
+  face_strength?: Uint8Array;
   /** per-face smooth shading flag */
   smooth?: Uint8Array;
   /** per-face material slot index */
@@ -104,21 +146,59 @@ export interface MeshData {
   shape_keys: ShapeKey[];
   active_shape_key_index: number;
   use_shape_key_edit_mode?: boolean;
+  /** shape keys blend relative to their reference key (default); false: absolute keys reached in turn by `eval_time` */
+  use_relative?: boolean;
+  /** absolute shape keys: evaluation time (animatable as data.shape_keys.eval_time) */
+  eval_time?: number;
   color_attributes: ColorAttribute[];
   active_color_index: number;
+  /** generic attributes (Attributes panel, geometry nodes Named Attribute, scripts) */
+  attributes?: MeshAttribute[];
+  /** name of the active attribute of the Attributes list */
+  active_attribute?: string;
   uv_map_name: string;
+  /** the other UV maps (per corner u, v), in list order with the active map left out */
+  uv_layers_extra?: { name: string; data: Float32Array }[];
+  /** position of the active map (uvs / uv_map_name) in the UV Maps list */
+  uv_active_index?: number;
+  /** name of the UV map used for rendering (default: the first map) */
+  uv_render_name?: string;
   /** Material slots (material ids or null for empty slot). */
   materials: (ID | null)[];
   /** Auto smooth by angle (radians); undefined = off. */
   auto_smooth_angle?: number;
   remesh_voxel_size?: number;
+  /** Remesh panel: voxel remesh or quad remesh */
+  remesh_mode?: 'VOXEL' | 'QUAD';
   /** Sculpt mode mask, one value per vertex (0 = unmasked, 1 = fully masked). */
   sculpt_mask?: Float32Array;
+  /** Sculpt face sets, one id per face (ids start at 1). */
+  sculpt_face_set?: Int32Array;
+  /** Face set id drawn without a color (the "default" set). */
+  face_sets_color_default?: number;
+  /** Seed for the face set display colors. */
+  face_sets_color_seed?: number;
+  /** Per-face hidden flag used by Sculpt Mode visibility tools. */
+  hide_poly?: Uint8Array;
+  /** Paint modes: only paint the faces selected in the face selection mask. */
+  use_paint_mask?: boolean;
+  /** Paint modes: only paint the vertices selected in the vertex selection mask. */
+  use_paint_mask_vertex?: boolean;
   /** edges that do not belong to any face (vertex index pairs) */
   loose_edges?: Uint32Array;
+  /** Skin modifier data, 4 per vertex: radius x, radius y, root flag, loose flag */
+  skin_vertices?: Float32Array;
   /** UV editor selection, one flag per face corner */
   uv_select?: Uint8Array;
+  /** UV pins (kept in place by unwrapping and UV tools), one flag per face corner */
+  uv_pin?: Uint8Array;
+  /** faces hidden in the UV editor (without sync selection), one flag per face */
+  uv_hide?: Uint8Array;
   users?: number;
+  /** texture space (Generated coordinates): automatic from the bounds, or location ± size */
+  use_auto_texspace?: boolean;
+  texspace_location?: [number, number, number];
+  texspace_size?: [number, number, number];
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +217,8 @@ export interface BezierPoint {
   select_control_point?: boolean;
   select_left_handle?: boolean;
   select_right_handle?: boolean;
+  /** hidden in Edit Mode (not drawn, not selectable) */
+  hide?: boolean;
 }
 
 export interface SplinePoint {
@@ -144,6 +226,7 @@ export interface SplinePoint {
   radius: number;
   tilt: number;
   select?: boolean;
+  hide?: boolean;
 }
 
 export interface Spline {
@@ -154,6 +237,18 @@ export interface Spline {
   resolution_u: number;
   order_u: number;
   use_endpoint_u?: boolean;
+  /** NURBS knots in Bézier segments (interior knots repeated order-1 times) */
+  use_bezier_u?: boolean;
+  /** NURBS surfaces: `points` is a grid of point_count_u × point_count_v (U varies fastest) */
+  point_count_u?: number;
+  point_count_v?: number;
+  order_v?: number;
+  resolution_v?: number;
+  use_cyclic_v?: boolean;
+  use_endpoint_v?: boolean;
+  use_bezier_v?: boolean;
+  /** hidden in Edit Mode */
+  hide?: boolean;
   use_smooth: boolean;
   material_index: number;
 }
@@ -161,33 +256,109 @@ export interface Spline {
 export interface CurveData {
   id: ID;
   name: string;
+  /** texture space (Generated coordinates): automatic from the bounds, or location ± size */
+  use_auto_texspace?: boolean;
+  texspace_location?: [number, number, number];
+  texspace_size?: [number, number, number];
   dimensions: '2D' | '3D';
+  /** Path animation: frames for one run along the path, and the current position in frames (animatable). */
+  path_duration?: number;
+  eval_time?: number;
   splines: Spline[];
   resolution_u: number;
+  /** data of NURBS surface objects */
+  surface?: boolean;
+  /** how the profile turns along 3D curves, and how much that turning is smoothed */
+  twist_mode?: 'MINIMUM' | 'Z_UP' | 'TANGENT';
+  twist_smooth?: number;
+  /** the part of each spline the bevel covers, and how the factors are measured */
+  bevel_factor_start?: number;
+  bevel_factor_end?: number;
+  bevel_factor_mapping_start?: 'RESOLUTION' | 'SEGMENTS' | 'SPLINE';
+  bevel_factor_mapping_end?: 'RESOLUTION' | 'SEGMENTS' | 'SPLINE';
+  /** how the taper object's value combines with the point radius; map it to the covered part only */
+  taper_radius_mode?: 'OVERRIDE' | 'MULTIPLY' | 'ADD';
+  use_map_taper?: boolean;
+  /** curve deform: scale by the curve radius, stretch the deformed object over the whole curve, clamp to its bounds */
+  use_radius?: boolean;
+  use_stretch?: boolean;
+  use_deform_bounds?: boolean;
+  /** surfaces: preview resolution along V; render resolutions (0 = use the preview ones) */
+  resolution_v?: number;
+  render_resolution_u?: number;
+  render_resolution_v?: number;
   bevel_depth: number;
   bevel_resolution: number;
   extrude: number;
   offset: number;
   fill_mode: 'FULL' | 'BACK' | 'FRONT' | 'HALF' | 'NONE' | 'BOTH';
+  /** ROUND: tube of bevel_depth; OBJECT: cross-section from bevel_object */
+  bevel_mode?: 'ROUND' | 'OBJECT';
   bevel_object?: ID | null;
+  /** curve object whose height along its X extent scales the radius */
   taper_object?: ID | null;
   use_fill_caps: boolean;
   materials: (ID | null)[];
-  // Text (FONT objects share curve data like the reference app)
+  // Text (FONT objects share curve data)
   body?: string;
   size?: number;
-  align_x?: 'LEFT' | 'CENTER' | 'RIGHT' | 'JUSTIFY';
-  align_y?: 'TOP' | 'CENTER' | 'BOTTOM';
+  align_x?: 'LEFT' | 'CENTER' | 'RIGHT' | 'JUSTIFY' | 'FLUSH';
+  align_y?: 'TOP_BASELINE' | 'TOP' | 'CENTER' | 'BOTTOM' | 'BOTTOM_BASELINE';
   space_line?: number;
   space_character?: number;
+  space_word?: number;
   font_family?: string;
   users?: number;
+  /** per-character styles, parallel to `body` (UTF-16 code units) */
+  body_format?: CharFormat[];
+  underline_position?: number;
+  underline_height?: number;
+  small_caps_scale?: number;
+  shear?: number;
+  offset_x?: number;
+  offset_y?: number;
+  /** text frames; a box with width 0 does not wrap */
+  text_boxes?: TextBox[];
+  overflow?: 'NONE' | 'SCALE' | 'TRUNCATE';
+  /** custom font data-blocks per style (null / missing: built-in font) */
+  font?: ID | null;
+  font_bold?: ID | null;
+  font_italic?: ID | null;
+  font_bold_italic?: ID | null;
+  /** text: curve object the text is bent along */
+  follow_curve?: ID | null;
+}
+
+/** A loaded font file (TrueType / OpenType / WOFF), packed into the document. */
+export interface VectorFontData {
+  id: ID;
+  name: string;
+  filepath: string;
+  bytes: Uint8Array | null;
+  users?: number;
+}
+
+export interface CharFormat {
+  use_bold?: boolean;
+  use_italic?: boolean;
+  use_underline?: boolean;
+  use_small_caps?: boolean;
+  kerning?: number;
+  /** material slot of the character */
+  material_index?: number;
+}
+
+export interface TextBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 // ---------------------------------------------------------------------------
 // Lights / cameras / armatures
 
-export interface LightData {
+export interface LightData extends RealtimeLightSettings {
   id: ID;
   name: string;
   type: 'POINT' | 'SUN' | 'SPOT' | 'AREA';
@@ -208,6 +379,15 @@ export interface LightData {
   diffuse_factor: number;
   specular_factor: number;
   volume_factor: number;
+  /** colour from a black body temperature (kelvin), multiplied with `color` */
+  use_temperature?: boolean;
+  temperature?: number;
+  /** brightness scale in stops (2^exposure) */
+  exposure?: number;
+  /** area lights: keep the total power when the size changes (off: power per square metre) */
+  normalize?: boolean;
+  /** area lights: angle of the cone the light emits into (π = the whole hemisphere) */
+  spread?: number;
   users?: number;
 }
 
@@ -231,12 +411,59 @@ export interface CameraData {
     focus_distance: number;
     aperture_fstop: number;
     aperture_blades: number;
+    /** rotation of the aperture polygon (radians) */
+    aperture_rotation?: number;
+    /** anamorphic distortion of the bokeh (1 = round) */
+    aperture_ratio?: number;
   };
+  /** stereo rig used by stereo 3D renders (render/final/stereo.ts) */
+  stereo?: CameraStereoData;
   display_size: number;
   show_passepartout: boolean;
   passepartout_alpha: number;
   show_limits?: boolean;
+  /** draw the world's mist range along the camera axis */
+  show_mist?: boolean;
+  /** camera view: outline of the sensor area */
+  show_sensor?: boolean;
+  /** colour of the composition guides (RGBA) */
+  composition_guide_color?: [number, number, number, number];
+  /** camera view overlays (src/render/final/cameraoverlay.ts) */
+  show_name?: boolean;
+  show_safe_areas?: boolean;
+  show_safe_center?: boolean;
+  show_composition_thirds?: boolean;
+  show_composition_center?: boolean;
+  show_composition_center_diagonal?: boolean;
+  show_composition_golden?: boolean;
+  show_composition_golden_tria_a?: boolean;
+  show_composition_golden_tria_b?: boolean;
+  show_composition_harmony_tri_a?: boolean;
+  show_composition_harmony_tri_b?: boolean;
+  /** reference images drawn behind or in front of the scene when looking through this camera */
+  show_background_images?: boolean;
+  background_images?: CameraBackgroundImage[];
   users?: number;
+}
+
+export interface CameraBackgroundImage {
+  /** what is shown: an image, or a movie clip (footage of a camera solve); absent means image */
+  source?: 'IMAGE' | 'MOVIE_CLIP';
+  image: ID | null;
+  clip?: ID | null;
+  /** with a movie clip source: use the scene's active clip */
+  use_camera_clip?: boolean;
+  alpha: number;
+  display_depth: 'BACK' | 'FRONT';
+  frame_method: 'STRETCH' | 'FIT' | 'CROP';
+  /** offset in units of the camera frame width */
+  offset: [number, number];
+  rotation: number;
+  scale: number;
+  use_flip_x: boolean;
+  use_flip_y: boolean;
+  show_background_image: boolean;
+  show_expanded: boolean;
 }
 
 export interface Bone {
@@ -258,6 +485,55 @@ export interface Bone {
   select_head?: boolean;
   select_tail?: boolean;
   layer_collections?: string[];
+  /** names of the bone collections this bone is assigned to */
+  collections?: string[];
+  /** draw as wireframe only */
+  show_wire?: boolean;
+  /** B-Bone display size (default: a tenth of the bone length) */
+  bbone_x?: number;
+  bbone_z?: number;
+  /** location is applied in the bone's own space (false: in the parent's space) */
+  use_local_location?: boolean;
+  /** objects parented to the bone follow its deformation (pose relative to rest) instead of its tail */
+  use_relative_parent?: boolean;
+  /** envelope deformation strength and whether it multiplies vertex group weights */
+  envelope_weight?: number;
+  use_envelope_multiply?: boolean;
+  /** colour of the bone (Edit Mode / rest; pose bones can override it) */
+  color?: BoneColor;
+  // B-Bone shape (rest): curve offsets, roll, scale and ease of the start / end handles
+  bbone_curveinx?: number;
+  bbone_curveinz?: number;
+  bbone_curveoutx?: number;
+  bbone_curveoutz?: number;
+  bbone_rollin?: number;
+  bbone_rollout?: number;
+  use_endroll_as_inroll?: boolean;
+  bbone_scalein?: Vec3;
+  bbone_scaleout?: Vec3;
+  bbone_easein?: number;
+  bbone_easeout?: number;
+  use_scale_easing?: boolean;
+  /** what the B-Bone's start / end handles follow */
+  bbone_handle_type_start?: 'AUTO' | 'ABSOLUTE' | 'RELATIVE' | 'TANGENT';
+  bbone_handle_type_end?: 'AUTO' | 'ABSOLUTE' | 'RELATIVE' | 'TANGENT';
+  bbone_custom_handle_start?: string;
+  bbone_custom_handle_end?: string;
+  /** how vertices map to segments: by projection on the straight bone or on the curve */
+  bbone_mapping_mode?: 'STRAIGHT' | 'CURVED';
+}
+
+/** Bone colour: a theme colour set or custom colours for the normal / selected / active states. */
+export interface BoneColor {
+  palette: string;
+  custom?: { normal: Color; select: Color; active: Color; show_colored_constraints?: boolean };
+}
+
+/** Named group of bones (visibility, selection, organisation). */
+export interface BoneCollection {
+  name: string;
+  is_visible: boolean;
+  is_solo?: boolean;
 }
 
 export interface ArmatureData {
@@ -269,8 +545,16 @@ export interface ArmatureData {
   show_names: boolean;
   show_axes: boolean;
   show_in_front?: boolean;
+  /** draw bones in their colours */
+  show_bone_colors?: boolean;
+  /** draw custom shapes instead of the bones (default on) */
+  show_bone_custom_shapes?: boolean;
   active_bone?: string | null;
   users?: number;
+  collections?: BoneCollection[];
+  active_collection_index?: number;
+  /** Edit Mode X-Axis Mirror: joints of `.L`/`.R` counterparts move together */
+  use_mirror_x?: boolean;
 }
 
 export interface PoseBone {
@@ -282,6 +566,27 @@ export interface PoseBone {
   scale: Vec3;
   constraints: Constraint[];
   custom_shape?: ID | null;
+  /** custom shape placement (relative to the bone) and line width */
+  custom_shape_translation?: Vec3;
+  custom_shape_rotation_euler?: Vec3;
+  custom_shape_scale_xyz?: Vec3;
+  custom_shape_wire_width?: number;
+  /** the custom shape is drawn at this other bone's transform (Override Transform) */
+  custom_shape_transform?: string;
+  use_custom_shape_bone_size?: boolean;
+  /** pose colour (overrides the bone's colour when its palette is not DEFAULT) */
+  color?: BoneColor;
+  // B-Bone shape (pose, added to the rest values)
+  bbone_curveinx?: number;
+  bbone_curveinz?: number;
+  bbone_curveoutx?: number;
+  bbone_curveoutz?: number;
+  bbone_rollin?: number;
+  bbone_rollout?: number;
+  bbone_scalein?: Vec3;
+  bbone_scaleout?: Vec3;
+  bbone_easein?: number;
+  bbone_easeout?: number;
   lock_location?: [boolean, boolean, boolean];
   lock_rotation?: [boolean, boolean, boolean];
   lock_scale?: [boolean, boolean, boolean];
@@ -290,6 +595,18 @@ export interface PoseBone {
   lock_ik_x?: boolean;
   lock_ik_y?: boolean;
   lock_ik_z?: boolean;
+  ik_stiffness_x?: number;
+  ik_stiffness_y?: number;
+  ik_stiffness_z?: number;
+  use_ik_limit_x?: boolean;
+  use_ik_limit_y?: boolean;
+  use_ik_limit_z?: boolean;
+  ik_min_x?: number;
+  ik_max_x?: number;
+  ik_min_y?: number;
+  ik_max_y?: number;
+  ik_min_z?: number;
+  ik_max_z?: number;
   select?: boolean;
 }
 
@@ -302,8 +619,22 @@ export interface LatticeData {
   /** deformed point positions (u*v*w*3), in lattice local space ±0.5 */
   points: Float32Array;
   interpolation: 'KEY_LINEAR' | 'KEY_BSPLINE';
+  /** interpolation per axis (default: `interpolation`) */
+  interpolation_type_u?: LatticeInterpolation;
+  interpolation_type_v?: LatticeInterpolation;
+  interpolation_type_w?: LatticeInterpolation;
+  /** only the outer points deform; inner points follow them */
+  use_outside?: boolean;
+  /** vertex group whose weights scale each point's influence */
+  vertex_group?: string;
+  /** lattice vertex groups and their weights per point */
+  vertex_groups?: { name: string }[];
+  weights?: Float32Array[];
+  active_vertex_group_index?: number;
   users?: number;
 }
+
+export type LatticeInterpolation = 'KEY_LINEAR' | 'KEY_CARDINAL' | 'KEY_CATMULL_ROM' | 'KEY_BSPLINE';
 
 // ---------------------------------------------------------------------------
 // Node trees (shader, geometry, compositor, world)
@@ -336,6 +667,10 @@ export interface NodeData {
   open_panels?: string[];
   /** Hide the node's property buttons (show_options off) */
   hide_options?: boolean;
+  /** number key (1-9) that views this node in the node editor */
+  viewer_shortcut?: number;
+  /** show a rendered preview of the node's output above it (shader nodes) */
+  show_preview?: boolean;
 }
 
 export interface LinkData {
@@ -352,9 +687,17 @@ export interface NodeTreeData {
   nodes: NodeData[];
   links: LinkData[];
   /** For node groups: interface sockets */
-  interface?: { in_out: 'INPUT' | 'OUTPUT'; name: string; socket_type: string; default_value?: SocketValue; min_value?: number; max_value?: number; identifier: string }[];
+  interface?: { in_out: 'INPUT' | 'OUTPUT'; name: string; socket_type: string; default_value?: SocketValue; min_value?: number; max_value?: number; identifier: string; hide_value?: boolean; /** identifier of the interface panel holding this input */ panel?: string; /** tooltip of the socket */ description?: string }[];
+  /** node groups: collapsible panels that organize the group node's inputs */
+  interface_panels?: { identifier: string; name: string; default_closed?: boolean; /** boolean input drawn as a checkbox in the panel header */ toggle?: string }[];
   active_node?: ID | null;
   view?: { x: number; y: number; zoom: number };
+  /** node groups: description shown as a tooltip */
+  description?: string;
+  /** node groups: width of newly added group nodes */
+  default_group_node_width?: number;
+  /** node groups: header color of the group's nodes, by node category ('input', 'shader', …) */
+  color_tag?: string;
 }
 
 export interface NodeGroupData {
@@ -363,11 +706,18 @@ export interface NodeGroupData {
   tree: NodeTreeData;
   is_modifier?: boolean;
   is_tool?: boolean;
+  /** tools: modes and object types the tool is offered for (all when unset) */
+  is_mode_object?: boolean;
+  is_mode_edit?: boolean;
+  is_mode_sculpt?: boolean;
+  is_type_mesh?: boolean;
+  is_type_curve?: boolean;
+  is_type_pointcloud?: boolean;
   use_fake_user?: boolean;
   users?: number;
 }
 
-export interface MaterialData {
+export interface MaterialData extends RealtimeMaterialSettings {
   id: ID;
   name: string;
   use_nodes: boolean;
@@ -388,7 +738,7 @@ export interface MaterialData {
   grease_pencil?: import('../greasepencil/types').MaterialGPencilStyle;
 }
 
-export interface WorldData {
+export interface WorldData extends RealtimeWorldSettings {
   id: ID;
   name: string;
   color: Color;
@@ -397,6 +747,9 @@ export interface WorldData {
   /** mist settings */
   mist_start?: number;
   mist_depth?: number;
+  mist_falloff?: 'QUADRATIC' | 'LINEAR' | 'INVERSE_QUADRATIC';
+  /** World ▸ Ray Visibility ▸ Camera: the background is seen by the camera (off: black) */
+  visible_camera?: boolean;
   users?: number;
 }
 
@@ -408,7 +761,7 @@ export interface ImageData {
   bytes: Uint8Array | null;
   width: number;
   height: number;
-  source: 'FILE' | 'GENERATED' | 'VIEWER' | 'RENDER';
+  source: 'FILE' | 'GENERATED' | 'VIEWER' | 'RENDER' | 'TILED';
   generated_type?: 'BLANK' | 'UV_GRID' | 'COLOR_GRID';
   generated_color?: Color4;
   colorspace: 'sRGB' | 'Non-Color' | 'Linear';
@@ -418,6 +771,23 @@ export interface ImageData {
   revision?: number;
   use_fake_user?: boolean;
   users?: number;
+  /** UDIM tiles (source 'TILED'): the first tile uses the image's own pixels (src/render/udim.ts) */
+  tiles?: UdimTile[];
+  active_tile_index?: number;
+}
+
+/** One tile of a UDIM image: number 1001 + u + 10 × v of the UV square it covers. */
+export interface UdimTile {
+  number: number;
+  label?: string;
+  /** encoded pixels (null: generated); unused for the first tile */
+  bytes?: Uint8Array | null;
+  mime?: string;
+  width: number;
+  height: number;
+  generated_type?: 'BLANK' | 'UV_GRID' | 'COLOR_GRID';
+  generated_color?: Color4;
+  revision?: number;
 }
 
 export interface TextData {
@@ -467,8 +837,16 @@ export interface Keyframe {
 }
 
 export interface FModifier {
-  type: 'NOISE' | 'CYCLES' | 'GENERATOR' | 'LIMITS' | 'STEPPED';
+  type: 'NOISE' | 'CYCLES' | 'GENERATOR' | 'LIMITS' | 'STEPPED' | 'FNGENERATOR' | 'ENVELOPE';
   mute?: boolean;
+  /** influence and restricted frame range (with blend in/out) */
+  use_influence?: boolean;
+  influence?: number;
+  use_restricted_range?: boolean;
+  frame_start?: number;
+  frame_end?: number;
+  blend_in?: number;
+  blend_out?: number;
   // noise
   scale?: number;
   strength?: number;
@@ -488,6 +866,18 @@ export interface FModifier {
   use_max_y?: boolean;
   min_y?: number;
   max_y?: number;
+  // built-in function (FNGENERATOR)
+  function_type?: 'SIN' | 'COS' | 'TAN' | 'SQRT' | 'LN' | 'SINC';
+  amplitude?: number;
+  phase_multiplier?: number;
+  phase_offset?: number;
+  value_offset?: number;
+  use_additive?: boolean;
+  // envelope
+  reference_value?: number;
+  default_min?: number;
+  default_max?: number;
+  control_points?: { frame: number; min: number; max: number }[];
 }
 
 export interface FCurve {
@@ -503,6 +893,28 @@ export interface FCurve {
   select?: boolean;
   color_mode?: 'AUTO_RAINBOW' | 'AUTO_RGB' | 'AUTO_YRGB' | 'CUSTOM';
   color?: Color;
+  /** baked samples (frame, value) used when the curve has no keyframes */
+  sampled_points?: [number, number][];
+  /** how automatic handles are computed: independently (NONE) or for a smooth acceleration (CONT_ACCEL) */
+  auto_smoothing?: 'NONE' | 'CONT_ACCEL';
+  /** handle of the action slot this curve animates (actions with slots; the first slot when absent) */
+  slot?: number;
+  /** set when the curve's property could not be found during evaluation ("Revive Disabled F-Curves" clears it) */
+  disabled?: boolean;
+}
+
+/**
+ * A slot of an action: one data-block's worth of animation. Several data-blocks can play
+ * the same action, each through its own slot (or share one).
+ */
+export interface ActionSlot {
+  /** stable number the users refer to (unique within the action) */
+  handle: number;
+  /** two-letter data-block type code ('OB', 'ME', …; 'XX' until first assigned) followed by the name */
+  identifier: string;
+  select?: boolean;
+  /** expanded in the channel list of the Action Editor */
+  show_expanded?: boolean;
 }
 
 export interface ActionData {
@@ -511,8 +923,17 @@ export interface ActionData {
   fcurves: FCurve[];
   frame_range?: Vec2;
   use_fake_user?: boolean;
-  /** Pose markers etc omitted */
+  /** markers stored with the action (shown in the Action Editor with Show Pose Markers) */
+  pose_markers?: TimelineMarker[];
   users?: number;
+  /** slots (absent / empty: a single implicit slot playing every curve on whatever uses the action) */
+  slots?: ActionSlot[];
+  /** last slot handle handed out */
+  last_slot_handle?: number;
+  /** handle of the slot shown as active in the Action Editor */
+  active_slot?: number;
+  /** groups pinned in the Graph Editor (listed while their bone is unselected) */
+  pinned_groups?: string[];
 }
 
 export interface NlaStrip {
@@ -531,6 +952,18 @@ export interface NlaStrip {
   mute: boolean;
   select?: boolean;
   extrapolation: 'HOLD' | 'HOLD_FORWARD' | 'NOTHING';
+  /** strip kind (action clip when absent) */
+  type?: 'CLIP' | 'TRANSITION' | 'META' | 'SOUND';
+  /** META: the grouped strips, in inner time (action_frame_start..end) */
+  strips?: NlaStrip[];
+  /** slot of the action the strip plays (0: none; absent: found through the owner, see anim/slots.ts) */
+  action_slot_handle?: number;
+  /** F-Modifiers acting on every channel the strip produces */
+  modifiers?: FModifier[];
+  /** SOUND strips: the speaker's sound plays from the strip start */
+  sound?: ID | null;
+  /** control curves of the strip (`influence` while the influence is animated) */
+  fcurves?: FCurve[];
 }
 
 export interface NlaTrack {
@@ -548,12 +981,43 @@ export interface AnimData {
   action_blend_type?: NlaStrip['blend_type'];
   action_influence?: number;
   drivers: Driver[];
+  /** NLA tweak mode: the strip whose action is being edited */
+  tweak?: { track: number; strip: number; prev_action: ID | null; upper: boolean; prev_slot?: number; prev_slot_action?: ID | null } | null;
+  /** slot of `action` this data-block plays (0: none); valid while slot_action equals action */
+  action_slot_handle?: number;
+  /** the action action_slot_handle refers to (when it differs from action, the slot is found again) */
+  slot_action?: ID | null;
+  /** identifier of the slot last assigned, used to find a slot again when another action is assigned */
+  last_slot_identifier?: string;
+  /** Graph Editor: channels stay listed while the owner is unselected ("Only Show Selected") */
+  use_pin?: boolean;
+}
+
+export type DriverIdType = 'OBJECT' | 'SCENE' | 'MESH' | 'CURVE' | 'LIGHT' | 'CAMERA' | 'ARMATURE' | 'LATTICE' | 'MATERIAL' | 'WORLD' | 'IMAGE' | 'ACTION' | 'NODETREE' | 'TEXT' | 'COLLECTION' | 'PARTICLE';
+
+export interface DriverTarget {
+  /** target data-block (an object unless id_type says otherwise) */
+  id: ID | null;
+  /** table the id refers to (default OBJECT) */
+  id_type?: DriverIdType;
+  data_path: string;
+  /** pose bone of an armature target (Transform Channel, Distance, Rotational Difference) */
+  bone_target?: string;
+  transform_type?: string;
+  transform_space?: 'WORLD_SPACE' | 'TRANSFORM_SPACE' | 'LOCAL_SPACE';
+  /** how rotation channels are read: AUTO, an Euler order, QUATERNION or SWING_TWIST_X/Y/Z */
+  rotation_mode?: string;
+  /** Context Property variables: which context data-block the path is read from */
+  context_property?: 'ACTIVE_SCENE' | 'ACTIVE_VIEW_LAYER';
+  /** use fallback_value when the path can't be resolved instead of flagging an error */
+  use_fallback_value?: boolean;
+  fallback_value?: number;
 }
 
 export interface DriverVariable {
   name: string;
-  type: 'SINGLE_PROP' | 'TRANSFORMS' | 'ROTATION_DIFF' | 'LOC_DIFF';
-  targets: { id: ID | null; data_path: string; transform_type?: string; transform_space?: string }[];
+  type: 'SINGLE_PROP' | 'TRANSFORMS' | 'ROTATION_DIFF' | 'LOC_DIFF' | 'CONTEXT_PROP';
+  targets: DriverTarget[];
 }
 
 export interface Driver {
@@ -562,6 +1026,10 @@ export interface Driver {
   type: 'AVERAGE' | 'SUM' | 'SCRIPTED' | 'MIN' | 'MAX';
   expression: string;
   variables: DriverVariable[];
+  /** scripted expressions can read the driven data-block as `self` */
+  use_self?: boolean;
+  /** maps the driver value (x) to the property value (y); without keys or modifiers the value passes through */
+  fcurve?: FCurve;
 }
 
 // ---------------------------------------------------------------------------
@@ -588,8 +1056,8 @@ export interface Constraint {
   show_expanded: boolean;
   target?: ID | null;
   subtarget?: string;
-  owner_space?: 'WORLD' | 'LOCAL' | 'POSE' | 'LOCAL_WITH_PARENT' | 'CUSTOM';
-  target_space?: 'WORLD' | 'LOCAL' | 'POSE' | 'LOCAL_WITH_PARENT' | 'CUSTOM';
+  owner_space?: 'WORLD' | 'LOCAL' | 'POSE' | 'LOCAL_WITH_PARENT' | 'CUSTOM' | 'LOCAL_OWNER_ORIENT';
+  target_space?: 'WORLD' | 'LOCAL' | 'POSE' | 'LOCAL_WITH_PARENT' | 'CUSTOM' | 'LOCAL_OWNER_ORIENT';
   [key: string]: unknown;
 }
 
@@ -634,7 +1102,8 @@ export interface ParticleSettings {
   use_rotations?: boolean;
   angular_velocity_factor?: number;
   seed?: number;
-  display_color?: Color;
+  /** how particles are coloured in the viewport */
+  display_color?: 'NONE' | 'MATERIAL' | 'VELOCITY' | 'ACCELERATION';
   child_type?: 'NONE' | 'SIMPLE' | 'INTERPOLATED';
   rendered_child_count?: number;
   clump_factor?: number;
@@ -649,7 +1118,7 @@ export interface ParticleSystem {
 }
 
 export interface ForceField {
-  type: 'NONE' | 'FORCE' | 'WIND' | 'VORTEX' | 'TURBULENCE' | 'DRAG';
+  type: 'NONE' | 'FORCE' | 'WIND' | 'VORTEX' | 'TURBULENCE' | 'DRAG' | 'MAGNET' | 'HARMONIC' | 'LENNARDJ' | 'GUIDE';
   strength: number;
   flow: number;
   noise?: number;
@@ -677,8 +1146,10 @@ export interface ObjectData {
   type: ObjectType;
   data: ID | null;
   parent: ID | null;
-  parent_type: 'OBJECT' | 'BONE' | 'VERTEX';
+  parent_type: 'OBJECT' | 'BONE' | 'VERTEX' | 'VERTEX_3';
   parent_bone: string;
+  /** VERTEX / VERTEX_3 parenting: element indices of the parent (vertices, curve points, lattice points) */
+  parent_vertices?: number[];
   /** inverse of the parent's world matrix at parenting time */
   matrix_parent_inverse: Mat4;
   location: Vec3;
@@ -717,7 +1188,14 @@ export interface ObjectData {
   use_empty_image_alpha?: boolean;
   instance_type: 'NONE' | 'COLLECTION' | 'VERTS' | 'FACES';
   instance_collection: ID | null;
+  /** vertex instancing: rotate instances to the vertex normal */
+  use_instance_vertices_rotation?: boolean;
+  /** face instancing: scale instances by the face size */
+  use_instance_faces_scale?: boolean;
+  instance_faces_scale?: number;
   modifiers: ModifierBase[];
+  /** visual effects of grease pencil objects (Properties ▸ Visual Effects) */
+  shader_effects?: import('../greasepencil/types').ShaderFx[];
   constraints: Constraint[];
   animation_data: AnimData | null;
   pose: Record<string, PoseBone> | null;
@@ -730,6 +1208,12 @@ export interface ObjectData {
   field: ForceField | null;
   collision: CollisionSettings | null;
   vertex_group_active_index?: number;
+  /** show only the active shape key, at full strength */
+  show_only_shape_key?: boolean;
+  /** sound settings of a SPEAKER object */
+  speaker?: import('../object/speaker').SpeakerSettings;
+  /** settings of a LIGHT_PROBE object (src/render/realtime/probes) */
+  lightprobe?: LightProbeSettings;
   pass_index?: number;
   is_shadow_catcher?: boolean;
   is_holdout?: boolean;
@@ -763,8 +1247,18 @@ export interface CollectionData {
 
 export type RenderEngine = 'RASTER' | 'PATHTRACE' | 'SOLID';
 
-export interface RenderSettings {
+export interface RenderSettings extends RealtimeRenderSettings, MultiviewSettings, OutputViewSettings {
   engine: RenderEngine;
+  /** Render ▸ Curves: strand shape in the realtime engine and its subdivisions */
+  hair_type?: 'STRAND' | 'STRIP' | 'CYLINDER';
+  hair_subdiv?: number;
+  /** Render ▸ Curves of the path tracer */
+  cycles_curves?: import('../render/final/curvesettings').CyclesCurves;
+  /** path tracer options (src/render/final/ptsettings.ts) */
+  cycles?: import('../render/final/ptsettings').PathTraceSettings;
+  /** texture baking (src/bake/settings.ts) */
+  bake?: import('../bake/settings').BakeSettings;
+  bake_type?: import('../bake/settings').BakeType;
   resolution_x: number;
   resolution_y: number;
   resolution_percentage: number;
@@ -773,7 +1267,10 @@ export interface RenderSettings {
   film_transparent: boolean;
   fps: number;
   fps_base: number;
-  file_format: 'PNG' | 'JPEG' | 'WEBP' | 'WEBM';
+  file_format: 'PNG' | 'JPEG' | 'WEBP' | 'WEBM' | 'OPEN_EXR' | 'OPEN_EXR_MULTILAYER';
+  /** OpenEXR: half (16) or full (32) floats, and the compression */
+  color_depth?: '16' | '32';
+  exr_codec?: 'NONE' | 'ZIPS' | 'ZIP';
   color_mode: 'BW' | 'RGB' | 'RGBA';
   filepath: string;
   // sampling
@@ -811,17 +1308,120 @@ export interface RenderSettings {
   use_pass_mist: boolean;
   use_pass_ambient_occlusion?: boolean;
   use_pass_emit?: boolean;
+  use_pass_environment?: boolean;
+  use_pass_transmission_color?: boolean;
   use_pass_diffuse_color?: boolean;
   use_pass_object_index?: boolean;
   use_compositing: boolean;
   use_stamp?: boolean;
   dither_intensity: number;
   use_freestyle?: boolean;
+  // --- sampling / light paths (see src/render/final/props/render.ts)
+  /** realtime viewport anti-aliasing samples accumulated while the view is still */
+  preview_raster_samples?: number;
+  /** path tracer: stop sampling after this many seconds (0 = no limit) */
+  time_limit?: number;
+  sample_clamp_direct?: number;
+  sample_clamp_indirect?: number;
+  /** path tracer: roughness added along glossy paths to reduce caustic noise */
+  blur_glossy?: number;
+  /** realtime: scale of light from lamps / from the world */
+  direct_light_intensity?: number;
+  indirect_light_intensity?: number;
+  // --- simplify
+  use_simplify?: boolean;
+  simplify_subdivision?: number;
+  simplify_subdivision_render?: number;
+  simplify_child_particles?: number;
+  simplify_child_particles_render?: number;
+  // --- depth of field / motion blur / film
+  use_bokeh_jittered?: boolean;
+  motion_blur_position?: 'START' | 'CENTER' | 'END';
+  /** shutter openness over the shutter interval (control points x, y in 0..1); absent = fully open */
+  motion_blur_shutter_curve?: [number, number][];
+  filter_size?: number;
+  pixel_filter_type?: 'BOX' | 'GAUSSIAN' | 'BLACKMAN_HARRIS';
+  filter_width?: number;
+  film_exposure?: number;
+  // --- performance
+  preview_pixel_size?: 'AUTO' | '1' | '2' | '4' | '8';
+  use_auto_tile?: boolean;
+  tile_size?: number;
+  // --- colour management
+  display_device?: string;
+  sequencer_colorspace?: string;
+  use_white_balance?: boolean;
+  white_balance_temperature?: number;
+  white_balance_tint?: number;
+  use_curve_mapping?: boolean;
+  /** display curve control points (x, y in 0..1) applied after the view transform */
+  curve_mapping?: [number, number][];
+  // --- output
+  frame_map_old?: number;
+  frame_map_new?: number;
+  use_border?: boolean;
+  border_min_x?: number;
+  border_min_y?: number;
+  border_max_x?: number;
+  border_max_y?: number;
+  use_crop_to_border?: boolean;
+  use_file_extension?: boolean;
+  /** JPEG / WebP quality (percent) */
+  quality?: number;
+  use_lock_interface?: boolean;
+  // --- metadata (stamp)
+  use_stamp_date?: boolean;
+  use_stamp_time?: boolean;
+  use_stamp_render_time?: boolean;
+  use_stamp_frame?: boolean;
+  use_stamp_frame_range?: boolean;
+  use_stamp_memory?: boolean;
+  use_stamp_hostname?: boolean;
+  use_stamp_camera?: boolean;
+  use_stamp_lens?: boolean;
+  use_stamp_scene?: boolean;
+  use_stamp_marker?: boolean;
+  use_stamp_filename?: boolean;
+  use_stamp_note?: boolean;
+  stamp_note_text?: string;
+  use_stamp_labels?: boolean;
+  stamp_font_size?: number;
+  stamp_foreground?: [number, number, number, number];
+  stamp_background?: [number, number, number, number];
+  /** Solid (Workbench) engine: shading of final renders */
+  display_shading?: {
+    light: 'STUDIO' | 'MATCAP' | 'FLAT';
+    color_type: 'MATERIAL' | 'OBJECT' | 'SINGLE' | 'RANDOM' | 'VERTEX' | 'TEXTURE';
+    single_color: [number, number, number];
+    show_backface_culling: boolean;
+    show_xray: boolean;
+    xray_alpha: number;
+    show_shadows: boolean;
+    show_cavity: boolean;
+    show_object_outline: boolean;
+    show_specular_highlight: boolean;
+  };
+  // --- view layer
+  /** the view layer is rendered */
+  use_view_layer?: boolean;
+  use_sky?: boolean;
+  use_solid?: boolean;
+  use_pass_position?: boolean;
+  use_pass_uv?: boolean;
+  use_pass_material_index?: boolean;
 }
 
 export interface ToolSettings {
   use_snap: boolean;
-  snap_elements: ('INCREMENT' | 'VERTEX' | 'EDGE' | 'FACE' | 'VOLUME' | 'EDGE_MIDPOINT' | 'GRID')[];
+  snap_elements: ('INCREMENT' | 'VERTEX' | 'EDGE' | 'FACE' | 'VOLUME' | 'EDGE_MIDPOINT' | 'GRID' | 'EDGE_PERPENDICULAR' | 'FACE_CENTER')[];
+  /** snapping skips faces turned away from the view */
+  use_snap_backface_culling?: boolean;
+  /** objects that cannot be selected are not snapped to */
+  use_snap_selectable?: boolean;
+  /** which transforms the snap toggle applies to (Move on, Rotate / Scale off by default) */
+  use_snap_translate?: boolean;
+  use_snap_rotate?: boolean;
+  use_snap_scale?: boolean;
   snap_target: 'CLOSEST' | 'CENTER' | 'MEDIAN' | 'ACTIVE';
   use_snap_align_rotation?: boolean;
   use_snap_grid_absolute?: boolean;
@@ -838,9 +1438,27 @@ export interface ToolSettings {
   use_mesh_automerge: boolean;
   double_threshold: number;
   use_keyframe_insert_auto: boolean;
+  /** auto keying adds and replaces keys, or only replaces keys that exist on the frame */
+  auto_keying_mode?: 'ADD_REPLACE_KEYS' | 'REPLACE_KEYS';
+  /** auto keying keys the active keying set only */
+  use_keyframe_insert_keyingset?: boolean;
+  /** keys inserted on curves with a Cycles modifier land inside the cycle (and keep both ends equal) */
+  use_keyframe_cycle_aware?: boolean;
+  /** markers can't be selected, moved or deleted */
+  lock_markers?: boolean;
+  /** proportional editing of keys in the Dope Sheet / Graph Editor */
+  use_proportional_action?: boolean;
+  use_proportional_fcurve?: boolean;
   keyframe_type: Keyframe['type'];
   use_uv_select_sync: boolean;
   uv_select_mode: 'VERTEX' | 'EDGE' | 'FACE' | 'ISLAND';
+  /** re-unwrap islands while their pinned UVs are moved */
+  use_live_unwrap?: boolean;
+  /** snapping while transforming UVs, and what to snap to */
+  use_snap_uv?: boolean;
+  snap_uv_element?: 'INCREMENT' | 'VERTEX';
+  /** which UVs are selected together with a picked UV (default SHARED_LOCATION) */
+  uv_sticky_select_mode?: 'SHARED_LOCATION' | 'DISABLED' | 'SHARED_VERTEX';
   // sculpt / paint
   sculpt: SculptSettings;
   unified_paint: { size: number; strength: number; color: Color; secondary_color: Color; weight: number };
@@ -850,6 +1468,12 @@ export interface ToolSettings {
   use_mesh_mirror_x?: boolean;
   use_mesh_mirror_y?: boolean;
   use_mesh_mirror_z?: boolean;
+  /** interactive add tools: where the base is placed, how it is oriented, what Ctrl snaps to */
+  plane_depth?: 'SURFACE' | 'CURSOR_PLANE' | 'CURSOR_VIEW';
+  plane_orientation?: 'SURFACE' | 'DEFAULT';
+  snap_elements_tool?: 'GEOMETRY' | 'DEFAULT';
+  plane_axis?: 'X' | 'Y' | 'Z';
+  plane_axis_auto?: boolean;
 }
 
 export interface SculptSettings {
@@ -860,7 +1484,16 @@ export interface SculptSettings {
   radius: number; // px
   strength: number;
   use_dyntopo?: boolean;
+  /** dynamic topology detail: pixels (relative), percent of the brush, or constant resolution */
   detail_size?: number;
+  detail_type_method?: 'RELATIVE' | 'CONSTANT' | 'BRUSH' | 'MANUAL';
+  detail_refine_method?: 'SUBDIVIDE' | 'COLLAPSE' | 'SUBDIVIDE_COLLAPSE';
+  detail_percent?: number;
+  /** pull the surface down (world -Z) with every dab */
+  gravity?: number;
+  /** meshes with modifiers update their shading only after a stroke */
+  use_sculpt_delay_updates?: boolean;
+  constant_detail_resolution?: number;
   use_frontface?: boolean;
   falloff: 'SMOOTH' | 'SPHERE' | 'ROOT' | 'SHARP' | 'LINEAR' | 'CONSTANT';
   autosmooth_factor: number;
@@ -869,6 +1502,22 @@ export interface SculptSettings {
   normal_radius_factor?: number;
   use_space?: boolean;
   spacing?: number;
+  /** auto-masking: limit brushes by topology, face sets, boundaries, cavity or normals */
+  use_automasking_topology?: boolean;
+  use_automasking_face_sets?: boolean;
+  use_automasking_boundary_edges?: boolean;
+  use_automasking_boundary_face_sets?: boolean;
+  use_automasking_cavity?: boolean;
+  use_automasking_cavity_inverted?: boolean;
+  use_automasking_start_normal?: boolean;
+  use_automasking_view_normal?: boolean;
+  automasking_boundary_edges_propagation_steps?: number;
+  automasking_cavity_factor?: number;
+  automasking_cavity_blur_steps?: number;
+  automasking_start_normal_limit?: number;
+  automasking_start_normal_falloff?: number;
+  automasking_view_normal_limit?: number;
+  automasking_view_normal_falloff?: number;
 }
 
 export interface UnitSettings {
@@ -895,8 +1544,27 @@ export interface RigidBodyWorld {
   frame_end: number;
 }
 
+export interface KeyingSetPath {
+  /** object the path belongs to */
+  id: ID | null;
+  data_path: string;
+  /** array element, or -1 for all elements */
+  index: number;
+}
+
+export interface KeyingSetData {
+  name: string;
+  paths: KeyingSetPath[];
+  active_path_index?: number;
+}
+
 export interface SceneData {
   name: string;
+  /** step of the timeline's Jump buttons (Ctrl ← / →), in time_jump_unit */
+  time_jump_delta?: number;
+  time_jump_unit?: 'SECONDS' | 'FRAMES';
+  /** camera view safe-area margins (fractions of the frame, x and y) */
+  safe_areas?: { title: [number, number]; action: [number, number]; title_center: [number, number]; action_center: [number, number] };
   frame_start: number;
   frame_end: number;
   frame_step: number;
@@ -925,7 +1593,12 @@ export interface SceneData {
   /** active object id (view layer) */
   active_object: ID | null;
   custom: CustomProps;
-  keying_set?: 'LocRotScale' | 'Location' | 'Rotation' | 'Scale' | 'Available' | 'WholeCharacter';
+  /** active keying set: a built-in set or `KS:<name>` for one of `keying_sets` */
+  keying_set?: 'LocRotScale' | 'Location' | 'Rotation' | 'Scale' | 'Available' | 'WholeCharacter' | `KS:${string}`;
+  /** scrubbing stays inside the scene (or preview) frame range */
+  lock_frame_selection_to_range?: boolean;
+  /** user keying sets (absolute property paths) */
+  keying_sets?: KeyingSetData[];
 }
 
 export interface DocumentData {
@@ -947,8 +1620,26 @@ export interface DocumentData {
   particles: Record<ID, ParticleSettings>;
   texts: Record<ID, TextData>;
   brushes: Record<ID, BrushData>;
+  /** Font data-blocks used by text objects; absent in older files */
+  fonts?: Record<ID, VectorFontData>;
   /** Grease Pencil data-blocks (src/greasepencil); absent in older files */
   grease_pencils?: Record<ID, import('../greasepencil/types').GreasePencilData>;
+  /** Files stored in the project for geometry import nodes; absent in older files */
+  packed_files?: Record<ID, import('../geonodes/curves/importers').PackedFile>;
+  /** Metaball data-blocks (src/metaball); absent in older files */
+  metaballs?: Record<ID, import('../metaball/types').MetaballData>;
+  /** Hair curves data-blocks (src/hair); absent in older files */
+  hair_curves?: Record<ID, import('../hair/types').HairCurvesData>;
+  /** Volume data-blocks (src/volume); absent in older files */
+  volumes?: Record<ID, import('../volume/types').VolumeData>;
+  /** Point cloud data-blocks (src/pointcloud); absent in older files */
+  pointclouds?: Record<ID, import('../pointcloud/types').PointCloudData>;
+  /** Library files this file links data-blocks from (src/library); absent in older files */
+  libraries?: Record<ID, import('../library/types').LibraryData>;
+  /** Color palettes of the paint modes (src/paint/palette.ts); absent in older files */
+  palettes?: Record<ID, import('../paint/palettemath').PaletteData>;
+  /** Paint curves the Curve stroke method follows (src/paint/paintcurve.ts); absent in older files */
+  paint_curves?: Record<ID, import('../paint/strokemath').PaintCurveData>;
   /** Mode of the active object */
   mode: Mode;
   /** Ordering of object ids for stable iteration */
@@ -963,7 +1654,8 @@ export interface BrushData {
   mode: 'SCULPT' | 'TEXTURE_PAINT' | 'VERTEX_PAINT' | 'WEIGHT_PAINT';
   strength: number;
   radius: number;
-  falloff: SculptSettings['falloff'];
+  /** falloff preset (src/paint/math.ts), 'CUSTOM' uses the brush's own curve */
+  falloff: import('../paint/math').Falloff;
   direction: 'ADD' | 'SUBTRACT';
   color?: Color;
   blend?: 'MIX' | 'ADD' | 'SUB' | 'MUL' | 'LIGHTEN' | 'DARKEN' | 'ERASE_ALPHA';

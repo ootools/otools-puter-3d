@@ -25,13 +25,55 @@ import {
   type Group,
   type WebGLProgramParametersWithUniforms,
 } from 'three';
-import type { DocumentData, MaterialData } from '../../data/types';
+import type { DocumentData, MaterialData, NodeData } from '../../data/types';
+import type { PbrHint } from '../../render/final/ptmaterial';
+import { activeOutput } from '../tree';
 import { setMaterialCompiler, setMaterialKeyExtra, principledFallback, errorMaterial } from '../../render/pbr';
 import { imageTexture } from '../../render/images';
 import { compileTree, DISPLACE_MARK, type CompiledTree, type UniformSpec } from './codegen';
 import { app } from '../../app/app';
 import { renderContext } from '../../render/context';
 import { hashName } from './util';
+import { patchFx } from '../../render/realtime/fxshader';
+import { applyRealtimeMaterial, realtimeMaterialKey } from '../../render/realtime/materialfx';
+import { manualTexSpace } from '../../render/texspace';
+
+/**
+ * Path tracer hints for surface closures the generic conversion does not know: builders keyed by
+ * the node type feeding the Material Output's Surface (see render/final/ptmaterial.ts PbrHint).
+ */
+export const pbrHintBuilders: Record<string, (node: NodeData, doc: DocumentData) => PbrHint> = {};
+
+/** Base parameters for the path tracer: the Principled/Emission/Diffuse values plus closure-specific hints. */
+function surfaceHint(doc: DocumentData, ma: MaterialData): PbrHint {
+  const fb = principledFallback(doc, ma) as MeshPhysicalMaterial;
+  const hint: PbrHint = {
+    color: fb.color.clone(),
+    map: fb.map,
+    roughness: fb.roughness,
+    metalness: fb.metalness,
+    ior: fb.ior,
+    opacity: fb.opacity,
+    transmission: fb.transmission,
+    clearcoat: fb.clearcoat,
+    clearcoatRoughness: fb.clearcoatRoughness,
+    sheen: fb.sheen,
+    emissive: fb.emissive.clone(),
+    emissiveIntensity: fb.emissiveIntensity,
+  };
+  fb.dispose();
+  const out = activeOutput(ma.tree, 'ShaderNodeOutputMaterial');
+  const link = out && ma.tree.links.find((l) => l.to_node === out.id && l.to_socket === 'Surface' && !l.is_muted);
+  const from = link ? ma.tree.nodes.find((n) => n.id === link.from_node) : undefined;
+  const b = from && !from.mute ? pbrHintBuilders[from.type] : undefined;
+  return b ? { ...hint, ...b(from!, doc) } : hint;
+}
+
+/** Store the path tracer hint on a compiled material (the version tells the converter to refresh). */
+function setHint(mat: Material, hint: PbrHint) {
+  mat.userData.pbr = hint;
+  mat.userData.pbrVersion = ((mat.userData.pbrVersion as number | undefined) ?? 0) + 1;
+}
 
 interface Entry {
   key: string;
@@ -52,7 +94,7 @@ export const compileMessages = new Map<string, string[]>();
 function lutTexture(data: Float32Array, width: number, nearest: boolean): DataTexture {
   const half = new Uint16Array(data.length);
   for (let i = 0; i < data.length; i++) half[i] = DataUtils.toHalfFloat(data[i]);
-  const t = new DataTexture(half, width, 1, RGBAFormat, HalfFloatType);
+  const t = new DataTexture(half, width, Math.max(1, Math.floor(data.length / 4 / width)), RGBAFormat, HalfFloatType);
   t.magFilter = t.minFilter = nearest ? NearestFilter : LinearFilter;
   t.wrapS = t.wrapT = ClampToEdgeWrapping;
   t.generateMipmaps = false;
@@ -69,7 +111,7 @@ function updateLut(t: DataTexture, data: Float32Array, nearest: boolean) {
   return true;
 }
 
-function initialValue(doc: DocumentData, u: UniformSpec, luts: DataTexture[]): unknown {
+export function initialValue(doc: DocumentData, u: UniformSpec, luts: DataTexture[]): unknown {
   const v = u.value;
   if (typeof v === 'number') return v;
   if (Array.isArray(v)) return v.length === 3 ? new Vector3(v[0], v[1], v[2]) : new Vector4(v[0], v[1], v[2], v[3] ?? 1);
@@ -249,10 +291,16 @@ function updateObjectGroup(g: UniformsGroup, renderer: WebGLRenderer, geometry: 
   const u = g.uniforms as Uniform[];
   if (!geometry.boundingBox) geometry.computeBoundingBox();
   const bb = geometry.boundingBox!;
-  (u[0].value as Vector4).set(bb.min.x, bb.min.y, bb.min.z, 0);
-  (u[1].value as Vector4).set(bb.max.x, bb.max.y, bb.max.z, 0);
   const id = object.userData.id as string | undefined;
   const ob = id ? app?.doc.objects[id] : undefined;
+  const ts = manualTexSpace(app?.doc, ob);
+  if (ts) {
+    (u[0].value as Vector4).set(ts[0], ts[1], ts[2], 0);
+    (u[1].value as Vector4).set(ts[3], ts[4], ts[5], 0);
+  } else {
+    (u[0].value as Vector4).set(bb.min.x, bb.min.y, bb.min.z, 0);
+    (u[1].value as Vector4).set(bb.max.x, bb.max.y, bb.max.z, 0);
+  }
   (u[2].value as Vector4).set(ob ? hashName(ob.name) : 0, ob?.pass_index ?? 0, (group as unknown as { materialIndex?: number } | null)?.materialIndex ?? 0, 0);
   const c = ob?.color ?? [1, 1, 1, 1];
   (u[3].value as Vector4).set(c[0], c[1], c[2], c[3] ?? 1);
@@ -289,13 +337,13 @@ function build(doc: DocumentData, ma: MaterialData, ct: CompiledTree, key: strin
   mat.depthWrite = true;
   if (alphaUsed) {
     if (mode === 'CLIP') mat.alphaTest = Math.max(1e-4, ma.alpha_threshold);
-    else if (mode === 'HASHED') mat.alphaHash = true;
+    else if (mode === 'HASHED' || mode === 'OPAQUE') mat.alphaHash = true;
     else if (mode === 'BLEND') {
       mat.transparent = true;
       mat.depthWrite = ma.show_transparent_back === false;
     }
   }
-  const alphaMode = alphaUsed && mode !== 'OPAQUE' ? 'ALPHA' : 'OPAQUE';
+  const alphaMode = alphaUsed ? 'ALPHA' : 'OPAQUE';
   const objectGroup = makeObjectGroup();
   let objectBlock = false;
   let barycentric = false;
@@ -312,7 +360,11 @@ function build(doc: DocumentData, ma: MaterialData, ct: CompiledTree, key: strin
     shader.vertexShader = r.vertex;
     shader.fragmentShader = r.fragment;
     Object.assign(shader.uniforms, uniforms);
+    patchFx(shader);
   };
+  applyRealtimeMaterial(mat, ma);
+  // realtime subsurface scattering pass (render/realtime/sss.ts)
+  mat.userData.ndSss = ct.lib.includes('ND_HAS_SSS');
   mat.customProgramCacheKey = () => `nd:${key}`;
   if (objectBlock) (mat as unknown as { uniformsGroups: UniformsGroup[] }).uniformsGroups = [objectGroup];
   if (objectBlock || barycentric) {
@@ -330,6 +382,7 @@ function build(doc: DocumentData, ma: MaterialData, ct: CompiledTree, key: strin
     for (const t of luts) t.dispose();
   };
   mat.name = ma.name;
+  setHint(mat, surfaceHint(doc, ma));
   return { key, mat, uniforms, luts, errors: ct.errors };
 }
 
@@ -341,7 +394,7 @@ export function compileMaterial(doc: DocumentData, ma: MaterialData): Material {
   if (!hooked && renderContext) installShaderErrorHook(renderContext.engine.renderer);
   if (!ma.use_nodes) return principledFallback(doc, ma);
   const ct = compileTree(doc, ma.tree, 'MATERIAL');
-  const key = `${ct.key}|${ma.blend_method}|${ma.use_backface_culling ? 1 : 0}|${ma.show_transparent_back === false ? 0 : 1}`;
+  const key = `${ct.key}|${ma.blend_method}|${ma.use_backface_culling ? 1 : 0}|${ma.show_transparent_back === false ? 0 : 1}|${realtimeMaterialKey(ma)}`;
   compileMessages.set(ma.id, ct.errors);
   if (failedKeys.has(key)) return errorMaterial;
   const hit = cache.get(ma.id);
@@ -351,6 +404,7 @@ export function compileMaterial(doc: DocumentData, ma: MaterialData): Material {
       if (target) assignValue(doc, target, u);
     }
     if (ma.blend_method === 'CLIP') hit.mat.alphaTest = hit.mat.alphaTest > 0 ? Math.max(1e-4, ma.alpha_threshold) : 0;
+    setHint(hit.mat, surfaceHint(doc, ma));
     return hit.mat;
   }
   if (hit) release(hit);
@@ -409,6 +463,8 @@ setMaterialKeyExtra((doc, ma) => {
       }
       const img = n.props.image as string | undefined;
       if (img && seen.size && doc.images[img]) k += `|i:${img}:${doc.images[img].revision ?? 0}`;
+      // Scene Time: the frame is a value of the tree
+      if ((n as { type?: string }).type === 'GeometryNodeInputSceneTime') k += `|f:${doc.scene.frame_current}:${doc.scene.frame_subframe ?? 0}`;
     }
   };
   visit(ma.tree.nodes);

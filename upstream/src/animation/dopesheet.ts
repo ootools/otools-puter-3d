@@ -4,19 +4,26 @@ import { icon } from '../ui/icons';
 import { app } from '../app/app';
 import { registerEditor, type Area } from '../ui/screen';
 import { openMenu, type MenuItem } from '../ui/menu';
-import { numberField } from '../ui/widgets';
-import type { ShapeKey } from '../data/types';
-import { AnimEditor, RULER_H, menuButton, hdrToggle, markerMenu } from './animeditor';
-import type { Channel, SpaceKind } from './channels';
+import { numberField, textField, checkbox } from '../ui/widgets';
+import { actionRange } from './actionops';
+import type { ActionData, Keyframe, ObjectData, ShapeKey, TimelineMarker } from '../data/types';
+import { findSlot, slotIdType, slotName, slotUsers } from '../anim/slots';
+import { objectSlotBinding, renameSlotEverywhere, slotSelector } from './slotops';
+import { AnimEditor, RULER_H, menuButton, hdrToggle, markerMenu, type Selectable, type SidebarTab } from './animeditor';
+import type { Channel, CurveRef, SpaceKind } from './channels';
+import { insertMaskKeys } from './maskmode';
 import { C, drawKey, shapeFor } from './theme';
 import { aggregate } from './aggregate';
 import { setKeySelected, selectAll, selectColumns, keyBounds } from './keyedit';
 import { startKeyTransform, type KeyTransformHost, type KeyTransformMode } from './transformkeys';
+import { proportionalOf, proportionalHeader } from './proportional';
 import { playbackFooter } from './footer';
+import { lassoGesture } from './selecttools';
 import { actionSelector } from './actionui';
-import { viewMenuCommon, selectMenu, channelMenu, keyMenu } from './menus';
+import { previewRangeMenu, selectMenu, channelMenu, keyMenu } from './menus';
+import { cacheMenuItems, timelineOverlays } from './overlays';
 
-export type DopeSheetMode = 'DOPESHEET' | 'ACTION' | 'SHAPEKEY';
+export type DopeSheetMode = 'DOPESHEET' | 'ACTION' | 'SHAPEKEY' | 'MASK';
 
 const MODES: {
   value: DopeSheetMode;
@@ -42,27 +49,49 @@ const MODES: {
     icon: 'shapekey_data',
     description: 'Edit keyframes in active object’s Shape Keys action',
   },
+  {
+    value: 'MASK',
+    label: 'Mask',
+    icon: 'mod_mask',
+    description: 'Edit the timing of mask shape keys',
+  },
 ];
 
 /** Mode list of the header dropdown (modules may append modes, e.g. Grease Pencil). */
 export const DOPESHEET_MODES = MODES as { value: string; label: string; icon: string; description: string }[];
 
 export class DopeSheet extends AnimEditor {
-  keymaps = ['Animation Channels', 'Dopesheet', 'Animation'];
+  keymaps = ['Markers', 'Animation Channels', 'Dopesheet', 'Animation'];
   prefix = 'action' as const;
   mode: DopeSheetMode = 'DOPESHEET';
   showHandlesInterp = true;
   showSummary = true;
+  protected filterExtras(): Child {
+    return this.mode === 'DOPESHEET' ? checkbox('af-summary', 'Summary', this.showSummary, (v) => ((this.showSummary = v), this.refresh(), app.changed('ui'))) : null;
+  }
+
+  get filter() {
+    return { ...super.filter, noSummary: !this.showSummary };
+  }
+
+  /** View ▸ Show Extremes: mark keys where the value turns */
+  showExtremes = false;
+  /** Action Editor: the marker row shows the action's pose markers */
+  showPoseMarkers = false;
 
   constructor(area: Area, state?: unknown) {
     super(area, state);
     const s = (state ?? {}) as Record<string, unknown>;
-    if (s.mode === 'ACTION' || s.mode === 'SHAPEKEY' || s.mode === 'DOPESHEET') this.mode = s.mode;
+    if (s.mode === 'ACTION' || s.mode === 'SHAPEKEY' || s.mode === 'DOPESHEET' || s.mode === 'MASK') this.mode = s.mode;
     if (typeof s.showHandlesInterp === 'boolean') this.showHandlesInterp = s.showHandlesInterp;
+    if (typeof s.showPoseMarkers === 'boolean') this.showPoseMarkers = s.showPoseMarkers;
+    if (typeof s.showExtremes === 'boolean') this.showExtremes = s.showExtremes;
+    // the Dope Sheet shows its playback controls unless turned off
+    if (typeof s.showFooter !== 'boolean') this.showFooter = true;
   }
 
   protected serializeExtra() {
-    return { mode: this.mode, showHandlesInterp: this.showHandlesInterp };
+    return { mode: this.mode, showHandlesInterp: this.showHandlesInterp, showPoseMarkers: this.showPoseMarkers, showExtremes: this.showExtremes };
   }
 
   space(): SpaceKind {
@@ -108,10 +137,16 @@ export class DopeSheet extends AnimEditor {
       ),
       menuButton('View', () => this.viewMenu()),
       menuButton('Select', () => selectMenu('action')),
-      menuButton('Marker', markerMenu),
-      menuButton('Channel', () => channelMenu('action')),
+      menuButton('Marker', () => [
+        ...markerMenu(),
+        { separator: true },
+        { label: 'Sync Markers', checked: this.syncMarkers, description: 'Move the selected markers along with transformed keyframes', action: () => ((this.syncMarkers = !this.syncMarkers), app.changed('ui')) },
+      ]),
+      this.mode === 'MASK' ? null : menuButton('Channel', () => channelMenu('action')),
       menuButton('Key', () => keyMenu('action')),
+      this.mode === 'ACTION' ? menuButton('Action', actionMenu) : null,
       this.mode === 'ACTION' && ob ? actionSelector(ob) : null,
+      this.mode === 'ACTION' && ob ? this.slotHeader(ob) : null,
       h('div', { class: 'hdr-spacer' }),
       this.mode === 'DOPESHEET'
         ? hdrToggle(
@@ -131,40 +166,94 @@ export class DopeSheet extends AnimEditor {
             () => ((this.showHidden = !this.showHidden), this.refresh(), app.changed('ui')),
           )
         : null,
-      hdrToggle(
-        'snap',
-        this.autoSnap ? 'snap_on' : 'snap_off',
-        this.autoSnap,
-        'Snap\nSnap keyframes to whole frames while transforming (Ctrl toggles)',
-        () => ((this.autoSnap = !this.autoSnap), app.changed('ui')),
-      ),
+      this.errorsToggle(),
+      this.filtersHeader(),
+      this.snapHeader('keyframes'),
+      proportionalHeader('use_proportional_action'),
     );
   }
 
+  /** Slot selector next to the action selector (actions with slots). */
+  private slotHeader(ob: ObjectData): Child {
+    const b = objectSlotBinding(ob);
+    return b ? slotSelector('ds-slot', b, 'header') : null;
+  }
+
+  private poseMarkerAction(): ActionData | null {
+    if (this.mode !== 'ACTION' || !this.showPoseMarkers) return null;
+    const id = app.activeObject?.animation_data?.action;
+    return id ? (app.doc.actions[id] ?? null) : null;
+  }
+
+  markerList() {
+    const act = this.poseMarkerAction();
+    return act ? (act.pose_markers ??= []) : super.markerList();
+  }
+
+  setMarkerList(list: TimelineMarker[]) {
+    const act = this.poseMarkerAction();
+    if (act) act.pose_markers = list;
+    else super.setMarkerList(list);
+  }
+
+  protected sidebarTabs(): SidebarTab[] {
+    const ob = app.activeObject;
+    const act = ob?.animation_data?.action ? app.doc.actions[ob.animation_data.action] : undefined;
+    return act ? [{ id: 'action', label: 'Action', draw: () => [actionPanel(act), slotPanel(act)] }] : [];
+  }
+
   viewMenu(): MenuItem[] {
+    const tog = (label: string, on: boolean, flip: () => void, extra: Partial<MenuItem> = {}): MenuItem => ({ label, checked: on, ...extra, action: () => (flip(), this.refresh(), app.changed('ui')) });
     return [
-      {
-        label: 'Show Handles and Interpolation',
-        checked: this.showHandlesInterp,
-        action: () => ((this.showHandlesInterp = !this.showHandlesInterp), this.draw()),
-      },
-      {
-        label: 'Show Markers',
-        checked: this.showMarkers,
-        action: () => ((this.showMarkers = !this.showMarkers), this.refresh()),
-      },
-      ...viewMenuCommon('action', this),
+      { label: 'Sidebar', checked: this.showSidebar, shortcut: 'N', action: () => this.toggleSidebar() },
+      this.channelsMenuItem(),
+      this.footerMenuItem(),
+      { separator: true },
+      { label: 'Frame Selected', op: 'action.view_selected', shortcut: 'Numpad .' },
+      { label: 'Frame All', op: 'action.view_all', shortcut: 'Home' },
+      { label: 'Frame Scene Range', op: 'anim.scene_range_frame' },
+      { label: 'Go to Current Frame', op: 'action.view_frame', shortcut: 'Numpad 0' },
+      { separator: true },
+      tog('Multi-Word Match Search', this.multiWordSearch, () => (this.multiWordSearch = !this.multiWordSearch)),
+      { separator: true },
+      this.realtimeMenuItem(),
+      tog('Show Sliders', this.showSliders, () => {
+        this.showSliders = !this.showSliders;
+        if (this.showSliders) this.chWidth = Math.max(this.chWidth, 300);
+      }),
+      tog('Show Handles and Interpolation', this.showHandlesInterp, () => (this.showHandlesInterp = !this.showHandlesInterp)),
+      tog('Show Extremes', this.showExtremes, () => (this.showExtremes = !this.showExtremes)),
+      tog('Auto-Merge Keyframes', this.autoMerge, () => (this.autoMerge = !this.autoMerge)),
+      { separator: true },
+      tog('Show Markers', this.showMarkers, () => (this.showMarkers = !this.showMarkers)),
+      ...(this.mode === 'ACTION' ? [tog('Show Pose Markers', this.showPoseMarkers, () => (this.showPoseMarkers = !this.showPoseMarkers))] : []),
+      { label: 'Show Seconds', checked: this.showSeconds, op: 'anim.show_seconds_toggle', shortcut: 'Ctrl T' },
+      this.syncRangeMenuItem(),
+      { separator: true },
+      ...previewRangeMenu('action.previewrange_set'),
+      { separator: true },
+      { label: 'Toggle Graph Editor', op: 'anim.switch_editor', props: { type: 'GRAPH' }, shortcut: 'Ctrl Tab' },
+      { separator: true },
+      ...cacheMenuItems(this),
+      this.areaMenuItem(),
     ];
   }
 
   protected footer(): Child | null {
-    return playbackFooter();
+    return playbackFooter(null, true);
+  }
+
+  /** Mask mode: I keys the layers' current point positions. */
+  insertKeys(curves: CurveRef[], _type: Keyframe['type']): boolean {
+    if (this.mode !== 'MASK') return false;
+    if (!insertMaskKeys(curves, app.doc.scene.frame_current)) app.report('WARNING', 'No mask layers with points to key');
+    return true;
   }
 
   // ---------------------------------------------------------------- channels
 
   protected rowExtra(ch: Channel): Child {
-    if (ch.kind !== 'SHAPEKEY' || !ch.shapeKey) return null;
+    if (ch.kind !== 'SHAPEKEY' || !ch.shapeKey) return this.valueSlider(ch);
     const sk: ShapeKey = ch.shapeKey;
     return h(
       'span',
@@ -186,7 +275,12 @@ export class DopeSheet extends AnimEditor {
   }
 
   protected rowToggles(ch: Channel): Child {
-    return this.muteLockToggles(ch);
+    return [this.modifierToggle(ch), this.muteLockToggles(ch)];
+  }
+
+  /** group rows carry the pin (object rows do not, here) */
+  protected rowPrefix(ch: Channel): Child {
+    return ch.kind === 'GROUP' ? this.pinToggle(ch) : null;
   }
 
   channelContextMenu(): MenuItem[] {
@@ -244,6 +338,8 @@ export class DopeSheet extends AnimEditor {
   // ---------------------------------------------------------------- drawing
 
   protected drawContent(g: CanvasRenderingContext2D, W: number, H: number) {
+    // registered overlays (e.g. simulation cache bars along the bottom)
+    for (const o of timelineOverlays) o(g, this, W);
     const v = this.view;
     const rows = this.list.rows;
     const rh = this.rowH;
@@ -281,6 +377,7 @@ export class DopeSheet extends AnimEditor {
         if (x < -10 || x > W + 10) continue;
         const shape = this.showHandlesInterp ? shapeFor(k.handle, k.interp) : 'DIAMOND';
         drawKey(g, Math.round(x) + 0.5, Math.round(yc) + 0.5, size, k.type, k.selected, shape, muted ? 0.5 : 1);
+        if (this.showExtremes && k.extreme) drawExtreme(g, Math.round(x) + 0.5, Math.round(yc) + 0.5, size, k.extreme);
       }
     }
   }
@@ -304,7 +401,7 @@ export class DopeSheet extends AnimEditor {
     return best === null ? null : { ch, frame: best };
   }
 
-  private keysAt(ch: Channel, frame: number) {
+  keysAt(ch: Channel, frame: number) {
     const out = [];
     for (const r of ch.curves) for (const k of r.fc.keyframe_points) if (Math.abs(k.co[0] - frame) < 1e-3) out.push(k);
     return out;
@@ -320,7 +417,13 @@ export class DopeSheet extends AnimEditor {
       fromDisp: (_fc, d) => d,
       screen: (x) => this.toClient(this.view.fx(x), RULER_H),
       autoSnap: this.autoSnap,
+      snapTo: this.snapTo(),
       handlesVisible: () => true,
+      proportional: proportionalOf('use_proportional_action'),
+      autoMerge: this.autoMerge,
+      syncMarkers: this.syncMarkers ? this.markerList().filter((m) => m.select) : undefined,
+      realtime: this.realtimeUpdates,
+      redraw: () => this.draw(),
     };
   }
 
@@ -336,6 +439,14 @@ export class DopeSheet extends AnimEditor {
   protected mainDown(e: PointerEvent, x: number, y: number) {
     const hit = this.keyAt(x, y);
     const curves = this.list.curves;
+    if (e.altKey && (e.ctrlKey || e.metaKey) && hit) {
+      // Ctrl+Alt: every key of the channel
+      if (!e.shiftKey) selectAll(curves, 'DESELECT');
+      for (const r of hit.ch.curves) r.fc.keyframe_points.forEach((k) => setKeySelected(k, true));
+      app.pushUndo('Select Channel Keys');
+      app.changed('doc');
+      return;
+    }
     if (e.altKey && hit) {
       selectColumns(curves, [hit.frame], e.shiftKey);
       app.pushUndo('Select Column');
@@ -386,6 +497,20 @@ export class DopeSheet extends AnimEditor {
     );
   }
 
+  protected onCanvasDown(e: PointerEvent) {
+    // Ctrl+right-drag: lasso select (Shift subtracts)
+    if (e.button === 2 && (e.ctrlKey || e.metaKey) && this.regionAt(e) === 'main' && !app.modal) {
+      e.preventDefault();
+      this.clickOrDrag(
+        e,
+        () => {},
+        (start) => lassoGesture(this, start, e.shiftKey ? 'SUB' : 'ADD', true, 'action'),
+      );
+      return;
+    }
+    super.onCanvasDown(e);
+  }
+
   private selectKeyChannel(ch: Channel) {
     if (ch.kind !== 'FCURVE' && ch.kind !== 'SHAPEKEY') return;
     this.deselectChannels();
@@ -404,6 +529,33 @@ export class DopeSheet extends AnimEditor {
     }
     app.pushUndo('Box Select');
     app.changed('doc');
+  }
+
+  selectables(): Selectable[] {
+    const out: Selectable[] = [];
+    const rows = this.list.rows;
+    for (let i = 0; i < rows.length; i++) {
+      const y = this.rowTop(i) + this.rowH / 2;
+      const ch = rows[i];
+      const byFrame = new Map<number, { k: Keyframe[] }>();
+      for (const r of ch.curves) {
+        if (r.fc.lock) continue;
+        for (const k of r.fc.keyframe_points) {
+          const f = Math.round(k.co[0] * 1000) / 1000;
+          let e = byFrame.get(f);
+          if (!e) byFrame.set(f, (e = { k: [] }));
+          e.k.push(k);
+        }
+      }
+      for (const [f, e] of byFrame)
+        out.push({
+          x: this.view.fx(f),
+          y,
+          selected: e.k.every((k) => k.select_control_point),
+          set: (v) => e.k.forEach((k) => setKeySelected(k, v)),
+        });
+    }
+    return out;
   }
 
   viewAll() {
@@ -428,14 +580,105 @@ export class DopeSheet extends AnimEditor {
   }
 }
 
+/** Sidebar panel for the active action: name, fake user and manual frame range. */
+function actionPanel(act: ActionData): Child {
+  const row = (label: string, c: Child) => h('div', { class: 'split-row' }, h('div', { class: 'sr-label' }, label), h('div', { class: 'sr-value' }, c), h('span'));
+  const commit = (label: string, final = true) => (app.changed('doc'), final && app.pushUndo(label));
+  const manual = !!act.frame_range;
+  const [a, b] = actionRange(act);
+  return h(
+    'div',
+    { class: 'anim-sb-panel' },
+    h('div', { class: 'anim-sb-title' }, 'Action'),
+    row('Name', textField('ds-act-name', act.name, (v) => v && ((act.name = v), commit('Rename Action')))),
+    h('div', { class: 'split-row check' }, h('div', { class: 'sr-label' }), h('div', { class: 'sr-value' }, checkbox('ds-act-fake', 'Fake User', !!act.use_fake_user, (v) => ((act.use_fake_user = v), commit('Fake User')))), h('span')),
+    h('div', { class: 'split-row check' }, h('div', { class: 'sr-label' }), h('div', { class: 'sr-value' }, checkbox('ds-act-range', 'Manual Frame Range', manual, (v) => ((act.frame_range = v ? [a, b] : undefined), commit('Manual Frame Range')))), h('span')),
+    manual
+      ? [
+          row('Start', numberField({ id: 'ds-act-fs', value: act.frame_range![0], precision: 2, set: (v, f) => ((act.frame_range = [v, Math.max(v + 1, act.frame_range![1])]), commit('Action Frame Range', f)) })),
+          row('End', numberField({ id: 'ds-act-fe', value: act.frame_range![1], precision: 2, set: (v, f) => ((act.frame_range = [Math.min(act.frame_range![0], v - 1), v]), commit('Action Frame Range', f)) })),
+        ]
+      : null,
+  );
+}
+
+/** Chevrons over (maximum) and/or under (minimum) a key that is a turning point. */
+function drawExtreme(g: CanvasRenderingContext2D, x: number, y: number, size: number, kind: 'MAX' | 'MIN' | 'BOTH') {
+  const r = size / 2 + 2,
+    w = 3;
+  g.save();
+  g.strokeStyle = 'rgba(0, 0, 0,0.8)';
+  g.fillStyle = '#e8e9ea';
+  g.lineWidth = 1;
+  const tri = (dir: 1 | -1) => {
+    g.beginPath();
+    g.moveTo(x - w, y - dir * r);
+    g.lineTo(x, y - dir * (r + w));
+    g.lineTo(x + w, y - dir * r);
+    g.closePath();
+    g.fill();
+    g.stroke();
+  };
+  if (kind !== 'MIN') tri(1);
+  if (kind !== 'MAX') tri(-1);
+  g.restore();
+}
+
+/** The action's active slot: name and the type of data-block it is for. */
+function slotPanel(act: ActionData): Child {
+  const slot = findSlot(act, act.active_slot) ?? act.slots?.[0];
+  if (!slot) return null;
+  const row = (label: string, c: Child) => h('div', { class: 'split-row' }, h('div', { class: 'sr-label' }, label), h('div', { class: 'sr-value' }, c), h('span'));
+  const t = slotIdType(slot);
+  const users = slotUsers(app.doc, act, slot.handle);
+  return h(
+    'div',
+    { class: 'anim-sb-panel' },
+    h('div', { class: 'anim-sb-title' }, 'Slot'),
+    row(
+      'Name',
+      textField('ds-slot-name', slotName(slot), (v) => {
+        if (!v.trim()) return;
+        renameSlotEverywhere(app.doc, act, slot, v.trim());
+        app.pushUndo('Rename Slot');
+        app.changed('doc');
+      }),
+    ),
+    row('Type', h('span', { class: 'sr-text' }, t === 'UNSPECIFIED' ? 'Not yet assigned' : t.charAt(0) + t.slice(1).toLowerCase())),
+    row('Users', h('span', { class: 'sr-text' }, users.length ? users.map((o) => o.name).join(', ') : 'None')),
+  );
+}
+
+/** Header ▸ Action menu of the Action Editor. */
+function actionMenu(): MenuItem[] {
+  return [
+    { label: 'Merge Animation', op: 'anim.merge_animation' },
+    { label: 'Separate Slots', op: 'anim.separate_slots' },
+    { label: 'Replace Action', op: 'anim.replace_action' },
+    { label: 'Replace with New Action', op: 'anim.replace_action_new' },
+    { separator: true },
+    { label: 'Move Slots to new Action', op: 'anim.slot_channels_move_to_new_action' },
+    { separator: true },
+    { label: 'New Action', op: 'action.new' },
+    { label: 'Unlink Action', op: 'action.unlink' },
+    { separator: true },
+    { label: 'Push Down Action', op: 'action.push_down' },
+    { label: 'Stash Action', op: 'action.stash' },
+    { label: 'Stash and Create New', op: 'action.stash_and_create' },
+  ];
+}
+
 function rowColor(ch: Channel) {
   switch (ch.kind) {
     case 'SUMMARY':
       return C.summary;
     case 'OBJECT':
+    case 'MASK':
       return C.objectRow;
     case 'ACTION':
       return C.actionRow;
+    case 'SLOT':
+      return C.objectRow;
     case 'GROUP':
       return ch.ob && ch.action ? C.groupRow : C.groupRow;
     default:

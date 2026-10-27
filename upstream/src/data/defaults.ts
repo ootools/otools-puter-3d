@@ -23,7 +23,8 @@ import type {
   LatticeData,
   BrushData,
 } from './types';
-import { cube } from '../mesh/primitives';
+import { startupCube } from '../mesh/primitives';
+import { defaultBakeSettings } from '../bake/settings';
 
 let counter = 0;
 export function uid(prefix = 'id'): ID {
@@ -36,6 +37,8 @@ export const IDENTITY: Mat4 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 export function defaultRender(): RenderSettings {
   return {
     engine: 'RASTER',
+    bake: defaultBakeSettings(),
+    bake_type: 'COMBINED',
     resolution_x: 1920,
     resolution_y: 1080,
     resolution_percentage: 100,
@@ -78,6 +81,92 @@ export function defaultRender(): RenderSettings {
     use_pass_mist: false,
     use_compositing: true,
     dither_intensity: 1,
+    use_freestyle: false,
+    line_thickness_mode: 'ABSOLUTE',
+    line_thickness: 1,
+    preview_raster_samples: 16,
+    time_limit: 0,
+    sample_clamp_direct: 0,
+    sample_clamp_indirect: 10,
+    blur_glossy: 1,
+    direct_light_intensity: 1,
+    indirect_light_intensity: 1,
+    use_simplify: false,
+    simplify_subdivision: 6,
+    simplify_subdivision_render: 6,
+    simplify_child_particles: 1,
+    simplify_child_particles_render: 1,
+    use_bokeh_jittered: true,
+    motion_blur_position: 'CENTER',
+    filter_size: 1.5,
+    pixel_filter_type: 'BLACKMAN_HARRIS',
+    filter_width: 1.5,
+    film_exposure: 1,
+    preview_pixel_size: 'AUTO',
+    use_auto_tile: true,
+    tile_size: 640,
+    display_device: 'sRGB',
+    sequencer_colorspace: 'sRGB',
+    use_white_balance: false,
+    white_balance_temperature: 6500,
+    white_balance_tint: 10,
+    use_curve_mapping: false,
+    curve_mapping: [
+      [0, 0],
+      [1, 1],
+    ],
+    frame_map_old: 100,
+    frame_map_new: 100,
+    use_border: false,
+    border_min_x: 0,
+    border_min_y: 0,
+    border_max_x: 1,
+    border_max_y: 1,
+    use_crop_to_border: false,
+    use_file_extension: true,
+    quality: 90,
+    use_lock_interface: false,
+    use_stamp: false,
+    use_stamp_date: true,
+    use_stamp_time: true,
+    use_stamp_render_time: true,
+    use_stamp_frame: true,
+    use_stamp_frame_range: false,
+    use_stamp_memory: false,
+    use_stamp_hostname: false,
+    use_stamp_camera: true,
+    use_stamp_lens: false,
+    use_stamp_scene: true,
+    use_stamp_marker: false,
+    use_stamp_filename: true,
+    use_stamp_note: false,
+    stamp_note_text: '',
+    use_stamp_labels: true,
+    stamp_font_size: 12,
+    stamp_foreground: [0.8, 0.8, 0.8, 1],
+    stamp_background: [0, 0, 0, 0.25],
+    display_shading: {
+      light: 'STUDIO',
+      color_type: 'MATERIAL',
+      single_color: [0.8, 0.8, 0.8],
+      show_backface_culling: false,
+      show_xray: false,
+      xray_alpha: 0.5,
+      show_shadows: false,
+      show_cavity: false,
+      show_object_outline: true,
+      show_specular_highlight: true,
+    },
+    use_view_layer: true,
+    use_sky: true,
+    use_solid: true,
+    use_pass_position: false,
+    use_pass_uv: false,
+    use_pass_object_index: false,
+    use_pass_material_index: false,
+    use_pass_diffuse_color: false,
+    use_pass_emit: false,
+    use_pass_ambient_occlusion: false,
   };
 }
 
@@ -96,6 +185,7 @@ export function defaultToolSettings(): ToolSettings {
     use_mesh_automerge: false,
     double_threshold: 0.001,
     use_keyframe_insert_auto: false,
+    use_keyframe_cycle_aware: false,
     keyframe_type: 'KEYFRAME',
     use_uv_select_sync: false,
     uv_select_mode: 'VERTEX',
@@ -199,6 +289,7 @@ export function newWorld(name = 'World'): WorldData {
       links: [{ id: uid('link'), from_node: bg.id, from_socket: 'Background', to_node: out.id, to_socket: 'Surface' }],
     },
     mist_start: 5,
+    mist_falloff: 'QUADRATIC',
     mist_depth: 25,
   };
 }
@@ -432,6 +523,7 @@ export function newObject(name: string, type: ObjectType, data: ID | null): Obje
     empty_display_type: 'PLAIN_AXES',
     empty_display_size: 1,
     instance_type: 'NONE',
+    instance_faces_scale: 1,
     instance_collection: null,
     modifiers: [],
     constraints: [],
@@ -505,6 +597,7 @@ export function defaultBrushes(): Record<ID, BrushData> {
 
 export function defaultScene(collection: ID, world: ID): SceneData {
   return {
+    id: uid('sc'),
     name: 'Scene',
     frame_start: 1,
     frame_end: 250,
@@ -566,8 +659,9 @@ export function startupDocument(): DocumentData {
 
   const mat = newMaterial('Material');
   doc.materials[mat.id] = mat;
-  const me = newMeshData('Cube', cube(2));
+  const me = newMeshData('Cube', startupCube());
   me.materials = [mat.id];
+  me.select_vert = new Uint8Array(8).fill(1);
   doc.meshes[me.id] = me;
   const cubeOb = newObject('Cube', 'MESH', me.id);
   cubeOb.select = true;

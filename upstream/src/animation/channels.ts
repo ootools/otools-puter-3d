@@ -1,11 +1,13 @@
 // Channel hierarchy shared by the animation editors (Dope Sheet, Graph Editor,
 // Drivers, NLA): Summary ▸ Object ▸ Action ▸ Group ▸ F-Curve, shape keys,
 // drivers and NLA tracks. Pure document logic (no DOM) so it can be unit tested.
-import type { ActionData, DocumentData, Driver, FCurve, NlaTrack, ObjectData, ShapeKey } from '../data/types';
+import type { ActionData, ActionSlot, DocumentData, Driver, FCurve, NlaTrack, ObjectData, ShapeKey } from '../data/types';
+import { curveSlot, isSlotted, objectCurves, slotCurves, slotIdType, slotName, slotUsers } from '../anim/slots';
 import { channelLabel, dataBlock } from '../data/rna';
+import { driverAction } from './drivercurves';
 
-export type SpaceKind = 'DOPESHEET' | 'ACTION' | 'SHAPEKEY' | 'GRAPH' | 'DRIVERS' | 'NLA';
-export type ChannelKind = 'SUMMARY' | 'OBJECT' | 'ACTION' | 'GROUP' | 'FCURVE' | 'SHAPEKEY' | 'DRIVERS' | 'DRIVER' | 'NLA_ACTION' | 'NLA_TRACK';
+export type SpaceKind = 'DOPESHEET' | 'ACTION' | 'SHAPEKEY' | 'GRAPH' | 'DRIVERS' | 'NLA' | 'MASK';
+export type ChannelKind = 'SUMMARY' | 'OBJECT' | 'ACTION' | 'SLOT' | 'GROUP' | 'FCURVE' | 'SHAPEKEY' | 'DRIVERS' | 'DRIVER' | 'NLA_ACTION' | 'NLA_TRACK' | 'MASK' | 'MASK_LAYER';
 
 export interface CurveRef {
   ob: ObjectData;
@@ -21,6 +23,8 @@ export interface Channel {
   icon?: string;
   ob?: ObjectData;
   action?: ActionData;
+  /** SLOT rows (and rows inside a slot in the Action Editor) */
+  slot?: ActionSlot;
   group?: string;
   fc?: FCurve;
   shapeKey?: ShapeKey;
@@ -28,6 +32,11 @@ export interface Channel {
   driverIndex?: number;
   track?: NlaTrack;
   trackIndex?: number;
+  /** MASK / MASK_LAYER rows (Dope Sheet ▸ Mask) */
+  mask?: import('../mask/types').MaskData;
+  maskLayer?: import('../mask/types').MaskLayer;
+  /** the channel's property can't be found */
+  error?: boolean;
   /** F-Curves summarized by this row (keys drawn/edited through it) */
   curves: CurveRef[];
   expandable: boolean;
@@ -38,9 +47,23 @@ export interface ChannelFilter {
   onlySelected: boolean;
   showHidden: boolean;
   search: string;
+  /** match every word of the search separately (in any order) */
+  multiWord?: boolean;
+  /** only objects of this collection (and its children) */
+  collection?: Set<string> | null;
+  /** hidden channel types: object types (MESH, CAMERA, …) and TRANSFORMS / MODIFIERS / MATERIALS / SHAPEKEYS / DATA */
+  hiddenTypes?: Set<string>;
+  /** objects in alphabetical order (else in scene order) */
+  sortByName?: boolean;
+  /** the Dope Sheet's Summary row */
+  noSummary?: boolean;
   onlyErrors?: boolean;
+  /** pinned objects and groups stay listed with Only Show Selected (Graph Editor) */
+  usePins?: boolean;
   isVisible: (ob: ObjectData) => boolean;
   activeObject: ObjectData | null;
+  /** F-Curves whose property can't be found ("Only Show Errors", error highlight) */
+  curveError?: (ob: ObjectData, fc: FCurve) => boolean;
   /** driver error lookup (Drivers editor "Only Show Errors") */
   driverError?: (ob: ObjectData, d: Driver) => string | null;
 }
@@ -57,6 +80,7 @@ const DEFAULT_EXPANDED: Partial<Record<ChannelKind, boolean>> = {
   SUMMARY: true,
   OBJECT: true,
   ACTION: false,
+  SLOT: true,
   GROUP: true,
   DRIVERS: true,
 };
@@ -68,7 +92,10 @@ export function setExpanded(key: string, value: boolean) {
   channelState.expanded.set(key, value);
 }
 
-export const groupKey = (action: ActionData, name: string) => `grp:${action.id}:${name}`;
+/** Key of a group row; groups are per slot in actions with slots. */
+export const groupKey = (action: ActionData, name: string, slot?: number) => (slot === undefined ? `grp:${action.id}:${name}` : `grp:${action.id}:${slot}:${name}`);
+/** Group key of the group a curve is in. */
+export const curveGroupKey = (action: ActionData, fc: FCurve) => groupKey(action, fc.group ?? '', curveSlot(action, fc));
 export const curveKey = (ob: ObjectData, action: ActionData, fc: FCurve) => `fc:${ob.id}:${action.id}:${fc.data_path}:${fc.array_index}`;
 export const driverKey = (ob: ObjectData, d: Driver) => `drv:${ob.id}:${d.data_path}:${d.array_index}`;
 
@@ -84,8 +111,17 @@ export function objectIcon(ob: ObjectData) {
     LATTICE: 'outliner_ob_lattice',
     POINTCLOUD: 'outliner_ob_pointcloud',
     GREASEPENCIL: 'outliner_ob_greasepencil',
+    META: 'outliner_ob_meta',
+    CURVES: 'outliner_ob_curves',
   };
   return m[ob.type] ?? 'object';
+}
+
+/** Icon of a slot row: the type of the data-block playing it. */
+export function slotIcon(slot: ActionSlot, user?: ObjectData) {
+  const t = slotIdType(slot);
+  if (t === 'OBJECT') return user ? objectIcon(user) : 'object_data';
+  return t === 'UNSPECIFIED' ? 'action_slot' : t.toLowerCase() + '_data';
 }
 
 export function activeAction(doc: DocumentData, ob: ObjectData | null | undefined): ActionData | undefined {
@@ -95,42 +131,68 @@ export function activeAction(doc: DocumentData, ob: ObjectData | null | undefine
 
 const boneOf = (path: string) => /^pose\.bones\["([^"]+)"\]/.exec(path)?.[1];
 
-function curveVisibleForFilter(doc: DocumentData, ob: ObjectData, fc: FCurve, f: ChannelFilter) {
-  if (f.onlySelected && doc.mode === 'POSE' && ob.pose) {
+/** The channel type an F-Curve counts as for Filter by Type. */
+export function curveCategory(path: string): string {
+  if (/(^|\.)(location|rotation_euler|rotation_quaternion|rotation_axis_angle|scale|delta_location|delta_rotation_euler|delta_rotation_quaternion|delta_scale)$/.test(path)) return 'TRANSFORMS';
+  if (path.startsWith('modifiers[')) return 'MODIFIERS';
+  if (/key_blocks\[/.test(path)) return 'SHAPEKEYS';
+  if (/^(active_material|material_slots|material)\b/.test(path)) return 'MATERIALS';
+  if (path.startsWith('data.')) return 'DATA';
+  return 'OTHER';
+}
+
+function curveVisibleForFilter(doc: DocumentData, ob: ObjectData, fc: FCurve, f: ChannelFilter, act?: ActionData) {
+  if (f.hiddenTypes?.size && f.hiddenTypes.has(curveCategory(fc.data_path))) return false;
+  if (f.onlyErrors && f.curveError && !f.curveError(ob, fc)) return false;
+  if (f.onlySelected && doc.mode === 'POSE' && ob.pose && !(f.usePins && fc.group && act?.pinned_groups?.includes(fc.group))) {
     const bone = boneOf(fc.data_path);
     if (bone && ob.pose[bone] && !ob.pose[bone].select) return false;
   }
-  if (f.search) {
-    const q = f.search.toLowerCase();
-    if (!channelLabel(fc.data_path, fc.array_index).toLowerCase().includes(q) && !fc.data_path.toLowerCase().includes(q)) return false;
-  }
+  if (f.search && !searchMatches(f, channelLabel(fc.data_path, fc.array_index), fc.data_path)) return false;
   return true;
 }
 
-function filteredObjects(doc: DocumentData, f: ChannelFilter): ObjectData[] {
-  return doc.object_order.map((id) => doc.objects[id]).filter((ob) => ob && (f.showHidden || f.isVisible(ob)) && (!f.onlySelected || ob.select));
+/** Whether any of the texts matches the search (every word of it, with Multi-Word Match). */
+export function searchMatches(f: Pick<ChannelFilter, 'search' | 'multiWord'>, ...texts: string[]): boolean {
+  const hay = texts.map((t) => t.toLowerCase());
+  const q = f.search.toLowerCase().trim();
+  if (!q) return true;
+  if (!f.multiWord) return hay.some((t) => t.includes(q));
+  return q.split(/\s+/).every((w) => hay.some((t) => t.includes(w)));
 }
 
-/** Rows for an action's groups and F-Curves. */
-function actionRows(
-  doc: DocumentData,
-  ob: ObjectData,
-  action: ActionData,
-  depth: number,
-  f: ChannelFilter,
-  rows: Channel[],
-  visible: boolean,
-  curvesOut: CurveRef[],
-  filterCurve?: (fc: FCurve) => boolean,
-) {
-  const curves = action.fcurves.filter((fc) => curveVisibleForFilter(doc, ob, fc, f) && (!filterCurve || filterCurve(fc)));
+function filteredObjects(doc: DocumentData, f: ChannelFilter): ObjectData[] {
+  const list = doc.object_order
+    .map((id) => doc.objects[id])
+    .filter((ob) => ob && (f.showHidden || f.isVisible(ob)) && (!f.onlySelected || ob.select || (f.usePins && !!ob.animation_data?.use_pin)) && (!f.collection || f.collection.has(ob.id)) && !f.hiddenTypes?.has(ob.type));
+  return f.sortByName ? list.sort((a, b) => a.name.localeCompare(b.name)) : list;
+}
+
+/** Objects of a collection and its child collections (for the Filters popover's collection). */
+export function collectionObjects(doc: DocumentData, id: string): Set<string> {
+  const out = new Set<string>();
+  const visit = (cid: string, seen: Set<string>) => {
+    const c = doc.collections[cid];
+    if (!c || seen.has(cid)) return;
+    seen.add(cid);
+    for (const o of c.objects) out.add(o);
+    for (const ch of c.children) visit(ch, seen);
+  };
+  visit(id, new Set());
+  return out;
+}
+
+/** Rows for the groups and F-Curves of an action (the given curves of it: one slot). */
+function actionRows(doc: DocumentData, ob: ObjectData, action: ActionData, source: FCurve[], depth: number, f: ChannelFilter, rows: Channel[], visible: boolean, curvesOut: CurveRef[]) {
+  const curves = source.filter((fc) => curveVisibleForFilter(doc, ob, fc, f, action));
   const refs = curves.map((fc) => ({ ob, action, fc }));
   curvesOut.push(...refs);
   if (!visible) return refs;
   const groups: string[] = [];
   for (const fc of curves) if (fc.group && !groups.includes(fc.group)) groups.push(fc.group);
+  const slot = curves.length && isSlotted(action) ? curveSlot(action, curves[0]) : undefined;
   for (const g of groups) {
-    const key = groupKey(action, g);
+    const key = groupKey(action, g, slot);
     const inGroup = refs.filter((r) => r.fc.group === g);
     const exp = !!f.search || isExpanded(key, 'GROUP');
     rows.push({
@@ -145,14 +207,15 @@ function actionRows(
       expandable: true,
       expanded: exp,
     });
-    if (exp) for (const r of inGroup) rows.push(curveRow(r, depth + 1));
+    if (exp) for (const r of inGroup) rows.push(curveRow(r, depth + 1, f));
   }
-  for (const r of refs) if (!r.fc.group) rows.push(curveRow(r, depth));
+  for (const r of refs) if (!r.fc.group) rows.push(curveRow(r, depth, f));
   return refs;
 }
 
-function curveRow(r: CurveRef, depth: number): Channel {
+function curveRow(r: CurveRef, depth: number, f?: ChannelFilter): Channel {
   return {
+    error: f?.curveError?.(r.ob, r.fc) ?? false,
     key: curveKey(r.ob, r.action, r.fc),
     kind: 'FCURVE',
     depth,
@@ -172,7 +235,13 @@ export interface ChannelList {
   curves: CurveRef[];
 }
 
+/** Channel lists of spaces built by other modules (e.g. Dope Sheet ▸ Mask). */
+export const spaceChannelBuilders: Partial<Record<SpaceKind, (doc: DocumentData, f: ChannelFilter) => ChannelList>> = {};
+
 export function buildChannels(doc: DocumentData, space: SpaceKind, f: ChannelFilter): ChannelList {
+  const custom = spaceChannelBuilders[space];
+  if (custom) return custom(doc, f);
+  if (space === 'GRAPH' && f.usePins === undefined) f = { ...f, usePins: true };
   const rows: Channel[] = [];
   const curves: CurveRef[] = [];
   if (space === 'ACTION') {
@@ -189,7 +258,34 @@ export function buildChannels(doc: DocumentData, space: SpaceKind, f: ChannelFil
       expanded: isExpanded('summary', 'SUMMARY'),
     };
     rows.push(sum);
-    sum.curves = actionRows(doc, ob, action, 0, f, rows, sum.expanded, curves);
+    if (!isSlotted(action)) {
+      sum.curves = actionRows(doc, ob, action, action.fcurves, 0, f, rows, sum.expanded, curves);
+      return { rows, curves };
+    }
+    // one row per slot; each slot's channels are shown for the object playing it (or the active one)
+    for (const slot of action.slots!) {
+      const user = slotUsers(doc, action, slot.handle)[0] ?? ob;
+      const key = `slot:${action.id}:${slot.handle}`;
+      const exp = !!f.search || isExpanded(key, 'SLOT');
+      const srow: Channel = {
+        key,
+        kind: 'SLOT',
+        depth: 0,
+        label: slotName(slot),
+        icon: slotIcon(slot, user),
+        ob: user,
+        action,
+        slot,
+        curves: [],
+        expandable: true,
+        expanded: exp,
+      };
+      const start = rows.length;
+      if (sum.expanded) rows.push(srow);
+      srow.curves = actionRows(doc, user, action, slotCurves(action, slot.handle), 1, f, rows, sum.expanded && exp, curves);
+      if (f.search && !srow.curves.length) rows.length = start;
+      sum.curves.push(...srow.curves);
+    }
     return { rows, curves };
   }
   if (space === 'SHAPEKEY') {
@@ -208,10 +304,11 @@ export function buildChannels(doc: DocumentData, space: SpaceKind, f: ChannelFil
     };
     rows.push(sum);
     const action = activeAction(doc, ob);
+    const own = objectCurves(doc, ob);
     for (const sk of keys.slice(1)) {
       if (f.search && !sk.name.toLowerCase().includes(f.search.toLowerCase())) continue;
       const path = shapeKeyPath(sk.name);
-      const fc = action?.fcurves.find((c) => c.data_path === path);
+      const fc = own.find((c) => c.data_path === path);
       const refs = fc && action ? [{ ob, action, fc }] : [];
       curves.push(...refs);
       sum.curves.push(...refs);
@@ -244,6 +341,9 @@ export function buildChannels(doc: DocumentData, space: SpaceKind, f: ChannelFil
       if (!drivers.length) continue;
       const okey = `dob:${ob.id}`;
       const oexp = isExpanded(okey, 'OBJECT');
+      const action = driverAction(ob);
+      const refs = drivers.map(({ d }) => ({ ob, action, fc: d.fcurve! }));
+      curves.push(...refs);
       rows.push({
         key: okey,
         kind: 'OBJECT',
@@ -251,7 +351,7 @@ export function buildChannels(doc: DocumentData, space: SpaceKind, f: ChannelFil
         label: ob.name,
         icon: objectIcon(ob),
         ob,
-        curves: [],
+        curves: refs,
         expandable: true,
         expanded: oexp,
       });
@@ -265,24 +365,28 @@ export function buildChannels(doc: DocumentData, space: SpaceKind, f: ChannelFil
         label: 'Drivers',
         icon: 'graph',
         ob,
-        curves: [],
+        curves: refs,
         expandable: true,
         expanded: dexp,
       });
       if (!dexp) continue;
-      for (const { d, i } of drivers)
+      drivers.forEach(({ d, i }, n) =>
         rows.push({
           key: driverKey(ob, d),
           kind: 'DRIVER',
           depth: 2,
           label: channelLabel(d.data_path, d.array_index),
           ob,
+          action,
+          fc: d.fcurve,
           driver: d,
           driverIndex: i,
-          curves: [],
+          error: !!f.driverError?.(ob, d),
+          curves: [refs[n]],
           expandable: false,
           expanded: false,
-        });
+        }),
+      );
     }
     return { rows, curves };
   }
@@ -313,7 +417,7 @@ export function buildChannels(doc: DocumentData, space: SpaceKind, f: ChannelFil
         icon: 'action',
         ob,
         action,
-        curves: action ? action.fcurves.map((fc) => ({ ob, action, fc })) : [],
+        curves: action ? objectCurves(doc, ob).map((fc) => ({ ob, action, fc })) : [],
         expandable: false,
         expanded: false,
       });
@@ -337,7 +441,7 @@ export function buildChannels(doc: DocumentData, space: SpaceKind, f: ChannelFil
     return { rows, curves };
   }
   // DOPESHEET / GRAPH
-  const withSummary = space === 'DOPESHEET';
+  const withSummary = space === 'DOPESHEET' && !f.noSummary;
   const sum: Channel | null = withSummary
     ? {
         key: 'summary',
@@ -385,7 +489,7 @@ export function buildChannels(doc: DocumentData, space: SpaceKind, f: ChannelFil
     const start = rows.length;
     if (showChildren) rows.push(orow);
     if (showChildren && oexp) rows.push(arow);
-    const refs = actionRows(doc, ob, action, base + 1, f, rows, showChildren && oexp && aexp, curves);
+    const refs = actionRows(doc, ob, action, objectCurves(doc, ob), base + 1, f, rows, showChildren && oexp && aexp, curves);
     if (!refs.length && f.search) {
       rows.length = start;
       continue;
@@ -407,6 +511,8 @@ export function channelSelected(ch: Channel): boolean {
   switch (ch.kind) {
     case 'OBJECT':
       return !!ch.ob?.select;
+    case 'SLOT':
+      return !!ch.slot?.select;
     case 'GROUP':
       return channelState.selectedGroups.has(ch.key);
     case 'FCURVE':
@@ -414,9 +520,11 @@ export function channelSelected(ch: Channel): boolean {
     case 'SHAPEKEY':
       return ch.fc ? !!ch.fc.select : channelState.selectedShapeKeys.has(ch.key);
     case 'DRIVER':
-      return channelState.selectedDrivers.has(ch.key);
+      return ch.fc ? !!ch.fc.select : channelState.selectedDrivers.has(ch.key);
     case 'NLA_TRACK':
       return !!ch.track?.select;
+    case 'MASK_LAYER':
+      return !!ch.fc?.select;
     default:
       return false;
   }
@@ -426,6 +534,9 @@ export function setChannelSelected(ch: Channel, value: boolean) {
   switch (ch.kind) {
     case 'OBJECT':
       if (ch.ob) ch.ob.select = value;
+      break;
+    case 'SLOT':
+      if (ch.slot) ch.slot.select = value;
       break;
     case 'GROUP':
       if (value) channelState.selectedGroups.add(ch.key);
@@ -440,17 +551,21 @@ export function setChannelSelected(ch: Channel, value: boolean) {
       else channelState.selectedShapeKeys.delete(ch.key);
       break;
     case 'DRIVER':
+      if (ch.fc) ch.fc.select = value;
       if (value) channelState.selectedDrivers.add(ch.key);
       else channelState.selectedDrivers.delete(ch.key);
       break;
     case 'NLA_TRACK':
       if (ch.track) ch.track.select = value;
       break;
+    case 'MASK_LAYER':
+      if (ch.fc) ch.fc.select = value;
+      break;
   }
 }
 
 /** Curves affected by a channel-level setting toggle on this row. */
 export function channelCurves(ch: Channel): FCurve[] {
-  if (ch.kind === 'FCURVE' || ch.kind === 'SHAPEKEY') return ch.fc ? [ch.fc] : [];
+  if (ch.kind === 'FCURVE' || ch.kind === 'SHAPEKEY' || ch.kind === 'DRIVER') return ch.fc ? [ch.fc] : [];
   return ch.curves.map((r) => r.fc);
 }

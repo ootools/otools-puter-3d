@@ -4,9 +4,18 @@ import type { DocumentData, NodeData, NodeTreeData, ObjectData, SocketValue } fr
 import type { Field } from './field';
 import type { GeometrySet } from './geometry';
 import type { FieldType } from './types';
+import type { TreeEval } from './evaluator';
+
+/** Severity of a reported message. */
+export type WarningKind = 'ERROR' | 'WARNING' | 'INFO';
+
+/** Values that are only passed along (bundles, closures): identified by their kind. */
+export interface OpaqueVal {
+  readonly opaqueKind: string;
+}
 
 /** Value flowing through a socket. */
-export type Val = number | boolean | string | number[] | Field | GeometrySet | null | undefined;
+export type Val = number | boolean | string | number[] | Field | GeometrySet | OpaqueVal | null | undefined;
 
 /** Environment of one modifier evaluation. */
 export interface EvalEnv {
@@ -26,10 +35,26 @@ export interface EvalEnv {
   collectionObjects(id: string): string[];
   /** cache signature of another object's state (geometry version + transform) */
   objectSig(id: string): string;
+  /** set while a node group runs as a tool (geometry.execute_node_group) */
+  tool?: ToolEnv;
+}
+
+/** What a tool node group sees of the editor it runs from. */
+export interface ToolEnv {
+  mode: 'OBJECT' | 'EDIT' | 'SCULPT';
+  /** 3D cursor in the object's local space */
+  cursor: { location: [number, number, number]; rotation: [number, number, number] };
+  /** active element in Edit Mode */
+  active?: { domain: 'POINT' | 'EDGE' | 'FACE'; index: number };
+  mouse?: { x: number; y: number; width: number; height: number };
+  /** view and projection matrices of the viewport (column-major) */
+  view?: { view: number[]; projection: number[]; ortho: boolean };
 }
 
 export interface ExecContext {
   node: NodeData;
+  /** the evaluator running this node (zones evaluate their bodies through it) */
+  evaluator: TreeEval;
   tree: NodeTreeData;
   env: EvalEnv;
   /** unique, deterministic path of the node (for anonymous attribute names) */
@@ -41,6 +66,8 @@ export interface ExecContext {
   geometry(id: string): GeometrySet;
   /** all geometries linked into a multi-input socket (in link order) */
   geometries(id: string): GeometrySet[];
+  /** all values linked into a multi-input socket (in link order) */
+  values(id: string): Val[];
   field(id: string, type?: FieldType): Field;
   float(id: string): number;
   int(id: string): number;
@@ -54,7 +81,8 @@ export interface ExecContext {
   used(output: string): boolean;
   /** anonymous attribute name for a field output created by this node */
   anon(output: string): string;
-  warn(message: string): void;
+  /** report a message on the node (and the modifier); warnings by default */
+  warn(message: string, kind?: WarningKind): void;
 }
 
 export interface GeoNodeExec {
@@ -70,6 +98,9 @@ export interface GeoNodeExec {
 }
 
 export const geoExecs: Record<string, GeoNodeExec> = {};
+
+/** Node types evaluated in a modifier's tree even when nothing uses their outputs (gizmos). */
+export const alwaysEvaluated = new Set<string>();
 
 export function registerExec(idname: string, e: GeoNodeExec) {
   geoExecs[idname] = e;

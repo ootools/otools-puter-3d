@@ -1,19 +1,26 @@
 // Viewport sidebar (N panel): Item / Tool / View tabs.
+import { propertyAnimMenuHook } from '../../ui/props';
+import { workspacePanel } from '../../ui/workspacepanel';
 import { Box3, Vector3, Euler, Quaternion } from 'three';
 import { h, type Child } from '../../ui/h';
 import { icon } from '../../ui/icons';
 import { app } from '../../app/app';
 import type { View3D } from './view3d';
-import { panel, numberField, row, col, checkbox, enumMenu, decorator } from '../../ui/widgets';
+import { panel, numberField, row, col, checkbox, enumMenu, decorator, opButton } from '../../ui/widgets';
 import type { ObjectData } from '../../data/types';
 import { keyState, keyProperty } from '../../anim/keyframes';
 import { renderContext } from '../../render/context';
+import { toolHeader } from './toolbar';
+import { toolOptions } from './tooloptions';
+import { bindProp } from '../../ui/binding';
 
 export const sidebarTabs: { id: string; label: string; draw: (v: View3D) => Child; poll?: () => boolean }[] = [];
 
 /** Bind a vector component of an object property to a number field. */
 export function vecField(ob: ObjectData, key: 'location' | 'rotation_euler' | 'scale' | 'delta_location' | 'delta_scale' | 'delta_rotation_euler', i: number, label: string, unit: 'distance' | 'angle' | 'none') {
   const st = keyState(app.doc, ob, key, i);
+  // generic button actions (I, Backspace, Ctrl+C/V, right-click menu) work on these fields too
+  bindProp({ id: `${ob.id}.${key}.${i}`, owner: ob as unknown as Record<string, unknown>, key, index: i, label: `${key.replace(/_euler$/, '').replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase())} ${label}`, kind: 'vector', anim: { ob, path: key, index: i } });
   return h(
     'div',
     { class: 'vec-row', key: `${key}${i}` },
@@ -32,11 +39,15 @@ export function vecField(ob: ObjectData, key: 'location' | 'rotation_euler' | 's
       },
     }),
     lockButton(ob, key, i),
-    decorator(st, () => {
-      keyProperty(app.doc, ob, key, i);
-      app.pushUndo('Insert Keyframe');
-      app.changed('doc');
-    }),
+    decorator(
+      st,
+      () => {
+        keyProperty(app.doc, ob, key, i);
+        app.pushUndo('Insert Keyframe');
+        app.changed('doc');
+      },
+      propertyAnimMenuHook.open ? (e: MouseEvent) => propertyAnimMenuHook.open!(e, ob, key, i) : undefined,
+    ),
   );
 }
 
@@ -143,22 +154,12 @@ sidebarTabs.push(
   {
     id: 'Tool',
     label: 'Tool',
-    draw: () => {
+    draw: (v) => {
       const ts = app.doc.scene.tool_settings;
       return [
-        panel('sb-options', 'Options', () => [
-          h('div', { class: 'sb-label' }, 'Transform'),
-          checkbox('affect-origins', 'Affect Only Origins', !!ts.use_transform_data_origin, (x) => ((ts.use_transform_data_origin = x), app.changed('ui'))),
-          checkbox('affect-parents', 'Affect Only Parents', !!ts.use_transform_skip_children, (x) => ((ts.use_transform_skip_children = x), app.changed('ui'))),
-          app.doc.mode === 'EDIT'
-            ? [
-                h('div', { class: 'sb-label' }, 'Mesh Options'),
-                checkbox('automerge', 'Auto Merge Vertices', ts.use_mesh_automerge, (x) => ((ts.use_mesh_automerge = x), app.pushUndo('Auto Merge'), app.changed('ui'))),
-                row('Mirror', checkbox('mx', 'X', !!ts.use_mesh_mirror_x, (x) => ((ts.use_mesh_mirror_x = x), app.changed('ui'))), checkbox('my', 'Y', !!ts.use_mesh_mirror_y, (x) => ((ts.use_mesh_mirror_y = x), app.changed('ui'))), checkbox('mz', 'Z', !!ts.use_mesh_mirror_z, (x) => ((ts.use_mesh_mirror_z = x), app.changed('ui')))),
-              ]
-            : null,
-        ]),
-        panel('sb-workspace', 'Workspace', () => [h('div', { class: 'sb-label' }, `Mode: ${app.doc.mode[0] + app.doc.mode.slice(1).toLowerCase().replace('_', ' ')}`)]),
+        panel('sb-active-tool', 'Active Tool', () => h('div', { class: 'sb-active-tool' }, toolHeader(v))),
+        panel('sb-options', 'Options', () => toolOptions('sb')),
+        workspacePanel('sb-workspace'),
       ];
     },
   },
@@ -169,13 +170,50 @@ sidebarTabs.push(
       const cur = app.doc.scene.cursor;
       return [
         panel('sb-view', 'View', () => [
-          numberField({ id: 'v-lens', label: 'Focal Length', value: v.nav.lens, min: 1, max: 5000, unit: 'none', precision: 0, set: (x) => ((v.nav.lens = x), renderContext?.engine.requestDraw(), app.changed('ui')) }),
-          h('div', { class: 'sb-label' }, 'Clip'),
-          col(
-            numberField({ id: 'v-cs', label: 'Start', value: v.nav.clipStart, min: 1e-6, unit: 'distance', set: (x) => ((v.nav.clipStart = x), app.changed('ui')) }),
-            numberField({ id: 'v-ce', label: 'End', value: v.nav.clipEnd, min: 1e-3, unit: 'distance', set: (x) => ((v.nav.clipEnd = x), app.changed('ui')) }),
+          row('Focal Length', numberField({ id: 'v-lens', value: v.nav.lens, min: 1, max: 5000, unit: 'none', precision: 0, tip: 'Focal Length\nLens of the viewport (millimetres)', set: (x) => ((v.nav.lens = x), renderContext?.engine.requestDraw(), app.changed('ui')) })),
+          row('Clip Start', numberField({ id: 'v-cs', value: v.nav.clipStart, min: 1e-6, unit: 'distance', set: (x) => ((v.nav.clipStart = x), app.changed('ui')) })),
+          row('End', numberField({ id: 'v-ce', value: v.nav.clipEnd, min: 1e-3, unit: 'distance', set: (x) => ((v.nav.clipEnd = x), app.changed('ui')) })),
+          row(
+            '',
+            h(
+              'div',
+              { class: 'sb-inline' },
+              checkbox('v-localcam', 'Local Camera', v.useLocalCamera, (x) => {
+                v.useLocalCamera = x;
+                if (x && !v.localCamera) v.localCamera = app.doc.scene.camera;
+                v.updateSceneCamera();
+                v.afterNav();
+                app.changed('ui');
+              }, { tip: 'Local Camera\nThis viewport looks through its own camera' }),
+              enumMenu('v-localcam-ob', Object.values(app.doc.objects).filter((o) => o.type === 'CAMERA').map((o) => ({ value: o.id, label: o.name, icon: 'outliner_ob_camera' })), v.localCamera ?? '', (id) => {
+                v.localCamera = id;
+                v.updateSceneCamera();
+                v.afterNav();
+                app.changed('ui');
+              }, { disabled: !v.useLocalCamera, label: v.localCamera ? undefined : 'Camera' }),
+            ),
           ),
-          checkbox('v-lock', 'Lock Camera to View', v.lockCameraToView, (x) => ((v.lockCameraToView = x), app.changed('ui'))),
+          row('', checkbox('v-region', 'Render Region', !!(app.doc.scene.render as { use_border?: boolean }).use_border, (x) => ((app.doc.scene.render as { use_border?: boolean }).use_border = x, app.pushUndo('Render Region'), app.changed('doc', 'ui')), { tip: 'Render Region\nRender only the region set with Ctrl B in camera view' })),
+          v.clipPlanes ? h('div', { class: 'sb-row-btn' }, opButton('view3d.clip_border', 'Clear Clipping Region')) : null,
+        ]),
+        panel('sb-view-lock', 'View Lock', () => [
+          row(
+            'Lock to Object',
+            enumMenu('v-lockob', [{ value: '', label: '—' }, ...Object.values(app.doc.objects).map((o) => ({ value: o.id, label: o.name, icon: 'object' }))], v.lockObject ?? '', (id) => {
+              v.lockObject = id || null;
+              if (id) v.lockCursor = false;
+              v.afterNav();
+              app.changed('ui');
+            }),
+          ),
+          row(
+            'Lock',
+            col(
+              checkbox('v-lockcur', 'To 3D Cursor', v.lockCursor && !v.lockObject, (x) => ((v.lockCursor = x), v.afterNav(), app.changed('ui')), { disabled: !!v.lockObject, tip: 'To 3D Cursor\nThe view stays centred on the 3D cursor' }),
+              checkbox('v-lock', 'Camera to View', v.lockCameraToView, (x) => ((v.lockCameraToView = x), app.changed('ui')), { tip: 'Camera to View\nNavigating in camera view moves the camera' }),
+              checkbox('v-lockrot', 'Rotation', v.lockRotation, (x) => ((v.lockRotation = x), app.changed('ui')), { tip: 'Rotation\nThe view cannot be orbited (dragging pans instead)' }),
+            ),
+          ),
         ]),
         panel('sb-cursor', '3D Cursor', () => [
           h('div', { class: 'sb-label' }, 'Location:'),
@@ -211,11 +249,88 @@ sidebarTabs.push(
             ),
           ),
         ]),
-        panel('sb-collections', 'Collections', () => h('div', { class: 'sb-label' }, 'Use the Outliner to manage collection visibility.'), { closed: true }),
+        v.quad
+          ? panel('sb-quad', 'Quad View', () => [
+              checkbox('q-lock', 'Lock', quadMembers(v).some((m) => m.lockRotation), (x) => {
+                for (const m of quadMembers(v)) if (m.quad?.role !== 'USER') m.lockRotation = x;
+                app.changed('ui');
+              }),
+              checkbox('q-sync', 'Sync Zoom/Pan', quadMembers(v).some((m) => m.quadSync), (x) => {
+                for (const m of quadMembers(v)) m.quadSync = x;
+                app.changed('ui');
+              }),
+            ])
+          : null,
+        panel('sb-collections', 'Collections', () => collectionRows(), { closed: true }),
+        ...viewTabPanels.map((f) => f(v)),
       ];
     },
   },
 );
+
+/** Extra panels at the end of the View tab (e.g. Annotations). */
+export const viewTabPanels: ((v: View3D) => Child)[] = [];
+
+/** Viewports of the same Quad View group. */
+function quadMembers(v: View3D): View3D[] {
+  if (!v.quad) return [v];
+  return v.area.screen.areas.map((a) => a.editor as unknown as View3D).filter((e) => e?.quad?.group === v.quad!.group);
+}
+
+/** Collection visibility: click a name to show only that collection (Shift adds it), the eye hides it. */
+function collectionRows(): Child {
+  const doc = app.doc;
+  const master = doc.collections[doc.scene.collection];
+  if (!master) return null;
+  const rows: Child[] = [];
+  const all: string[] = [];
+  const walk = (ids: string[], depth: number) => {
+    for (const id of ids) {
+      const c = doc.collections[id];
+      if (!c) continue;
+      all.push(id);
+      rows.push(
+        h(
+          'div',
+          { key: id, class: 'sb-coll', style: `display: flex; align-items: center; gap: 4px; padding-left: ${depth * 12}px` },
+          h(
+            'button',
+            {
+              class: { 'sb-coll-name': true, off: c.hide },
+              style: 'flex: 1; text-align: left; background: none; border: 0; color: inherit; padding: 2px 4px; cursor: pointer; opacity: ' + (c.hide || c.exclude ? '0.5' : '1'),
+              'data-tip': 'Show only this collection (Shift: toggle it)',
+              onclick: (e: MouseEvent) => {
+                if (e.shiftKey) c.hide = !c.hide;
+                else for (const other of all) doc.collections[other].hide = other !== id;
+                app.pushUndo('Hide Collection');
+                app.changed('doc');
+              },
+            },
+            icon('collection'),
+            ' ',
+            c.name,
+          ),
+          h(
+            'button',
+            {
+              class: 'lock-btn',
+              'data-tip': 'Hide in Viewport',
+              onclick: () => {
+                c.hide = !c.hide;
+                app.pushUndo('Hide Collection');
+                app.changed('doc');
+              },
+            },
+            icon(c.hide ? 'hide_on' : 'hide_off'),
+          ),
+        ),
+      );
+      walk(c.children, depth + 1);
+    }
+  };
+  walk(master.children, 0);
+  return rows.length ? rows : h('div', { class: 'sb-label' }, 'No collections');
+}
 
 export function sidebar(v: View3D): Child {
   const tabs = sidebarTabs.filter((t) => !t.poll || t.poll());

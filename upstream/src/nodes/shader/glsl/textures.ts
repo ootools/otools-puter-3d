@@ -1,4 +1,4 @@
-// GLSL library: Checker, Brick, Gradient, image / environment sampling and an analytic sky
+// GLSL library: Checker, Brick, Gradient (as in nodes/cpu/textures.ts), image / environment sampling and an analytic sky
 // (Preetham et al. 1999 daylight model, used to approximate every sky type). Independent code.
 import type { GlslLib } from './lib';
 
@@ -8,24 +8,29 @@ export const TEXTURES: GlslLib = {
 float nd_checker(vec3 p, float scale) {
   p = (p * scale + 0.000001) * 0.999999;
   ivec3 i = ivec3(floor(p));
-  return ((i.x + i.y + i.z) & 1) == 0 ? 1.0 : 0.0;
+  return ((i.x + i.y + i.z) & 1) == 1 ? 1.0 : 0.0;
 }
 `,
   },
   nd_brick: {
-    deps: ['nd_hash'],
     code: `
+float nd_brick_noise(int i) {
+  uint n = (uint(i) + 1013u) & 0x7fffffffu;
+  n = (n >> 13u) ^ n;
+  uint nn = (n * (n * n * 60493u + 19990303u) + 1376312589u) & 0x7fffffffu;
+  return 0.5 * float(nn) / 1073741824.0;
+}
 // returns (tint, mortar)
 vec2 nd_brick(vec3 p, float msize, float msmooth, float bias, float bw, float rh, float offamt, float offfreq, float sqamt, float sqfreq) {
   float row = floor(p.y / rh);
   float offset = 0.0;
   if (offfreq > 0.0 && sqfreq > 0.0) {
-    if (mod(row, offfreq) < 0.5) offset = bw * offamt;
     if (mod(row, sqfreq) < 0.5) bw *= sqamt;
+    if (mod(row, offfreq) < 0.5) offset = bw * offamt;
   }
   float brick = floor((p.x + offset) / bw);
   float x = (p.x + offset) - bw * brick, y = p.y - rh * row;
-  float tint = clamp(nd_hash_i(ivec2(int(row), int(brick))) + bias, 0.0, 1.0);
+  float tint = clamp(nd_brick_noise((int(row) << 16) + (int(brick) & 0xffff)) + bias, 0.0, 1.0);
   float md = min(min(x, y), min(bw - x, rh - y));
   float mortar;
   if (md >= msize) mortar = 0.0;
@@ -42,8 +47,8 @@ float nd_gradient(vec3 p, int type) {
   if (type == 1) { float r = max(p.x, 0.0); return r * r; }
   if (type == 2) { float r = clamp(p.x, 0.0, 1.0); return r * r * (3.0 - 2.0 * r); }
   if (type == 3) return (p.x + p.y) * 0.5;
-  if (type == 4) return max(1.0 - length(p), 0.0);
-  if (type == 5) { float r = max(1.0 - length(p), 0.0); return r * r; }
+  if (type == 4) return max(0.999999 - length(p), 0.0);
+  if (type == 5) { float r = max(0.999999 - length(p), 0.0); return r * r; }
   return atan(p.y, p.x) / 6.2831853 + 0.5;
 }
 `,
@@ -85,6 +90,20 @@ vec4 nd_tex_sample(sampler2D t, vec2 uv, int interp, int ext) {
   if (interp == 1) return texelFetch(t, clamp(ivec2(floor(uv * size)), ivec2(0), ivec2(size) - 1), 0);
   if (interp == 2) return nd_tex_cubic(t, uv);
   return textureGrad(t, uv, dx, dy);
+}
+// UDIM: the tiles sit in an atlas of grid.x × grid.y cells, cell (c, r) holding UV square (c, r)
+vec4 nd_tex_udim(sampler2D t, vec2 uv, vec2 grid, int interp) {
+  vec2 cell = floor(uv);
+  if (cell.x < 0.0 || cell.y < 0.0 || cell.x >= grid.x || cell.y >= grid.y) return vec4(0.0);
+  vec2 size = vec2(textureSize(t, 0)) / grid;
+  vec2 f = clamp(uv - cell, 0.5 / size, 1.0 - 0.5 / size);
+  vec2 a = (cell + f) / grid;
+  if (interp == 1) return texelFetch(t, ivec2(floor(a * vec2(textureSize(t, 0)))), 0);
+#ifdef ND_NO_DERIV
+  return textureLod(t, a, 0.0);
+#else
+  return textureGrad(t, a, dFdx(uv) / grid, dFdy(uv) / grid);
+#endif
 }
 vec2 nd_sphere_uv(vec3 v) { v = v * 2.0 - 1.0; return vec2(atan(v.y, v.x) / 6.2831853 + 0.5, atan(v.z, length(v.xy)) / 3.14159265 + 0.5); }
 vec2 nd_tube_uv(vec3 v) { v = v * 2.0 - 1.0; return vec2(atan(v.y, v.x) / 6.2831853 + 0.5, (v.z + 1.0) * 0.5); }

@@ -5,13 +5,19 @@ import { preEvaluateHooks } from '../eval/depsgraph';
 import { rapierReady, loadRapier } from './engine';
 import { simBudget, startBudget, caches } from './common';
 import { freeRigidBodyLive } from './rigidbody';
-import { particleDraw } from './particles';
+import { particleDraw, hairRenderData } from './particles';
 import { smokeDraw } from './fluid';
 import { physicsState } from './runtime';
 import './ops';
 import './ui-physics';
 import './ui-particles';
 import './draw';
+import './timelinecache';
+import './fluiddraw';
+import './particleops';
+import './ptcaches';
+import './oceanbake';
+import './dpbake';
 
 /** Interactive evaluations simulate at most this long, then continue on the next tick. */
 const BUDGET_MS = 120;
@@ -42,7 +48,7 @@ function pruneCaches() {
       caches.delete(key);
     }
   }
-  for (const map of [particleDraw, smokeDraw] as Map<string, unknown>[])
+  for (const map of [particleDraw, smokeDraw, hairRenderData] as Map<string, unknown>[])
     for (const key of map.keys()) {
       const [ob, mod] = key.split(':');
       if (!alive(ob, mod)) map.delete(key);
@@ -63,3 +69,11 @@ queueMicrotask(() => {
   if (app?.doc.scene.rigidbody_world) void loadRapier();
 });
 rapierReady.add(() => app?.changed('frame'));
+import './fieldadd';
+import './dynpaint';
+import './dpops';
+import './quickliquid';
+import './ui-rbworld';
+import './quickexplode';
+// render-engine hooks for particle hair load on their own (they pull in the render modules)
+void import('./hairrender');

@@ -7,11 +7,14 @@ import { newObject, uid } from '../data/defaults';
 import { uniqueName } from '../ops/object';
 import { newModifier } from '../eval/modifiers';
 import { applyMatrixToObject, toMatrix4 } from '../eval/transform';
-import { ensureAction, ensureFCurve, rotationPath } from '../anim/keyframes';
+import { keyingTarget, ensureFCurve, rotationPath } from '../anim/keyframes';
 import { insertKeyframe } from '../anim/fcurve';
-import { freeCache, objectWorldAt, startBudget } from './common';
+import { caches, freeCache, objectWorldAt, startBudget } from './common';
 import { freeRigidBodyLive, loadRapier, rapierLoaded, rigidBodyMatrix, simulateRigidBodies, RB_CACHE } from './rigidbody';
 import { meshSimKey } from './meshsim';
+import { RBC_TYPES, rbcDefaults } from './rbjoints';
+import { dpCacheKey, type DynamicPaintModifier } from './dynpaint';
+import { hairDynKey } from './hairdyn';
 import { particleCacheKey, systemOf } from './particles';
 import { fluidCacheKey } from './fluid';
 import { physicsState } from './runtime';
@@ -41,7 +44,15 @@ function ensureWorld(doc: DocumentData): RigidBodyWorldX {
 // ---------------------------------------------------------------------------
 // Point caches
 
-export type CacheOwner = { key: string; label: string; pc: { frame_start: number; frame_end: number; is_baked: boolean } };
+export type CacheOwner = {
+  key: string;
+  label: string;
+  pc: { frame_start: number; frame_end: number; is_baked: boolean };
+  /** fluid domains with Modular / All caches bake through the fluid operators only */
+  ownBake?: boolean;
+  /** the object holding `point_cache` (and its list of alternative caches) */
+  holder?: Record<string, unknown>;
+};
 
 /** All point caches in the document (rigid body world, cloth/soft body modifiers, particle systems). */
 export function cacheOwners(doc: DocumentData): CacheOwner[] {
@@ -52,14 +63,19 @@ export function cacheOwners(doc: DocumentData): CacheOwner[] {
     const ob = doc.objects[id];
     if (!ob) continue;
     for (const m of ob.modifiers) {
-      if ((m.type === 'CLOTH' || m.type === 'SOFT_BODY') && m.point_cache) out.push({ key: meshSimKey(m.type, ob, m), label: `${ob.name} ▸ ${m.name}`, pc: m.point_cache as PointCacheSettings });
-      if (m.type === 'FLUID' && m.fluid_type === 'DOMAIN' && m.point_cache) out.push({ key: fluidCacheKey(ob, m), label: `${ob.name} ▸ ${m.name}`, pc: m.point_cache as PointCacheSettings });
+      if ((m.type === 'CLOTH' || m.type === 'SOFT_BODY') && m.point_cache) out.push({ key: meshSimKey(m.type, ob, m), label: `${ob.name} ▸ ${m.name}`, pc: m.point_cache as PointCacheSettings, holder: m as unknown as Record<string, unknown> });
+      if (m.type === 'FLUID' && m.fluid_type === 'DOMAIN' && m.point_cache) out.push({ key: fluidCacheKey(ob, m), label: `${ob.name} ▸ ${m.name}`, pc: m.point_cache as PointCacheSettings, ownBake: ((m.domain_settings as { cache_type?: string } | undefined)?.cache_type ?? 'REPLAY') !== 'REPLAY' });
+      if (m.type === 'DYNAMIC_PAINT' && m.ui_type === 'CANVAS')
+        for (const sf of (m as DynamicPaintModifier).canvas_settings?.canvas_surfaces ?? []) if (sf.is_active) out.push({ key: dpCacheKey(ob, m, sf), label: `${ob.name} ▸ ${sf.name}`, pc: sf.point_cache, holder: sf as unknown as Record<string, unknown> });
       if (m.type === 'PARTICLE_SYSTEM') {
         const ps = systemOf(ob, m);
         const s = ps ? doc.particles[ps.settings] : undefined;
         if (ps && s && s.type !== 'HAIR') {
           ps.point_cache ??= defaultPointCache();
-          out.push({ key: particleCacheKey(ob, m), label: `${ob.name} ▸ ${ps.name}`, pc: ps.point_cache });
+          out.push({ key: particleCacheKey(ob, m), label: `${ob.name} ▸ ${ps.name}`, pc: ps.point_cache, holder: ps as unknown as Record<string, unknown> });
+        } else if (ps && s && ps.use_hair_dynamics) {
+          ps.point_cache ??= defaultPointCache();
+          out.push({ key: hairDynKey(ob, m), label: `${ob.name} ▸ ${ps.name}`, pc: ps.point_cache, holder: ps as unknown as Record<string, unknown> });
         }
       }
     }
@@ -93,6 +109,28 @@ function bakeCaches(doc: DocumentData, owners: CacheOwner[]): number {
   return end - start + 1;
 }
 
+/** Simulate the given caches from their start up to a frame without baking them ("calculate to frame"). */
+function calculateCaches(doc: DocumentData, owners: CacheOwner[], toFrame: number): number {
+  if (!owners.length) return 0;
+  const start = Math.min(...owners.map((o) => o.pc.frame_start));
+  const end = Math.min(toFrame, Math.max(...owners.map((o) => o.pc.frame_end)));
+  const cur = doc.scene.frame_current,
+    sub = doc.scene.frame_subframe;
+  try {
+    startBudget(Infinity);
+    for (let f = start; f <= end; f++) {
+      doc.scene.frame_current = f;
+      doc.scene.frame_subframe = 0;
+      app.graph.evaluate(doc);
+    }
+  } finally {
+    doc.scene.frame_current = cur;
+    doc.scene.frame_subframe = sub;
+  }
+  app.graph.evaluate(doc);
+  return Math.max(0, end - start + 1);
+}
+
 function freeOwner(o: CacheOwner) {
   o.pc.is_baked = false;
   freeCache(o.key);
@@ -105,13 +143,13 @@ function ownerByKey(doc: DocumentData, key: string) {
 
 const needsRapier = (owners: CacheOwner[]) => owners.some((o) => o.key === RB_CACHE) && !rapierLoaded();
 
-function withRapier(owners: CacheOwner[], run: () => void): 'FINISHED' | 'CANCELLED' {
+function withRapier(owners: CacheOwner[], run: () => void, bake = true): 'FINISHED' | 'CANCELLED' {
   if (!needsRapier(owners)) {
     run();
     return 'FINISHED';
   }
   app.report('INFO', 'Loading physics engine…');
-  void loadRapier().then(() => app.run('ptcache.bake_all', { only: owners.map((o) => o.key).join(',') }));
+  void loadRapier().then(() => app.run('ptcache.bake_all', { only: owners.map((o) => o.key).join(','), bake }));
   return 'CANCELLED';
 }
 
@@ -133,7 +171,7 @@ function bakeToKeyframes(doc: DocumentData, obs: ObjectData[], start: number, en
   }
   for (const ob of obs) {
     const scratch = { ...ob, location: [...ob.location], rotation_euler: [...ob.rotation_euler], rotation_quaternion: [...ob.rotation_quaternion], rotation_axis_angle: [...ob.rotation_axis_angle], scale: [...ob.scale] } as ObjectData;
-    const act = ensureAction(doc, ob);
+    const { act, slot } = keyingTarget(doc, ob);
     const rpath = rotationPath(ob);
     for (let f = start; f <= end; f += step) {
       const world = rigidBodyMatrix(doc, ob.id, f) ?? objectWorldAt(doc, ob, f);
@@ -143,8 +181,8 @@ function bakeToKeyframes(doc: DocumentData, obs: ObjectData[], start: number, en
       applyMatrixToObject(scratch, local);
       const loc = scratch.location;
       const rot = rpath === 'rotation_quaternion' ? scratch.rotation_quaternion : rpath === 'rotation_axis_angle' ? scratch.rotation_axis_angle : scratch.rotation_euler;
-      for (let i = 0; i < 3; i++) insertKeyframe(ensureFCurve(act, 'location', i), f, loc[i]);
-      for (let i = 0; i < rot.length; i++) insertKeyframe(ensureFCurve(act, rpath, i), f, rot[i]);
+      for (let i = 0; i < 3; i++) insertKeyframe(ensureFCurve(act, 'location', i, slot), f, loc[i]);
+      for (let i = 0; i < rot.length; i++) insertKeyframe(ensureFCurve(act, rpath, i, slot), f, rot[i]);
     }
     ob.rigid_body = null;
   }
@@ -172,7 +210,7 @@ function addConstraintObject(doc: DocumentData, a: ObjectData, b: ObjectData, ty
   e.empty_display_size = 0.5;
   e.name = uniqueName(doc, 'Constraint');
   e.location = loc;
-  e.rigid_body_constraint = { type, enabled: true, disable_collisions: true, object1: a.id, object2: b.id };
+  e.rigid_body_constraint = { ...rbcDefaults(), type, enabled: true, disable_collisions: true, object1: a.id, object2: b.id };
   doc.objects[e.id] = e;
   doc.object_order.push(e.id);
   doc.collections[doc.scene.collection].objects.push(e.id);
@@ -188,12 +226,7 @@ const SHAPES: [string, string][] = [
   ['CONVEX_HULL', 'Convex Hull'],
   ['MESH', 'Mesh'],
 ];
-const CON_TYPES: [string, string][] = [
-  ['FIXED', 'Fixed'],
-  ['POINT', 'Point'],
-  ['HINGE', 'Hinge'],
-  ['SLIDER', 'Slider'],
-];
+const CON_TYPES = RBC_TYPES;
 
 function particleOwnerModifier(ob: ObjectData, ps: ParticleSystemX): ModifierBase | undefined {
   return ob.modifiers.find((m) => m.type === 'PARTICLE_SYSTEM' && m.particle_system === (ps as { id?: string }).id);
@@ -315,7 +348,7 @@ registerOperators([
     poll: () => !!active() && !(active() as ObjectPhysics).rigid_body_constraint,
     exec: (ctx, p) => {
       ensureWorld(ctx.doc);
-      (active() as ObjectPhysics).rigid_body_constraint = { type: p.type as RigidBodyConstraintData['type'], enabled: true, disable_collisions: true, object1: null, object2: null };
+      (active() as ObjectPhysics).rigid_body_constraint = { ...rbcDefaults(), type: p.type as RigidBodyConstraintData['type'], enabled: true, disable_collisions: true, object1: null, object2: null };
     },
   },
   {
@@ -467,18 +500,46 @@ registerOperators([
   {
     idname: 'ptcache.bake',
     label: 'Bake Physics',
-    description: 'Bake the simulation of this cache for its whole frame range',
-    props: [{ id: 'cache', label: 'Cache', type: 'string', default: '', hidden: true }],
+    description: 'Bake the simulation of this cache for its whole frame range (or only calculate it up to the current frame)',
+    props: [
+      { id: 'cache', label: 'Cache', type: 'string', default: '', hidden: true },
+      { id: 'bake', label: 'Bake', type: 'bool', default: true, hidden: true },
+    ],
     redo: false,
     poll: (ctx) => cacheOwners(ctx.doc).length > 0,
     exec: (ctx, p) => {
       const o = ownerByKey(ctx.doc, p.cache as string);
       if (!o) return 'CANCELLED';
+      if (p.bake === false) {
+        if (o.pc.is_baked) return 'CANCELLED';
+        return withRapier([o], () => {
+          const n = calculateCaches(ctx.doc, [o], ctx.doc.scene.frame_current);
+          app.report('INFO', `Calculated ${o.label} for ${n} frames`);
+        }, false);
+      }
       return withRapier([o], () => {
         const t = performance.now();
         const n = bakeCaches(ctx.doc, [o]);
         app.report('INFO', `Baked ${o.label}: ${n} frames in ${((performance.now() - t) / 1000).toFixed(2)} s`);
       });
+    },
+  },
+  {
+    idname: 'ptcache.bake_from_cache',
+    label: 'Current Cache to Bake',
+    description: 'Keep the frames simulated so far as the bake of this cache',
+    props: [{ id: 'cache', label: 'Cache', type: 'string', default: '', hidden: true }],
+    redo: false,
+    poll: (ctx) => cacheOwners(ctx.doc).some((o) => !o.pc.is_baked),
+    exec: (ctx, p) => {
+      const o = ownerByKey(ctx.doc, p.cache as string);
+      if (!o || o.pc.is_baked) return 'CANCELLED';
+      const c = caches.get(o.key);
+      if (!c?.frames.size) {
+        app.report('WARNING', 'Nothing is cached yet: play the animation or calculate to a frame first');
+        return 'CANCELLED';
+      }
+      o.pc.is_baked = true;
     },
   },
   {
@@ -497,13 +558,23 @@ registerOperators([
   {
     idname: 'ptcache.bake_all',
     label: 'Bake All Dynamics',
-    description: 'Bake all physics simulations in the scene',
-    props: [{ id: 'only', label: 'Only', type: 'string', default: '', hidden: true }],
+    description: 'Bake all physics simulations in the scene (or only update them up to the current frame)',
+    props: [
+      { id: 'only', label: 'Only', type: 'string', default: '', hidden: true },
+      { id: 'bake', label: 'Bake', type: 'bool', default: true, hidden: true },
+    ],
     redo: false,
     poll: (ctx) => cacheOwners(ctx.doc).length > 0,
     exec: (ctx, p) => {
       const only = String(p.only || '');
-      const owners = cacheOwners(ctx.doc).filter((o) => !only || only.split(',').includes(o.key));
+      const owners = cacheOwners(ctx.doc).filter((o) => !o.ownBake && (!only || only.split(',').includes(o.key)));
+      if (p.bake === false) {
+        const todo = owners.filter((o) => !o.pc.is_baked);
+        return withRapier(todo, () => {
+          const n = calculateCaches(ctx.doc, todo, ctx.doc.scene.frame_current);
+          app.report('INFO', `Updated ${todo.length} simulation${todo.length === 1 ? '' : 's'} to frame ${ctx.doc.scene.frame_current} (${n} frames)`);
+        }, false);
+      }
       return withRapier(owners, () => {
         const t = performance.now();
         const n = bakeCaches(ctx.doc, owners);
@@ -518,7 +589,7 @@ registerOperators([
     redo: false,
     poll: (ctx) => cacheOwners(ctx.doc).some((o) => o.pc.is_baked),
     exec: (ctx) => {
-      for (const o of cacheOwners(ctx.doc)) if (o.pc.is_baked) freeOwner(o);
+      for (const o of cacheOwners(ctx.doc)) if (o.pc.is_baked && !o.ownBake) freeOwner(o);
     },
   },
   {
@@ -541,7 +612,7 @@ registerOperators([
     description: 'Free all (non-baked) simulation caches so they are recomputed',
     undo: false,
     exec: (ctx) => {
-      for (const o of cacheOwners(ctx.doc)) if (!o.pc.is_baked) freeOwner(o);
+      for (const o of cacheOwners(ctx.doc)) if (!o.pc.is_baked && !o.ownBake) freeOwner(o);
       app.changed('frame');
     },
   },

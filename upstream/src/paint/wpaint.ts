@@ -9,7 +9,9 @@ import { activeBrush } from './brushes';
 import { blendWeight, normalizeAllWeights, normalizeVertexWeights, type BlendMode } from './math';
 import { activeMeshData, beginGeometryStroke, meshSession, reevaluate, type MeshSession } from './session';
 import { runStroke } from './stroke';
-import { gatherPaint, NORMAL_ANGLE, smearSource } from './vgather';
+import { paintFilter } from './fsdata';
+import { brushRadiusPx, gatherPaint, normalAngleOf, smearSource, type NormalFalloff } from './vgather';
+import { dabTexture } from './brushtex';
 import { invalidatePaintAttributes, writeCornerValues } from './display';
 import { barycentric } from './vpaint';
 import { armatureWeightsFor } from './armweights';
@@ -86,9 +88,12 @@ export function weightPaintStroke(v: View3D, e: PointerEvent): boolean {
   let lastHit: Vector3 | null = null;
   let lastEval = 0;
   const touched: number[] = [];
+  let dabCount = 0;
+  const restrict = !!(ts as unknown as { weight_paint?: { use_group_restrict?: boolean } }).weight_paint?.use_group_restrict;
   runStroke(v, e, {
     spacing: () => Math.max(1, b.spacing || 10),
     radiusPx: () => b.radius,
+    settings: () => b,
     dab: (d) => {
       const hit = s.raycast(v, d.x, d.y);
       if (b.falloff_shape === 'SPHERE' && !hit) return;
@@ -102,7 +107,9 @@ export function weightPaintStroke(v: View3D, e: PointerEvent): boolean {
           y: d.y,
           hit,
           strength: 1,
-          normalAngle: NORMAL_ANGLE,
+          normalAngle: normalAngleOf((app.doc.scene.tool_settings as unknown as { weight_paint?: NormalFalloff }).weight_paint),
+          sizeFactor: d.sizeFactor,
+          tex: dabTexture(b, s, v, d.x, d.y, brushRadiusPx(b, s, v, hit?.world) * (d.sizeFactor ?? 1), dabCount++),
         },
         scratch,
       );
@@ -110,6 +117,8 @@ export function weightPaintStroke(v: View3D, e: PointerEvent): boolean {
       const w = W[gi];
       const weight = ts.unified_paint.weight;
       touched.length = 0;
+      // Restrict: only vertices already in the group (weight above zero when the stroke began)
+      if (restrict) for (let k = 0; k < n; k++) if (!(orig[s.gv[k]] > 0)) s.gf[k] = 0;
       if (tool === 'DRAW') {
         for (let k = 0; k < n; k++) {
           const vi = s.gv[k];
@@ -217,11 +226,13 @@ registerOperators([
       const wt = app.doc.scene.tool_settings.unified_paint.weight;
       editGroups((ob, me, gi) => {
         if (me.vertex_groups[gi].lock_weight) return;
-        me.weights[gi].fill(wt);
+        const allowed = paintFilter(me).verts;
+        const w = me.weights[gi];
+        for (let v = 0; v < w.length; v++) if (!allowed || allowed[v]) w[v] = wt;
         if (app.doc.scene.tool_settings.use_auto_normalize) {
           const groups = deformGroups(ob, me);
           const locked = me.vertex_groups.map((g) => !!g.lock_weight);
-          for (let v = 0; v < me.weights[gi].length; v++) normalizeVertexWeights(me.weights, groups, v, gi, locked);
+          for (let v = 0; v < me.weights[gi].length; v++) if (!allowed || allowed[v]) normalizeVertexWeights(me.weights, groups, v, gi, locked);
         }
       });
     },

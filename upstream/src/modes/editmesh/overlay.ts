@@ -18,6 +18,7 @@ import {
 import { app } from '../../app/app';
 import { renderContext } from '../../render/context';
 import { editMeshObjects, selectMode, active } from './context';
+import { exclusionsOf } from './selset';
 import { viewportExtensions } from '../../editors/view3d/hooks';
 import type { View3D } from '../../editors/view3d/view3d';
 import type { MeshData } from '../../data/types';
@@ -25,17 +26,20 @@ import { triangulatePoly, polyNormal } from '../../mesh/mesh';
 
 const C = {
   vert: new Color(0, 0, 0),
-  vertSel: new Color().setRGB(1.0, 0.478, 0.0).convertSRGBToLinear(),
+  vertSel: new Color().setRGB(0.96, 0.514, 0.015).convertSRGBToLinear(),
   edge: new Color(0, 0, 0),
-  edgeSel: new Color().setRGB(1.0, 0.6, 0.0).convertSRGBToLinear(),
-  edgeModeSel: new Color().setRGB(1.0, 0.847, 0.0).convertSRGBToLinear(),
-  seam: new Color().setRGB(0.859, 0.145, 0.071).convertSRGBToLinear(),
-  sharp: new Color().setRGB(0.0, 1.0, 1.0).convertSRGBToLinear(),
-  crease: new Color().setRGB(0.8, 0.0, 0.6).convertSRGBToLinear(),
-  faceSel: new Color().setRGB(1.0, 0.639, 0.0).convertSRGBToLinear(),
+  edgeSel: new Color().setRGB(0.961, 0.63, 0.015).convertSRGBToLinear(),
+  edgeModeSel: new Color().setRGB(0.971, 0.872, 0.015).convertSRGBToLinear(),
+  seam: new Color().setRGB(0.831, 0.189, 0.081).convertSRGBToLinear(),
+  sharp: new Color().setRGB(0.094, 0.942, 0.986).convertSRGBToLinear(),
+  crease: new Color().setRGB(0.8, 0.012, 0.564).convertSRGBToLinear(),
+  bevel: new Color().setRGB(0.0, 0.63, 0.98).convertSRGBToLinear(),
+  faceSel: new Color().setRGB(0.962, 0.668, 0.015).convertSRGBToLinear(),
   active: new Color(1, 1, 1),
-  normal: new Color().setRGB(0.133, 0.867, 0.867).convertSRGBToLinear(),
+  normal: new Color().setRGB(0.212, 0.835, 0.868).convertSRGBToLinear(),
 };
+/** Edit-mode colours (Preferences ▸ Themes writes them). */
+export const editMeshColors = C;
 
 const pointMat = (xray: boolean) =>
   new ShaderMaterial({
@@ -75,7 +79,7 @@ const scene = new Scene();
 scene.matrixWorldAutoUpdate = false;
 
 function aidKey(me: MeshData) {
-  return [me.positions, me.indices, me.select_vert, me.hide_vert, me.seams, me.sharp, me.creases].map((a) => (a ? idOf(a) : 0)).join(',');
+  return [me.positions, me.indices, me.select_vert, me.hide_vert, me.seams, me.sharp, me.creases, me.bevel_weight_edge].map((a) => (a ? idOf(a) : 0)).join(',');
 }
 const ids = new WeakMap<object, number>();
 let next = 1;
@@ -85,7 +89,7 @@ function idOf(o: object) {
   return i;
 }
 
-function build(me: MeshData, xray: boolean, ov: { seams: boolean; sharp: boolean; crease: boolean; faceDots: boolean; normals: boolean; normalLen: number; vnormals: boolean }, obId: string): Group {
+function build(me: MeshData, xray: boolean, ov: { seams: boolean; sharp: boolean; crease: boolean; bevel: boolean; faceDots: boolean; normals: boolean; normalLen: number; vnormals: boolean }, obId: string): Group {
   const g = new Group();
   g.matrixAutoUpdate = false;
   const P = me.positions;
@@ -93,6 +97,7 @@ function build(me: MeshData, xray: boolean, ov: { seams: boolean; sharp: boolean
   const sel = me.select_vert ?? new Uint8Array(nv);
   const hid = me.hide_vert;
   const mode = selectMode();
+  const ex = exclusionsOf(me);
   // faces (selected tint)
   const fpos: number[] = [],
     fcol: number[] = [];
@@ -113,6 +118,7 @@ function build(me: MeshData, xray: boolean, ov: { seams: boolean; sharp: boolean
       if (hid?.[v]) hidden = true;
     }
     if (hidden) continue;
+    if (ex?.faces.has(f)) all = false;
     const isActive = active.objectId === obId && active.kind === 'FACE' && active.index === f;
     const col = isActive ? [1, 1, 1, 0.25] : all ? [C.faceSel.r, C.faceSel.g, C.faceSel.b, mode === 'FACE' ? 0.28 : 0.22] : [1, 1, 1, xray ? 0.04 : 0.012];
     tmp.length = 0;
@@ -174,7 +180,7 @@ function build(me: MeshData, xray: boolean, ov: { seams: boolean; sharp: boolean
       seen.add(key);
       epos.push(P[a * 3], P[a * 3 + 1], P[a * 3 + 2], P[b * 3], P[b * 3 + 1], P[b * 3 + 2]);
       let ca: Color, cb: Color;
-      const both = sel[a] && sel[b];
+      const both = sel[a] && sel[b] && !ex?.edges.has(a < b ? `${a}:${b}` : `${b}:${a}`);
       const isActive = active.objectId === obId && active.kind === 'EDGE' && ((active.edge[0] === a && active.edge[1] === b) || (active.edge[0] === b && active.edge[1] === a));
       if (isActive) ca = cb = C.active;
       else if (mode === 'VERT') {
@@ -186,6 +192,7 @@ function build(me: MeshData, xray: boolean, ov: { seams: boolean; sharp: boolean
         if (ov.seams && flagAt(me.seams, c)) ca = cb = C.seam;
         else if (ov.sharp && flagAt(me.sharp, c)) ca = cb = C.sharp;
         else if (ov.crease && flagAt(me.creases, c) > 0) ca = cb = C.crease;
+        else if (ov.bevel && flagAt(me.bevel_weight_edge, c) > 0) ca = cb = C.bevel;
       }
       ecol.push(ca.r, ca.g, ca.b, cb.r, cb.g, cb.b);
     }
@@ -267,7 +274,7 @@ export function drawEditOverlay(v: View3D, camera: Camera) {
   if (!r) return;
   const xray = v.shading.type === 'WIREFRAME' ? v.shading.show_xray_wireframe : v.shading.show_xray;
   const o = v.overlay;
-  const ov = { seams: o.show_edge_seams, sharp: o.show_edge_sharp, crease: o.show_edge_crease, faceDots: o.show_face_center, normals: o.show_face_normals, normalLen: o.normals_length, vnormals: o.show_vertex_normals };
+  const ov = { seams: o.show_edge_seams, sharp: o.show_edge_sharp, crease: o.show_edge_crease, bevel: (o as { show_edge_bevel_weight?: boolean }).show_edge_bevel_weight !== false, faceDots: o.show_face_center, normals: o.show_face_normals, normalLen: o.normals_length, vnormals: o.show_vertex_normals };
   scene.clear();
   const live = new Set<string>();
   for (const { ob, me } of editMeshObjects()) {

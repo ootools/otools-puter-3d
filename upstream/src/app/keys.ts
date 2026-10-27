@@ -1,15 +1,16 @@
-// Default key bindings, modelled on the reference application's default keymap
-// (left-click select). Key names follow the reference event type identifiers.
+// Default key bindings (left-click select). Key names are the event type
+// identifiers used throughout the keymaps.
 import { addKeys } from './keymap';
 import { app } from './app';
 import { addMenu, applyMenu, objectContextMenu } from '../editors/view3d/menus';
 import { availableModes } from '../editors/view3d/header';
 import { openPie } from '../ui/menu';
+import { parentClearMenu, parentSetMenu } from '../object/menus';
 
 const objectMode = () => app.doc.mode === 'OBJECT';
 
 addKeys('Window', [
-  { key: 'N', ctrl: true, op: 'wm.read_homefile' },
+  { key: 'N', ctrl: true, op: 'wm.call_menu', props: { name: 'TOPBAR_MT_file_new' } },
   { key: 'O', ctrl: true, op: 'wm.open_mainfile' },
   { key: 'S', ctrl: true, op: 'wm.save_mainfile' },
   { key: 'S', ctrl: true, shift: true, op: 'wm.save_as_mainfile' },
@@ -91,7 +92,7 @@ addKeys('3D View', [
   { key: 'G', op: 'transform.translate' },
   { key: 'R', op: 'transform.rotate' },
   { key: 'S', op: 'transform.resize' },
-  { key: 'B', op: 'view3d.select_box_tool' },
+  { key: 'B', op: 'view3d.select_box' },
   { key: 'W', op: 'wm.tool_cycle_select' },
   { key: 'TAB', op: 'object.editmode_toggle' },
   { key: 'TAB', ctrl: true, op: 'object.posemode_toggle', when: () => app.activeObject?.type === 'ARMATURE' },
@@ -114,15 +115,15 @@ addKeys('Object Mode', [
   { key: 'D', alt: true, op: 'object.duplicate_move_linked', when: objectMode },
   { key: 'X', op: 'object.delete', when: objectMode },
   { key: 'DEL', op: 'object.delete', props: { confirm: false }, when: objectMode },
-  { key: 'A', shift: true, menu: addMenu, menuTitle: 'Add', when: objectMode },
+  { key: 'A', shift: true, menu: addMenu, menuTitle: 'Add', menuSearch: true, when: objectMode },
   { key: 'H', op: 'object.hide_view_set', when: objectMode },
   { key: 'H', shift: true, op: 'object.hide_view_set', props: { unselected: true }, when: objectMode },
   { key: 'H', alt: true, op: 'object.hide_view_clear', when: objectMode },
   { key: 'M', op: 'object.move_to_collection', when: objectMode },
   { key: 'M', shift: true, op: 'object.link_to_collection', when: objectMode },
   { key: 'J', ctrl: true, op: 'object.join', when: objectMode },
-  { key: 'P', ctrl: true, op: 'object.parent_set', when: objectMode },
-  { key: 'P', alt: true, op: 'object.parent_clear', when: objectMode },
+  { key: 'P', ctrl: true, menu: parentSetMenu, menuTitle: 'Set Parent To', when: objectMode },
+  { key: 'P', alt: true, menu: parentClearMenu, menuTitle: 'Clear Parent', when: objectMode },
   { key: 'A', ctrl: true, menu: applyMenu, menuTitle: 'Apply', when: objectMode },
   { key: 'F2', op: 'object.rename' },
   { key: 'C', ctrl: true, op: 'view3d.copybuffer', when: objectMode },
@@ -141,10 +142,12 @@ export function modePie() {
   const dirs = ['OBJECT', 'EDIT', 'SCULPT', 'POSE', 'VERTEX_PAINT', 'WEIGHT_PAINT', 'TEXTURE_PAINT'];
   const items = dirs.map((d) => {
     // grease pencil objects show their own Sculpt / Draw modes in the Sculpt / Texture Paint slots
-    const alt: Record<string, string> = { SCULPT: 'SCULPT_GREASE_PENCIL', TEXTURE_PAINT: 'PAINT_GREASE_PENCIL' };
-    const m = modes.find((x) => x.mode === d) ?? modes.find((x) => x.mode === alt[d]);
+    const alt: Record<string, string[]> = { SCULPT: ['SCULPT_GREASE_PENCIL', 'SCULPT_CURVES'], TEXTURE_PAINT: ['PAINT_GREASE_PENCIL'] };
+    const m = modes.find((x) => x.mode === d) ?? modes.find((x) => alt[d]?.includes(x.mode));
     return m ? { label: m.label, icon: m.icon, active: app.doc.mode === m.mode, op: 'object.mode_set', props: { mode: m.mode } } : null;
   });
+  const pe = modes.find((x) => x.mode === 'PARTICLE_EDIT');
+  const particle = pe ? { label: pe.label, icon: pe.icon, active: app.doc.mode === pe.mode, op: 'object.mode_set', props: { mode: pe.mode } } : null;
   // W E S N NW NE SW SE
-  openPie('Mode', [items[0], items[1], items[4], items[2], items[3], items[5], items[6], null], app.pointer.x, app.pointer.y, 'Tab');
+  openPie('Mode', [items[0], items[1], items[4], items[2], items[3], items[5], items[6], particle], app.pointer.x, app.pointer.y, 'Tab');
 }

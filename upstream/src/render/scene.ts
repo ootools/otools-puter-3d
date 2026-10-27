@@ -1,4 +1,6 @@
 // Synchronises the evaluated depsgraph into a three.js scene graph.
+import { boneVisible } from '../modes/armature/armkernels';
+import { boneShape } from '../modes/armature/boneshapes';
 import {
   Scene,
   Group,
@@ -28,10 +30,11 @@ import {
 } from 'three';
 import type { App } from '../app/app';
 import type { EvalObject } from '../eval/depsgraph';
-import type { DocumentData, ObjectData } from '../data/types';
+import type { DocumentData, ObjectData, LightData } from '../data/types';
 import { meshGeometry, wireGeometry, pointGeometry } from './geometry';
 import { imageTexture } from './images';
 import { cameraWire, cameraTriangle, lightWire, emptyWire, geom, boneOctahedron, latticeWire, groundLine } from './helpers';
+import { installLightInfluence } from './realtime/lightinfluence';
 
 export interface SyncedObject {
   id: string;
@@ -47,6 +50,8 @@ export interface SyncedObject {
   bones?: Group;
   points?: Points;
   instances?: Group;
+  /** collection / vertex / face instances of other objects (src/object/instancing.ts) */
+  duplis?: Group;
   geomVersion: number;
   helperKey: string;
   ev: EvalObject;
@@ -56,6 +61,8 @@ const helperMat = () => new LineBasicMaterial({ color: 0x000000 });
 
 /** Extra per-object content (e.g. grease pencil strokes): called for every synced object. */
 export const sceneSyncHooks: ((doc: DocumentData, ev: EvalObject, so: SyncedObject) => void)[] = [];
+/** Adjust the colour of a viewport light (temperature, exposure: render/final/lightcolor.ts). */
+export const sceneLightTintHooks: ((la: LightData, color: Color) => void)[] = [];
 
 export class SceneSync {
   scene = new Scene();
@@ -67,6 +74,7 @@ export class SceneSync {
 
   constructor(private app: App) {
     this.scene.matrixWorldAutoUpdate = false;
+    installLightInfluence(this.scene);
   }
 
   objectIndex(id: string) {
@@ -169,7 +177,10 @@ export class SceneSync {
     else if (ob.type === 'LIGHT' && ob.data) key = 'L' + JSON.stringify(doc.lights[ob.data]);
     else if (ob.type === 'EMPTY') key = `E${ob.empty_display_type}${ob.empty_display_size}` + (ob.empty_display_type === 'IMAGE' ? imageEmptyKey(doc, ob) : '');
     else if (ob.type === 'LATTICE' && ob.data) key = 'T' + doc.lattices[ob.data]?.points.join(',');
-    else if (ob.type === 'ARMATURE' && ob.data) key = 'A' + (ev.pose?.signature ?? '') + doc.armatures[ob.data]?.display_type + doc.armatures[ob.data]?.bones.length + (doc.armatures[ob.data]?.bones.filter((b) => b.hide).length ?? 0);
+    else if (ob.type === 'ARMATURE' && ob.data) {
+      const arm = doc.armatures[ob.data];
+      key = 'A' + (ev.pose?.signature ?? '') + arm?.display_type + arm?.bones.length + (arm?.bones.map((b) => (boneVisible(arm, b) ? 1 : 0) + (b.show_wire ? 2 : 0)).join('') ?? '') + (arm?.display_type === 'ENVELOPE' || arm?.display_type === 'BBONE' ? arm.bones.map((b) => `${b.head_radius},${b.tail_radius},${b.bbone_segments},${b.bbone_x},${b.bbone_z}`).join(';') : '');
+    }
     if (key !== so.helperKey) {
       so.helperKey = key;
       if (so.helper) {
@@ -183,6 +194,14 @@ export class SceneSync {
       }
       if (so.bones) {
         so.root.remove(so.bones);
+        // geometries / materials are built per rebuild: free them
+        const geos = new Set<{ dispose(): void }>();
+        so.bones.traverse((c) => {
+          const o = c as unknown as { geometry?: { dispose(): void }; material?: { dispose(): void } };
+          if (o.geometry) geos.add(o.geometry);
+          o.material?.dispose();
+        });
+        geos.forEach((g) => g.dispose());
         so.bones = undefined;
       }
       if (so.imagePlane) {
@@ -193,7 +212,8 @@ export class SceneSync {
       }
       let seg: number[] | null = null;
       if (ob.type === 'CAMERA' && ob.data) {
-        seg = cameraWire(doc.cameras[ob.data], aspect);
+        const wo = doc.scene.world ? doc.worlds[doc.scene.world] : null;
+        seg = cameraWire(doc.cameras[ob.data], aspect, wo ? { start: wo.mist_start ?? 5, depth: wo.mist_depth ?? 25 } : null);
         const tri = new BufferGeometry();
         tri.setAttribute('position', geom(cameraTriangle(doc.cameras[ob.data], aspect)).getAttribute('position'));
         so.helperFill = new Mesh(tri, new MeshBasicMaterial({ color: 0x000000, side: DoubleSide }));
@@ -288,22 +308,32 @@ export class SceneSync {
     triGeo.computeVertexNormals();
     for (const name of ev.pose!.order) {
       const b = ev.pose!.bones.get(name)!;
-      const m = b.pose.clone().multiply(new Matrix4().makeScale(b.length, b.length, b.length));
       const bone = arm.bones.find((x) => x.name === name);
-      const l = new LineSegments(lineGeo, new LineBasicMaterial({ color: 0x000000 }));
+      // display type (octahedral uses the shared geometry)
+      const shape = boneShape(arm.display_type, bone, b.length);
+      const m = shape && !shape.unit ? b.pose.clone() : b.pose.clone().multiply(new Matrix4().makeScale(b.length, b.length, b.length));
+      let lg = lineGeo,
+        tg = triGeo;
+      if (shape) {
+        lg = geom(shape.lines);
+        tg = geom(shape.tris);
+        tg.computeVertexNormals();
+      }
+      const l = new LineSegments(lg, new LineBasicMaterial({ color: 0x000000 }));
       l.matrixAutoUpdate = false;
       l.matrix.copy(m);
       l.userData.bone = name;
       l.userData.id = ev.id;
-      const f = new Mesh(triGeo, new MeshBasicMaterial({ color: 0x8c8c8c, transparent: true, opacity: 0.85 }));
+      const f = new Mesh(tg, new MeshBasicMaterial({ color: 0x8b8c8e, transparent: true, opacity: arm.display_type === 'ENVELOPE' ? 0.35 : 0.85 }));
       f.matrixAutoUpdate = false;
       f.matrix.copy(m);
       f.userData.bone = name;
       f.userData.id = ev.id;
       f.userData.boneFill = true;
-      if (bone?.hide) {
+      if (bone && !boneVisible(arm, bone)) {
         l.visible = f.visible = false;
       }
+      if (bone?.show_wire || arm.display_type === 'WIRE') f.visible = false;
       g.add(f, l);
     }
     so.bones = g;
@@ -335,6 +365,8 @@ export class SceneSync {
     }
     const L = so.light;
     L.color = new Color(la.color[0], la.color[1], la.color[2]);
+    for (const hk of sceneLightTintHooks) hk(la, L.color);
+    L.userData.influence = [la.diffuse_factor ?? 1, la.specular_factor ?? 1, la.volume_factor ?? 1];
     // radiometric watts → three.js photometric-style units (see docs/rendering.md)
     if (L instanceof PointLight) {
       L.intensity = la.energy / (4 * Math.PI);
@@ -352,7 +384,7 @@ export class SceneSync {
         h = la.shape === 'RECTANGLE' || la.shape === 'ELLIPSE' ? la.size_y : la.size;
       L.width = w;
       L.height = h;
-      L.intensity = la.energy / (Math.PI * Math.max(1e-4, w * h)) / 4;
+      L.intensity = la.energy / (Math.PI * (la.normalize === false ? 1 : Math.max(1e-4, w * h))) / 4;
       L.lookAt(new Vector3(0, 0, -1));
     }
     if (!(L instanceof RectAreaLight)) {

@@ -5,6 +5,16 @@ import { icon } from './icons';
 import { numberField, checkbox, enumMenu, colorSwatch, textField, decorator, type Unit, type EnumItem } from './widgets';
 import type { ObjectData } from '../data/types';
 import { keyState, keyProperty } from '../anim/keyframes';
+import { bindProp, type PropBinding } from './binding';
+import { isReadOnly } from '../library/readonly';
+
+/** Fields of linked (read-only) data draw disabled. */
+const ro = (owner: object, o: PropOpts): PropOpts => (isReadOnly(owner) ? { ...o, disabled: true, tip: o.tip ?? 'Linked data is read-only (make it local or override it to edit)' } : o);
+
+/** Register what a widget edits so generic button interactions (ui/buttons.ts) can act on it. */
+function bind(id: string, owner: object, key: string, label: string, kind: PropBinding['kind'], o: PropOpts = {}, extra: Partial<PropBinding> = {}) {
+  bindProp({ id, owner: owner as Record<string, unknown>, key, label, kind, anim: o.anim, min: o.min, max: o.max, int: o.int, onChange: o.onChange, undo: o.undo, disabled: o.disabled, ...extra });
+}
 
 const ids = new WeakMap<object, string>();
 let n = 0;
@@ -43,15 +53,23 @@ function commit(label: string, final: boolean, o?: PropOpts) {
   if (final) app.pushUndo(o?.undo ?? label);
 }
 
+/** Right-click menu of an animatable property's decorator (set by the animation module). */
+export const propertyAnimMenuHook: { open: ((e: MouseEvent, ob: ObjectData, path: string, index: number) => void) | null } = { open: null };
+
 function deco(o?: PropOpts): Child {
   if (o?.noDecorator) return null;
   if (!o?.anim) return h('span', { class: 'decorator-space' });
   const st = keyState(app.doc, o.anim.ob, o.anim.path, o.anim.index ?? -1);
-  return decorator(st, () => {
-    keyProperty(app.doc, o.anim!.ob, o.anim!.path, o.anim!.index ?? -1);
-    app.pushUndo('Insert Keyframe');
-    app.changed('doc');
-  });
+  const a = o.anim;
+  return decorator(
+    st,
+    () => {
+      keyProperty(app.doc, a.ob, a.path, a.index ?? -1);
+      app.pushUndo('Insert Keyframe');
+      app.changed('doc');
+    },
+    propertyAnimMenuHook.open ? (e: MouseEvent) => propertyAnimMenuHook.open!(e, a.ob, a.path, a.index ?? -1) : undefined,
+  );
 }
 
 function animState(o?: PropOpts) {
@@ -65,7 +83,9 @@ export function splitRow(label: string, content: Child, decoration: Child = h('s
 }
 
 export function num<T extends object>(owner: T, key: keyof T & string, label: string, o: PropOpts = {}) {
+  o = ro(owner, o);
   const value = owner[key] as unknown as number;
+  bind(`${oid(owner)}.${key}`, owner, key, label, 'number', o);
   return splitRow(
     label,
     numberField({
@@ -93,6 +113,8 @@ export function num<T extends object>(owner: T, key: keyof T & string, label: st
 }
 
 export function bool<T extends object>(owner: T, key: keyof T & string, label: string, o: PropOpts = {}) {
+  o = ro(owner, o);
+  bind(`${oid(owner)}.${key}`, owner, key, label, 'bool', o);
   return h(
     'div',
     { class: 'split-row check' },
@@ -109,8 +131,10 @@ export function bool<T extends object>(owner: T, key: keyof T & string, label: s
   );
 }
 
-/** Checkbox with the label in the label column (reference "heading" style). */
+/** Checkbox with the label in the label column ("heading" style). */
 export function boolHeading<T extends object>(owner: T, key: keyof T & string, heading: string, label = '', o: PropOpts = {}) {
+  o = ro(owner, o);
+  bind(`${oid(owner)}.${key}`, owner, key, label || heading, 'bool', o);
   return splitRow(
     heading,
     checkbox(`${oid(owner)}.${key}`, label, !!owner[key], (v) => {
@@ -122,7 +146,9 @@ export function boolHeading<T extends object>(owner: T, key: keyof T & string, h
 }
 
 export function enumProp<T extends object>(owner: T, key: keyof T & string, label: string, items: (EnumItem | [string, string])[], o: PropOpts = {}) {
+  o = ro(owner, o);
   const list = items.map((i) => (Array.isArray(i) ? { value: i[0], label: i[1] } : i));
+  bind(`${oid(owner)}.${key}`, owner, key, label, 'enum', o, { items: list.map((x) => x.value) });
   return splitRow(
     label,
     enumMenu(`${oid(owner)}.${key}`, list, String(owner[key]), (v) => {
@@ -134,6 +160,7 @@ export function enumProp<T extends object>(owner: T, key: keyof T & string, labe
 }
 
 export function colorProp<T extends object>(owner: T, key: keyof T & string, label: string, o: PropOpts & { alpha?: boolean } = {}) {
+  bind(`${oid(owner)}.${key}`, owner, key, label, 'color', o);
   return splitRow(
     label,
     colorSwatch(`${oid(owner)}.${key}`, owner[key] as unknown as number[], (v, final) => {
@@ -145,23 +172,32 @@ export function colorProp<T extends object>(owner: T, key: keyof T & string, lab
 }
 
 export function textProp<T extends object>(owner: T, key: keyof T & string, label: string, o: PropOpts = {}) {
+  const id = `${oid(owner)}.${key}`;
+  bind(id, owner, key, label, 'text', o);
   return splitRow(
     label,
-    textField(`${oid(owner)}.${key}`, String(owner[key] ?? ''), (v) => {
-      (owner as Record<string, unknown>)[key] = v;
-      commit(`Change ${label}`, true, o);
-    }),
+    textField(
+      id,
+      String(owner[key] ?? ''),
+      (v) => {
+        (owner as Record<string, unknown>)[key] = v;
+        commit(`Change ${label}`, true, o);
+      },
+      { bound: true },
+    ),
   );
 }
 
 /** Stacked vector fields: first row carries the label ("Location X"), following rows "Y", "Z". */
 export function vecProp<T extends object>(owner: T, key: keyof T & string, label: string, o: PropOpts & { names?: string[]; lock?: { owner: object; key: string; offset?: number } } = {}) {
+  o = { ...o, ...(isReadOnly(owner) ? { disabled: true } : {}) };
   const arr = owner[key] as unknown as number[];
   const names = o.names ?? ['X', 'Y', 'Z', 'W'];
   return h(
     'div',
     { class: 'vec-prop' },
     arr.map((v, i) => {
+      bind(`${oid(owner)}.${key}.${i}`, owner, key, `${label} ${names[i]}`, 'vector', { ...o, anim: o.anim ? { ...o.anim, index: i } : undefined }, { index: i });
       const field = numberField({
           id: `${oid(owner)}.${key}.${i}`,
           value: v,
@@ -173,6 +209,7 @@ export function vecProp<T extends object>(owner: T, key: keyof T & string, label
           step: o.step,
           precision: o.precision,
           slider: o.slider,
+          disabled: o.disabled,
           anim: o.anim ? (() => {
             const st = keyState(app.doc, o.anim!.ob, o.anim!.path, i);
             return st === 'none' ? null : st;
@@ -191,6 +228,7 @@ export function vecProp<T extends object>(owner: T, key: keyof T & string, label
               'button',
               {
                 class: { 'lock-btn': true, on: !!locks?.[li] },
+                disabled: !!o.disabled || isReadOnly(o.lock.owner),
                 'data-tip': `Lock ${label} ${names[i]}\nDisable editing this channel in the 3D viewport`,
                 'aria-label': `Lock ${label} ${names[i]}`,
                 'aria-pressed': locks?.[li] ? 'true' : 'false',
@@ -211,11 +249,15 @@ export function vecProp<T extends object>(owner: T, key: keyof T & string, label
         i === 0 ? `${label} ${names[i]}` : names[i],
         lockBtn ? h('div', { class: 'field-with-lock' }, field, lockBtn) : field,
         o.anim
-          ? decorator(keyState(app.doc, o.anim.ob, o.anim.path, i), () => {
-              keyProperty(app.doc, o.anim!.ob, o.anim!.path, i);
-              app.pushUndo('Insert Keyframe');
-              app.changed('doc');
-            })
+          ? decorator(
+              keyState(app.doc, o.anim.ob, o.anim.path, i),
+              () => {
+                keyProperty(app.doc, o.anim!.ob, o.anim!.path, i);
+                app.pushUndo('Insert Keyframe');
+                app.changed('doc');
+              },
+              propertyAnimMenuHook.open ? (e: MouseEvent) => propertyAnimMenuHook.open!(e, o.anim!.ob, o.anim!.path, i) : undefined,
+            )
           : h('span', { class: 'decorator-space' }),
         i === 0 ? 'vec-first' : i === arr.length - 1 ? 'vec-last' : 'vec-mid',
       );
@@ -246,6 +288,29 @@ export function axisToggles<T extends object>(owner: T, key: keyof T & string, l
         ),
       ),
     ),
+  );
+}
+
+/** Object reference picker (with an eyedropper on E); `filter` limits the candidates. */
+export function objectProp<T extends object>(owner: T, key: keyof T & string, label: string, o: PropOpts & { filter?: (ob: ObjectData) => boolean; none?: string } = {}) {
+  const candidates = Object.values(app.doc.objects)
+    .filter((ob) => !o.filter || o.filter(ob))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const id = `${oid(owner)}.${key}`;
+  bind(id, owner, key, label, 'object', o, { items: candidates.map((c) => c.id) });
+  return splitRow(
+    label,
+    enumMenu(
+      id,
+      [{ value: '', label: o.none ?? '—' }, ...candidates.map((c) => ({ value: c.id, label: c.name, icon: 'object' }))],
+      String(owner[key] ?? ''),
+      (v) => {
+        (owner as Record<string, unknown>)[key] = v || null;
+        commit(`Set ${label}`, true, o);
+      },
+      { disabled: o.disabled, tip: o.tip ?? `${label}\nPress E over the field to pick an object in the viewport` },
+    ),
+    deco(o),
   );
 }
 

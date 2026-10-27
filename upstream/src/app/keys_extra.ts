@@ -2,10 +2,12 @@
 // subdivision levels, pies for orientation / falloff, toolbar popup, local view removal, …).
 import { Vector3 } from 'three';
 import { app, registerOperators } from './app';
-import { addKeys } from './keymap';
-import { uiState, activeTools } from './prefs';
+import { addKeys, keymaps, keyLabel } from './keymap';
+import { activeTools } from './prefs';
 import { editorTypes, type EditorTypeId } from '../ui/screen';
-import { openMenu, openPie, promptText, type MenuItem } from '../ui/menu';
+import { openMenu, openPie, promptText, closeMenus, type MenuItem, type PieItem } from '../ui/menu';
+import { currentOrientation, customOrientations, setOrientation } from '../ops/orientations';
+import { BUILTIN_ORIENTATIONS } from '../ops/orientation_list';
 import { activeView3D } from '../editors/view3d/view3d';
 import { toolsFor, setActiveTool } from '../editors/view3d/toolbar';
 import { newModifier } from '../eval/modifiers';
@@ -85,30 +87,31 @@ registerOperators([
     undo: false,
   },
   {
-    idname: 'view3d.dolly',
-    label: 'Dolly View',
-    description: 'Move the view forward or backward without changing the pivot distance',
-    props: [{ id: 'delta', label: 'Delta', type: 'int', default: 1 }],
-    poll: () => !!activeView3D(),
-    exec: (_ctx, p) => {
-      const v = activeView3D()!;
-      v.leaveCamera();
-      v.nav.pivot.add(v.nav.forward.multiplyScalar((p.delta as number) * v.nav.distance * 0.2));
-      v.afterNav();
-    },
-    undo: false,
-  },
-  {
     idname: 'wm.toolbar',
     label: 'Toolbar',
     description: 'Show the toolbar tools of the current mode in a popup',
     poll: () => !!activeView3D(),
     invoke: () => {
       const tools = toolsFor(app.doc.mode).filter(Boolean) as { id: string; label: string; icon: string; shortcut?: string }[];
+      // inside the popup, single keys pick tools (the Toolbar Popup keymap)
+      const popupKey = (id: string) => (keymaps['Toolbar Popup'] ?? []).find((k) => !k.inactive && k.op === 'wm.tool_set_by_id' && k.props?.name === id);
       openMenu(
-        tools.map((t) => ({ label: t.label, icon: t.icon, shortcut: t.shortcut, active: activeTools[app.doc.mode] === t.id, action: () => setActiveTool(t.id) })),
+        tools.map((t) => {
+          const k = popupKey(t.id);
+          return { label: t.label, icon: t.icon, shortcut: k ? keyLabel(k) : t.shortcut, active: activeTools[app.doc.mode] === t.id, action: () => setActiveTool(t.id) };
+        }),
         { x: app.pointer.x, y: app.pointer.y },
-        { title: 'Toolbar' },
+        {
+          title: 'Toolbar',
+          typeSpace: true,
+          onType: (ch) => {
+            const key = ch === ' ' ? 'SPACE' : ch.toUpperCase();
+            const k = (keymaps['Toolbar Popup'] ?? []).find((x) => !x.inactive && x.key === key && !x.ctrl && !x.alt && !!x.shift === (ch !== ch.toLowerCase() && ch !== ' '));
+            if (!k?.op || !app.poll(k.op)) return;
+            closeMenus();
+            app.run(k.op, k.props ?? {});
+          },
+        },
       );
       return 'CANCELLED';
     },
@@ -149,10 +152,12 @@ registerOperators([
   {
     idname: 'screen.time_jump',
     label: 'Jump Time by Delta',
-    description: 'Jump forward or backward by one second',
+    description: 'Jump forward or backward by the scene’s time jump step (one second by default)',
     props: [{ id: 'backward', label: 'Backwards', type: 'bool', default: false }],
     exec: (ctx, p) => {
-      const step = Math.max(1, Math.round(ctx.doc.scene.render.fps));
+      const sc = ctx.doc.scene;
+      const delta = sc.time_jump_delta ?? 1;
+      const step = Math.max(1, Math.round(sc.time_jump_unit === 'FRAMES' ? delta : delta * (sc.render.fps / (sc.render.fps_base || 1))));
       app.setFrame(ctx.doc.scene.frame_current + (p.backward ? -step : step));
     },
     undo: false,
@@ -232,20 +237,16 @@ registerOperators([
   },
 ]);
 
-function orientationPie() {
-  const items = (['GLOBAL', 'LOCAL', 'NORMAL', 'GIMBAL', 'VIEW', 'CURSOR', 'PARENT'] as const).map((o) => ({
-    label: o[0] + o.slice(1).toLowerCase(),
-    active: uiState.orientation === o,
-    action: () => {
-      uiState.orientation = o;
-      app.changed('ui');
-    },
-  }));
-  // W E S N NW NE SW SE
-  openPie('Transform Orientation', [items[1], items[0], items[2], items[4], items[3], items[5], items[6], null], app.pointer.x, app.pointer.y, 'COMMA');
+export function orientationPie() {
+  const cur = currentOrientation();
+  // W E S N NW NE SW SE: the built-in orientations in order, then the first custom one
+  const items: (PieItem | null)[] = BUILTIN_ORIENTATIONS.map(([o, label, ic]) => ({ label, icon: ic, active: cur === o, action: () => setOrientation(o) }));
+  const custom = customOrientations()[0];
+  items.push(custom ? { label: custom.name, icon: 'orientation_local', active: cur === custom.name, action: () => setOrientation(custom.name) } : null);
+  openPie('Transform Orientation', items, app.pointer.x, app.pointer.y, 'COMMA');
 }
 
-function falloffPie() {
+export function falloffPie() {
   const ts = app.doc.scene.tool_settings;
   const items = (['SMOOTH', 'SPHERE', 'ROOT', 'INVERSE_SQUARE', 'SHARP', 'LINEAR', 'CONSTANT', 'RANDOM'] as const).map((f) => ({
     label: f === 'INVERSE_SQUARE' ? 'Inverse Square' : f[0] + f.slice(1).toLowerCase(),
@@ -259,26 +260,35 @@ function falloffPie() {
   openPie('Proportional Editing Falloff', items, app.pointer.x, app.pointer.y, 'O');
 }
 
-const fileContextMenu = (): MenuItem[] => [
-  { label: 'New', op: 'wm.read_homefile', shortcut: 'Ctrl N' },
-  { label: 'Open…', op: 'wm.open_mainfile', shortcut: 'Ctrl O' },
-  { separator: true },
-  { label: 'Save', op: 'wm.save_mainfile', shortcut: 'Ctrl S' },
-  { label: 'Save As…', op: 'wm.save_as_mainfile', shortcut: 'Shift Ctrl S' },
-  { label: 'Save Incremental', op: 'wm.save_mainfile', props: { incremental: true }, shortcut: 'Ctrl Alt S' },
-];
+
+// keys that pick a tool while the toolbar popup is open
+addKeys('Toolbar Popup', [
+  { key: 'SPACE', op: 'wm.tool_set_by_id', props: { name: 'builtin.cursor' } },
+  { key: 'W', op: 'wm.tool_set_by_id', props: { name: 'builtin.select' } },
+  { key: 'L', op: 'wm.tool_set_by_id', props: { name: 'builtin.select_lasso' } },
+  { key: 'T', op: 'wm.tool_set_by_id', props: { name: 'builtin.transform' } },
+  { key: 'M', op: 'wm.tool_set_by_id', props: { name: 'builtin.measure' } },
+]);
 
 addKeys('Window', [
   ...Object.keys(SPACE_KEYS).map((k) => ({ key: k, shift: true, op: 'screen.space_type_set_or_cycle', props: { key: k } })),
   { key: 'SPACE', shift: true, op: 'wm.toolbar' },
   { key: 'F2', ctrl: true, op: 'wm.batch_rename' },
-  { key: 'F4', menu: fileContextMenu, menuTitle: 'File' },
+  { key: 'F4', op: 'wm.call_menu', props: { name: 'TOPBAR_MT_file_context_menu' } },
   { key: 'S', ctrl: true, alt: true, op: 'wm.save_mainfile', props: { incremental: true } },
 ]);
 
 addKeys('Frames', [
   { key: 'RIGHT_ARROW', ctrl: true, op: 'screen.time_jump', props: { backward: false } },
   { key: 'LEFT_ARROW', ctrl: true, op: 'screen.time_jump', props: { backward: true } },
+  // Alt + mouse wheel steps through frames anywhere
+  { key: 'WHEELDOWNMOUSE', alt: true, op: 'screen.frame_offset', props: { delta: 1 } },
+  { key: 'WHEELUPMOUSE', alt: true, op: 'screen.frame_offset', props: { delta: -1 } },
+  // media keys of keyboards that have them
+  { key: 'MEDIA_PLAY', op: 'screen.animation_play' },
+  { key: 'MEDIA_STOP', op: 'screen.animation_cancel' },
+  { key: 'MEDIA_LAST', op: 'screen.keyframe_jump', props: { next: true } },
+  { key: 'MEDIA_FIRST', op: 'screen.keyframe_jump', props: { next: false } },
 ]);
 
 addKeys('3D View', [
@@ -289,8 +299,8 @@ addKeys('3D View', [
   { key: 'NUMPAD_MINUS', shift: true, op: 'view3d.dolly', props: { delta: -1 } },
   { key: 'EQUAL', shift: true, ctrl: true, op: 'view3d.dolly', props: { delta: 1 } },
   { key: 'MINUS', shift: true, ctrl: true, op: 'view3d.dolly', props: { delta: -1 } },
-  { key: 'HOME', ctrl: true, op: 'view3d.view_all' },
-  { key: 'NUMPAD_PERIOD', ctrl: true, op: 'view3d.view_selected' },
+  { key: 'HOME', ctrl: true, op: 'view3d.view_all', props: { use_all_regions: true } },
+  { key: 'NUMPAD_PERIOD', ctrl: true, op: 'view3d.view_selected', props: { use_all_regions: true } },
   { key: 'Z', shift: true, op: 'view3d.toggle_shading', props: { type: 'WIREFRAME' } },
   { key: 'ACCENT_GRAVE', ctrl: true, op: 'view3d.gizmo_toggle' },
   { key: 'COMMA', action: orientationPie },

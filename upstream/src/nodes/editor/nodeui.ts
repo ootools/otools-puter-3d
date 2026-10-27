@@ -5,10 +5,11 @@ import { icon } from '../../ui/icons';
 import { app } from '../../app/app';
 import { numberField, checkbox, enumMenu, colorSwatch, textField, type Unit } from '../../ui/widgets';
 import { openMenu } from '../../ui/menu';
+import { bindProp } from '../../ui/binding';
 import type { NodeData, NodeTreeData, SocketValue } from '../../data/types';
-import { getNodeType, inputValue, nodeLabel, propValue, NODE_CLASS_COLORS, SOCKET_COLORS } from '../registry';
+import { getNodeType, inputValue, nodeLabel, nodePanels, propValue, NODE_CLASS_COLORS, SOCKET_COLORS } from '../registry';
 import type { NodeDrawContext, NodePropDef, ResolvedSocket } from '../types';
-import { HEADER, ROW, type NodeLayout, type Row } from './layout';
+import { HEADER, ROW, type NodeLayout, type Row, type SocketPos } from './layout';
 import { compatibleGroups } from '../tree';
 import { importImageFile } from '../../ops/data';
 
@@ -40,6 +41,20 @@ export function unitOf(sub?: string): Unit {
 }
 
 /** Value widget for an unlinked input socket. */
+/** Register node input values for the generic button actions (keyframes, reset, copy/paste, data path). */
+function bindSocket(node: NodeData, s: ResolvedSocket, key: string) {
+  const base = { owner: node.inputs as Record<string, unknown>, key: s.identifier, label: s.label, def: s.default, min: s.min, max: s.max };
+  if (s.type === 'VECTOR' || s.type === 'ROTATION') for (let i = 0; i < (s.dimensions ?? 3); i++) bindProp({ ...base, id: `${key}:${s.identifier}:${i}`, index: i, kind: 'vector' });
+  else
+    bindProp({
+      ...base,
+      id: `${key}:${s.identifier}`,
+      kind: s.type === 'RGBA' ? 'color' : s.type === 'BOOLEAN' ? 'bool' : s.type === 'MENU' ? 'enum' : 'number',
+      int: s.type === 'INT',
+      items: s.items,
+    });
+}
+
 export function socketValueWidget(node: NodeData, s: ResolvedSocket, key: string, opts: { label?: boolean; vectorColumn?: boolean } = {}): Child {
   const v = inputValue(node, s);
   const set = (nv: SocketValue, final: boolean) => {
@@ -47,6 +62,7 @@ export function socketValueWidget(node: NodeData, s: ResolvedSocket, key: string
     nodeChanged(`Change ${s.label}`, final);
   };
   const label = opts.label === false ? undefined : s.label;
+  bindSocket(node, s, key);
   switch (s.type) {
     case 'FLOAT':
     case 'INT':
@@ -137,7 +153,7 @@ export function propWidget(node: NodeData, p: NodePropDef, key: string, ctx: { t
   const id = `${key}:p:${p.id}`;
   switch (p.type) {
     case 'ENUM': {
-      const items = (p.items ?? []).map(([value, l]) => ({ value, label: l }));
+      const items = (p.itemsFor?.(ctx.tree) ?? p.items ?? []).map(([value, l]) => ({ value, label: l }));
       if (p.expand)
         return h(
           'div',
@@ -245,6 +261,13 @@ export function propWidget(node: NodeData, p: NodePropDef, key: string, ctx: { t
       const obs = Object.values(app.doc.objects);
       return enumMenu(id, [{ value: '', label: '—' }, ...obs.map((o) => ({ value: o.id, label: o.name, icon: 'object' }))], String(v ?? ''), (x) => set(x || null), { title: p.name });
     }
+    case 'COLLECTION':
+    case 'MATERIAL': {
+      const doc = app.doc;
+      const list = p.type === 'COLLECTION' ? Object.values(doc.collections).filter((c) => c.id !== doc.scene.collection) : Object.values(doc.materials);
+      const ic = p.type === 'COLLECTION' ? 'collection' : 'material';
+      return enumMenu(id, [{ value: '', label: '—' }, ...list.map((o) => ({ value: o.id, label: o.name, icon: ic }))], String(v ?? ''), (x) => set(x || null), { title: p.name });
+    }
     default:
       return null;
   }
@@ -329,13 +352,66 @@ export interface NodeRenderState {
   highlightSockets?: Set<string>;
   groupName?: string;
   invalid?: boolean;
+  /** text shown above a reroute (its label, or the name of the socket feeding it) */
+  rerouteLabel?: string;
+  /** while a link is dragged: sockets it cannot connect to are dimmed */
+  dimSocket?: (p: SocketPos, nodeId: string) => boolean;
+  /** preview image above the node ('' while it renders) */
+  preview?: string;
+  /** tooltip of the node title (a group's description) */
+  titleTip?: string;
+  /** messages from the last evaluation, shown as an icon on the header */
+  warnings?: { messages: string[]; kind: 'ERROR' | 'WARNING' | 'INFO' };
 }
 
 const COLLAPSE_TIP = 'Collapse (H)';
 
+const TYPE_NAMES: Record<string, string> = {
+  FLOAT: 'Float',
+  INT: 'Integer',
+  BOOLEAN: 'Boolean',
+  VECTOR: 'Vector',
+  RGBA: 'Color',
+  SHADER: 'Shader',
+  STRING: 'String',
+  ROTATION: 'Rotation',
+  MATRIX: 'Matrix',
+  MENU: 'Menu',
+  GEOMETRY: 'Geometry',
+  OBJECT: 'Object',
+  COLLECTION: 'Collection',
+  IMAGE: 'Image',
+  MATERIAL: 'Material',
+  TEXTURE: 'Texture',
+};
+
+/** Socket tooltip: name, type, the value of an unlinked input, and the socket's description. */
+function socketTip(node: NodeData, s: ResolvedSocket, isOutput: boolean, linked: boolean): string {
+  if (s.type === 'CUSTOM') {
+    if (!s.identifier.startsWith('__extend__')) return '';
+    return node.type === 'NodeGroupInput' || node.type === 'NodeGroupOutput'
+      ? 'New Socket\nLink here to add a socket to the group interface'
+      : 'New Item\nLink here to add an item of the linked socket\u2019s type';
+  }
+  const lines = [s.label || s.name, `${TYPE_NAMES[s.type] ?? s.type} ${isOutput ? 'output' : 'input'}${linked ? ' (linked)' : ''}`];
+  if (!isOutput && !linked && !s.hide_value) {
+    const v = inputValue(node, s);
+    const f = (x: number) => (Number.isInteger(x) ? String(x) : x.toFixed(3));
+    if (typeof v === 'number') lines.push(`Value: ${f(v)}`);
+    else if (typeof v === 'boolean') lines.push(`Value: ${v ? 'True' : 'False'}`);
+    else if (Array.isArray(v)) lines.push(`Value: (${(v as number[]).map(f).join(', ')})`);
+    else if (typeof v === 'string' && v) lines.push(`Value: ${v}`);
+  }
+  if (s.description) lines.push(s.description);
+  return lines.join('\n');
+}
+
 export function nodeColor(n: NodeData): string {
   const def = getNodeType(n.type);
-  return NODE_CLASS_COLORS[def?.category ?? 'converter'] ?? '#3b3b3b';
+  // group nodes can take a category color from their group
+  const tag = def?.dynamicSockets && typeof n.props.node_tree === 'string' ? app.doc.node_groups[n.props.node_tree]?.tree.color_tag : undefined;
+  if (tag && tag in NODE_CLASS_COLORS) return NODE_CLASS_COLORS[tag as keyof typeof NODE_CLASS_COLORS];
+  return NODE_CLASS_COLORS[def?.dynamicCategory?.(n) ?? def?.category ?? 'converter'] ?? '#38393b';
 }
 
 function rowContent(node: NodeData, row: Row, key: string, tree: NodeTreeData): Child {
@@ -359,8 +435,12 @@ function rowContent(node: NodeData, row: Row, key: string, tree: NodeTreeData): 
             if (e.button !== 0) return;
             e.stopPropagation();
             const name = row.panel!.name;
-            const def2 = getNodeType(node.type)!;
-            const open = new Set(node.open_panels ?? def2.panels!.filter((p) => !p.closed).map((p) => p.name));
+            const open = new Set(
+              node.open_panels ??
+                nodePanels(node, { doc: app.doc, tree })
+                  .filter((p) => !p.closed)
+                  .map((p) => p.name),
+            );
             if (open.has(name)) open.delete(name);
             else open.add(name);
             node.open_panels = [...open];
@@ -368,6 +448,9 @@ function rowContent(node: NodeData, row: Row, key: string, tree: NodeTreeData): 
           },
         },
         icon(row.open ? 'disclosure_tri_down' : 'disclosure_tri_right'),
+        row.socket && !row.linked
+          ? h('span', { class: 'nd-panel-toggle', onpointerdown: (e: PointerEvent) => e.stopPropagation() }, socketValueWidget(node, row.socket, `${key}:ptoggle`, { label: false }))
+          : null,
         h('span', { class: 'nd-label' }, row.panel!.name),
       );
     case 'body':
@@ -394,16 +477,20 @@ export function renderNode(l: NodeLayout, tree: NodeTreeData, st: NodeRenderStat
   const custom = n.use_custom_color && n.color ? `rgb(${n.color.map((c) => Math.round(Math.pow(Math.max(0, Math.min(1, c)), 1 / 2.2) * 255)).join(',')})` : null;
   if (l.kind === 'REROUTE') {
     const s = l.sockets.get('out:Output')!;
-    return h('div', {
-      key,
-      class: { 'nd-reroute': true, sel: !!n.select, active: st.active },
-      'data-node': n.id,
-      style: {
-        left: `${l.x}px`,
-        top: `${l.y}px`,
-        '--sc': SOCKET_COLORS[s.socket.type] ?? '#888',
+    return h(
+      'div',
+      {
+        key,
+        class: { 'nd-reroute': true, sel: !!n.select, active: st.active },
+        'data-node': n.id,
+        style: {
+          left: `${l.x}px`,
+          top: `${l.y}px`,
+          '--sc': SOCKET_COLORS[s.socket.type] ?? '#87888a',
+        },
       },
-    });
+      st.rerouteLabel ? h('span', { class: { 'nd-reroute-label': true, auto: !n.label } }, st.rerouteLabel) : null,
+    );
   }
   if (l.kind === 'FRAME') {
     const size = (propValue(n, 'label_size') as number) ?? 20;
@@ -437,14 +524,16 @@ export function renderNode(l: NodeLayout, tree: NodeTreeData, st: NodeRenderStat
           out: p.isOutput,
           linked,
           hl: !!st.highlightSockets?.has(k),
+          dim: !!st.dimSocket?.(p, n.id),
           ext: p.socket.type === 'CUSTOM' && p.socket.identifier === '__extend__',
           diamond: p.socket.shape === 'DIAMOND' || p.socket.shape === 'DIAMOND_DOT',
         },
         'data-sock': k,
+        'data-tip': socketTip(n, p.socket, p.isOutput, linked),
         style: {
           left: `${p.x - l.x}px`,
           top: `${p.y - l.y}px`,
-          '--sc': SOCKET_COLORS[p.socket.type] ?? '#888',
+          '--sc': SOCKET_COLORS[p.socket.type] ?? '#87888a',
         },
       }),
     );
@@ -488,9 +577,13 @@ export function renderNode(l: NodeLayout, tree: NodeTreeData, st: NodeRenderStat
         },
         icon(n.hide ? 'right_arrow' : 'down_arrow_hlt'),
       ),
-      h('span', { class: 'nd-title' }, title),
+      h('span', { class: 'nd-title', 'data-tip': st.titleTip ? `${title}\n${st.titleTip}` : null }, title),
       def?.dynamicSockets && n.props.node_tree !== undefined ? h('span', { class: 'nd-group-icon', 'data-tip': 'Node group (Tab to edit)' }, icon('node_tree')) : null,
+      st.warnings?.messages.length
+        ? h('span', { class: `nd-warn-icon ${st.warnings.kind.toLowerCase()}`, 'data-tip': st.warnings.messages.join('\n') }, icon(st.warnings.kind === 'INFO' ? 'info' : 'error'))
+        : null,
     ),
+    st.preview !== undefined ? h('div', { class: 'nd-preview' }, st.preview ? h('img', { src: st.preview, alt: '', draggable: 'false' }) : null) : null,
     n.hide
       ? null
       : l.rows.map((r, i) =>

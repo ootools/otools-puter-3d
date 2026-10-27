@@ -9,12 +9,23 @@ import './style';
 import './follow';
 import './editor';
 import './ops';
+import './graphops';
 import './constraintui';
+import './solvers';
+import './solveops';
+import './solvemenus';
+import './scenesetup';
+import './bundles3d';
+import './planenode';
+import './editorops';
+import './proxy';
+import './presets';
+import '../mask/index';
 import { registerWorkspaceTemplate, A, H, V } from '../ui/screen';
 
 registerWorkspaceTemplate('VFX', () => ({
   name: 'Motion Tracking',
-  // proportions measured from the reference VFX template
+  // default VFX template proportions
   layout: H(
     0.826,
     V(0.29, H(0.527, A('CLIP_EDITOR', { view: 'DOPESHEET' }), A('VIEW_3D')), V(0.73, A('CLIP_EDITOR', { view: 'CLIP' }), V(0.82, A('CLIP_EDITOR', { view: 'GRAPH' }), A('TIMELINE')))),

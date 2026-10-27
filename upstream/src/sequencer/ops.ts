@@ -1,13 +1,16 @@
-// Sequencer operators (reference idnames): selection, editing, meta strips, view, adding strips.
+// Sequencer operators: selection, editing, meta strips, view, adding strips.
+import { MODIFIER_KINDS, isSoundModifier, modifierKind } from './modextra';
 import { app, registerOperators, operators, type Operator } from '../app/app';
 import type { Strip, StripType, ModifierType } from './types';
 import * as S from './strips';
 import { seqEditor, seqList, seqChannels, selectedStrips, activeStrip, setActive, isLocked, toolSettings, afterEdit, hoverSeq, hasEditor, overPreview } from './context';
-import { startSlide, startExtend, startSlip, startPreviewTransform, previewStrips, type PreviewMode } from './transform';
+import { startSlide, startExtend, startSlip, previewStrips, slideBy, slipBy, extendBy } from './transform';
+import { startPreviewTransform, transformPreview, type PreviewMode } from './pvtransform';
 import { addEffect, addScene, addMovie, addSound, addImages, pickFiles, ACCEPT, DEFAULT_LENGTH, fitScale } from './add';
 import { restartPlayback } from './audio';
 import { promptText } from '../ui/menu';
 import { clearMovieCaches } from './media';
+import { connectedOf, remapConnections } from './connect';
 
 const anySeq = () => hasEditor() && seqList().length > 0;
 const anySelected = () => hasEditor() && seqList().some((s) => s.select);
@@ -35,8 +38,8 @@ function deselectAll(list = seqList()) {
   }
 }
 
-/** Click selection in the timeline (sequencer.select). */
-export function selectStrip(s: Strip | null, opts: { extend?: boolean; toggle?: boolean; handle?: 'LEFT' | 'RIGHT' | null; deselectAll?: boolean } = {}) {
+/** Click selection in the timeline (sequencer.select). Connected strips follow unless ignored. */
+export function selectStrip(s: Strip | null, opts: { extend?: boolean; toggle?: boolean; handle?: 'LEFT' | 'RIGHT' | null; deselectAll?: boolean; ignoreConnections?: boolean } = {}) {
   const list = seqList();
   if (!s) {
     if (opts.deselectAll !== false && !opts.extend && !opts.toggle) {
@@ -45,10 +48,13 @@ export function selectStrip(s: Strip | null, opts: { extend?: boolean; toggle?: 
     }
     return;
   }
+  const linked = opts.ignoreConnections ? [] : connectedOf(list, s);
   if (opts.toggle) {
     if (s.select && !opts.handle) {
-      s.select = false;
-      s.select_left_handle = s.select_right_handle = false;
+      for (const x of [s, ...linked]) {
+        x.select = false;
+        x.select_left_handle = x.select_right_handle = false;
+      }
       if (activeStrip() === s) setActive(null);
       return;
     }
@@ -57,6 +63,13 @@ export function selectStrip(s: Strip | null, opts: { extend?: boolean; toggle?: 
   s.select_left_handle = opts.handle === 'LEFT' || (!!opts.toggle && s.select_left_handle);
   s.select_right_handle = opts.handle === 'RIGHT' || (!!opts.toggle && s.select_right_handle);
   if (!opts.handle) s.select_left_handle = s.select_right_handle = false;
+  for (const c of linked) {
+    c.select = true;
+    if (!opts.handle) c.select_left_handle = c.select_right_handle = false;
+    // connected strips sharing the clicked edge are trimmed together
+    else if (opts.handle === 'LEFT' && S.finalStart(c) === S.finalStart(s)) c.select_left_handle = true;
+    else if (opts.handle === 'RIGHT' && S.finalEnd(c) === S.finalEnd(s)) c.select_right_handle = true;
+  }
   setActive(s);
 }
 
@@ -74,6 +87,7 @@ function duplicate(list: Strip[], src: Strip[]): Strip[] {
     return c;
   };
   for (const s of src) out.push(cloneDeep(s));
+  remapConnections(out, rename);
   // effects duplicated together with their inputs use the copies
   const fix = (l: Strip[]) => {
     for (const c of l) {
@@ -126,13 +140,17 @@ const ops: Operator[] = [
     idname: 'sequencer.select_box',
     label: 'Box Select',
     description: 'Select strips using box selection',
-    props: [{ id: 'mode', label: 'Mode', type: 'enum', default: 'SET', items: [['SET', 'Set'], ['ADD', 'Extend'], ['SUB', 'Subtract']] }],
+    props: [
+      { id: 'mode', label: 'Mode', type: 'enum', default: 'SET', items: [['SET', 'Set'], ['ADD', 'Extend'], ['SUB', 'Subtract']] },
+      { id: 'include_handles', label: 'Select Handles', type: 'bool', default: false },
+      { id: 'ignore_connections', label: 'Ignore Connections', type: 'bool', default: false },
+    ],
     poll: () => anySeq() && inSeq(),
     undo: false,
     invoke: (_c, p) => {
       const ed = hoverSeq();
       if (!ed) return 'CANCELLED';
-      ed.startBoxSelect({ clientX: app.pointer.x, clientY: app.pointer.y }, p.mode as 'SET');
+      ed.startBoxSelect({ clientX: app.pointer.x, clientY: app.pointer.y }, p.mode as 'SET', false, { includeHandles: !!p.include_handles, ignoreConnections: !!p.ignore_connections });
       return 'CANCELLED';
     },
   },
@@ -290,8 +308,9 @@ const ops: Operator[] = [
       afterEdit();
       if (!ed || !startSlide(ed, app.pointer.x, app.pointer.y, {
         label: 'Duplicate Strips',
+        redoOp: 'sequencer.duplicate_move',
         onCancel: () => {
-          // cancelling the move keeps the copies in place (as in the reference), resolving overlap
+          // cancelling the move keeps the copies in place, resolving overlap
           S.resolveOverlap(list, copies, toolSettings().overlap_mode);
           afterEdit();
           app.pushUndo('Duplicate Strips');
@@ -303,11 +322,27 @@ const ops: Operator[] = [
       }
       return 'RUNNING_MODAL';
     },
-    exec: () => {
+    props: [{ id: 'value', label: 'Offset', type: 'vec2', default: [0, 0], precision: 0 }],
+    exec: (_c, p) => {
       const list = seqList();
       const copies = duplicate(list, list.filter((s) => s.select));
-      S.resolveOverlap(list, copies, toolSettings().overlap_mode);
+      const v = (p.value as number[]) ?? [0, 0];
+      if (v[0] || v[1]) slideBy(Math.round(v[0]), Math.round(v[1]));
+      else S.resolveOverlap(list, copies, toolSettings().overlap_mode);
       done();
+    },
+  },
+  {
+    idname: 'sequencer.preview_duplicate_move',
+    label: 'Duplicate Strips',
+    description: 'Duplicate the selected strips and move their images in the preview',
+    poll: () => anySelected() && overPreview(),
+    invoke: () => {
+      const list = seqList();
+      duplicate(list, list.filter((s) => s.select));
+      S.resolveOverlap(list, list.filter((s) => s.select), toolSettings().overlap_mode);
+      afterEdit();
+      return startPreviewTransform(hoverSeq()!, 'TRANSLATE', app.pointer.x, app.pointer.y) ? 'RUNNING_MODAL' : 'FINISHED';
     },
   },
   {
@@ -669,26 +704,44 @@ const ops: Operator[] = [
     idname: 'transform.seq_slide',
     label: 'Sequence Slide',
     description: 'Slide a sequence strip in time',
+    props: [{ id: 'value', label: 'Offset', type: 'vec2', default: [0, 0], precision: 0 }],
     poll: () => anySelected() && !!hoverSeq() && !overPreview(),
     invoke: () => {
       const ed = hoverSeq()!;
       return startSlide(ed, app.pointer.x, app.pointer.y) ? 'RUNNING_MODAL' : 'CANCELLED';
+    },
+    exec: (_c, p) => {
+      const v = p.value as number[];
+      return slideBy(Math.round(v[0] ?? 0), Math.round(v[1] ?? 0)) ? 'FINISHED' : 'CANCELLED';
     },
   },
   {
     idname: 'sequencer.slip',
     label: 'Slip Strips',
     description: 'Slip the contents of selected strips',
+    props: [
+      { id: 'offset', label: 'Offset', type: 'int', default: 0 },
+      { id: 'clamp', label: 'Clamp', type: 'bool', default: true },
+    ],
     poll: () => anySelected() && !!hoverSeq() && !overPreview(),
     invoke: () => (startSlip(hoverSeq()!, app.pointer.x) ? 'RUNNING_MODAL' : 'CANCELLED'),
+    exec: (_c, p) => (slipBy(p.offset as number, p.clamp !== false) ? 'FINISHED' : 'CANCELLED'),
   },
   {
     idname: 'sequencer.strip_transform',
     label: 'Transform Strip Image',
     description: 'Move, rotate or scale the selected strips in the preview',
-    props: [{ id: 'mode', label: 'Mode', type: 'enum', default: 'TRANSLATE', items: [['TRANSLATE', 'Move'], ['ROTATE', 'Rotate'], ['RESIZE', 'Scale']] }],
+    props: [
+      { id: 'mode', label: 'Mode', type: 'enum', default: 'TRANSLATE', items: [['TRANSLATE', 'Move'], ['ROTATE', 'Rotate'], ['RESIZE', 'Scale'], ['ORIGIN', 'Move Origin']], hidden: true },
+      { id: 'value', label: 'Value', type: 'vec3', default: [0, 0, 0] },
+    ],
     poll: () => anySelected() && overPreview(),
     invoke: (_c, p) => (startPreviewTransform(hoverSeq()!, p.mode as PreviewMode, app.pointer.x, app.pointer.y) ? 'RUNNING_MODAL' : 'CANCELLED'),
+    exec: (_c, p) => {
+      const v = (p.value as number[]) ?? [0, 0, 0];
+      const value = p.mode === 'RESIZE' ? [v[0] || 1, v[1] || 1] : p.mode === 'ROTATE' ? [v[0]] : [v[0], v[1]];
+      return transformPreview(p.mode as PreviewMode, value) ? 'FINISHED' : 'CANCELLED';
+    },
   },
   {
     idname: 'sequencer.strip_transform_clear',
@@ -740,7 +793,7 @@ const ops: Operator[] = [
         label: 'Type',
         type: 'enum',
         default: 'CROSS',
-        items: (['CROSS', 'ADD', 'SUBTRACT', 'ALPHA_OVER', 'ALPHA_UNDER', 'GAMMA_CROSS', 'MULTIPLY', 'WIPE', 'GLOW', 'TRANSFORM', 'COLOR', 'SPEED', 'ADJUSTMENT', 'GAUSSIAN_BLUR', 'TEXT', 'COLORMIX'] as StripType[]).map((t) => [t, S.STRIP_LABELS[t]] as [string, string]),
+        items: (['CROSS', 'ADD', 'SUBTRACT', 'ALPHA_OVER', 'ALPHA_UNDER', 'GAMMA_CROSS', 'MULTIPLY', 'WIPE', 'GLOW', 'TRANSFORM', 'COLOR', 'SPEED', 'ADJUSTMENT', 'GAUSSIAN_BLUR', 'TEXT', 'COLORMIX', 'MULTICAM'] as StripType[]).map((t) => [t, S.STRIP_LABELS[t]] as [string, string]),
       },
       { id: 'frame_start', label: 'Start Frame', type: 'int', default: 0 },
       { id: 'length', label: 'Length', type: 'int', default: DEFAULT_LENGTH, min: 1 },
@@ -768,13 +821,14 @@ const ops: Operator[] = [
       { id: 'frame_start', label: 'Start Frame', type: 'int', default: 0 },
       { id: 'channel', label: 'Channel', type: 'int', default: 1, min: 1, max: 128 },
       { id: 'camera', label: 'Camera', type: 'string', default: '' },
+      { id: 'scene', label: 'Scene', type: 'string', default: '', hidden: true },
     ],
     invoke: (_c, p) => {
       const [frame, channel] = insertPoint();
       return app.run('sequencer.scene_strip_add', { ...p, frame_start: frame, channel }, { invoke: false });
     },
     exec: (_c, p) => {
-      addScene(p.frame_start as number, p.channel as number, (p.camera as string) || null);
+      addScene(p.frame_start as number, p.channel as number, (p.camera as string) || null, (p.scene as string) || null);
       done();
     },
   },
@@ -796,14 +850,32 @@ const ops: Operator[] = [
     idname: 'sequencer.strip_modifier_add',
     label: 'Add Strip Modifier',
     description: 'Add a modifier to the strip',
-    props: [{ id: 'type', label: 'Type', type: 'enum', default: 'COLOR_BALANCE', items: [['COLOR_BALANCE', 'Color Balance'], ['BRIGHT_CONTRAST', 'Brightness/Contrast']] }],
-    poll: () => !!activeStrip() && activeStrip()!.type !== 'SOUND',
+    props: [{ id: 'type', label: 'Type', type: 'enum', default: 'COLOR_BALANCE', items: MODIFIER_KINDS.map((k) => [k.type, k.label] as [string, string]) }],
+    poll: () => !!activeStrip(),
     exec: (_c, p) => {
       const s = activeStrip()!;
-      const base = p.type === 'COLOR_BALANCE' ? 'Color Balance' : 'Brightness/Contrast';
+      // sound strips take sound modifiers, the others image modifiers
+      if ((s.type === 'SOUND') !== isSoundModifier(p.type as ModifierType)) {
+        app.report('ERROR', s.type === 'SOUND' ? 'Sound strips only take sound modifiers' : 'Sound modifiers only work on sound strips');
+        return 'CANCELLED';
+      }
+      const base = modifierKind(p.type as ModifierType)?.label ?? 'Modifier';
       let name = base;
       for (let i = 1; s.modifiers.some((m) => m.name === name); i++) name = `${base}.${String(i).padStart(3, '0')}`;
       s.modifiers.push(S.newModifier(p.type as ModifierType, name));
+      s.active_modifier = name;
+    },
+  },
+  {
+    idname: 'sequencer.strip_modifier_set_active',
+    label: 'Set Active Modifier',
+    description: 'Make a modifier of the active strip the active one',
+    props: [{ id: 'modifier', label: 'Modifier', type: 'string', default: '' }],
+    poll: () => !!activeStrip()?.modifiers.length,
+    exec: (_c, p) => {
+      const s = activeStrip()!;
+      if (!s.modifiers.some((m) => m.name === p.modifier)) return 'CANCELLED';
+      s.active_modifier = p.modifier as string;
     },
   },
   {
@@ -838,15 +910,22 @@ const ops: Operator[] = [
   },
 ];
 
-/** Time Extend uses the reference's generic transform operator name. */
+/** Time Extend uses the generic transform operator name. */
 if (!operators.has('transform.transform'))
   ops.push({
     idname: 'transform.transform',
     label: 'Transform',
     description: 'Transform selected strips (Time Extend)',
-    props: [{ id: 'mode', label: 'Mode', type: 'enum', default: 'TIME_EXTEND', items: [['TIME_EXTEND', 'Time Extend']] }],
+    props: [
+      { id: 'mode', label: 'Mode', type: 'enum', default: 'TIME_EXTEND', items: [['TIME_EXTEND', 'Time Extend']] },
+      { id: 'value', label: 'Values', type: 'vec3', default: [0, 0, 0] },
+    ],
     poll: () => anySelected() && !!hoverSeq() && !overPreview(),
     invoke: () => (startExtend(hoverSeq()!, app.pointer.x) ? 'RUNNING_MODAL' : 'CANCELLED'),
+    exec: (c, p) => {
+      const frame = typeof p.frame === 'number' ? p.frame : c.doc.scene.frame_current;
+      return extendBy(Math.round((p.value as number[])[0] ?? 0), frame, p.side !== 'LEFT') ? 'FINISHED' : 'CANCELLED';
+    },
   });
 
 registerOperators(ops);

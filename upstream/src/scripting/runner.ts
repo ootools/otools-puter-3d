@@ -2,8 +2,10 @@
 // ("Run Script" = one undo step), JavaScript execution with line-numbered errors.
 import { app } from '../app/app';
 import { scriptState, Struct, PropCollection, BoundArray } from './rna';
-import { bpy } from './api';
+import { bpy, bpy_extras } from './api';
+import './api_ext';
 import { mathutils, VecBase, Matrix } from './mathutils';
+import { scriptModules } from './jsmodules';
 
 // ---------------------------------------------------------------------------
 // output (scrollback of the Python Console; print() from scripts lands here too)
@@ -14,12 +16,16 @@ export interface ConsoleLine {
   type: LineType;
 }
 
+/** Console limits (Preferences ▸ System ▸ Memory & Limits). */
+export const consoleSettings = { scrollback: 5000 };
+
 export const output = {
   lines: [] as ConsoleLine[],
   listeners: new Set<() => void>(),
   push(text: string, type: LineType = 'OUTPUT') {
     for (const l of String(text).replace(/\n$/, '').split('\n')) this.lines.push({ text: l, type });
-    if (this.lines.length > 5000) this.lines.splice(0, this.lines.length - 5000);
+    const max = Math.max(32, consoleSettings.scrollback);
+    if (this.lines.length > max) this.lines.splice(0, this.lines.length - max);
     this.notify();
   },
   clear() {
@@ -132,7 +138,7 @@ const scriptConsole = {
 
 /** Globals available to JavaScript scripts and the JS console. */
 export function jsGlobals(): Record<string, unknown> {
-  return { bpy, mathutils, ...mathutils, C: bpy.context, D: bpy.data, print: printFn, console: scriptConsole };
+  return { bpy, bpy_extras, mathutils, ...mathutils, ...scriptModules, C: bpy.context, D: bpy.data, print: printFn, console: scriptConsole };
 }
 
 let lineOffset: number | null = null;

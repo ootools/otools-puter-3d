@@ -18,6 +18,7 @@ import { installTooltips, pointerDownOutsideMenus } from './ui/menu';
 import { View3D, setLastView3D } from './editors/view3d/view3d';
 import { registerEditor } from './ui/screen';
 import './editors/outliner';
+import './ui/buttons';
 import './editors/properties/properties';
 import './editors/properties/tabs';
 import './editors/properties/stack';
@@ -43,8 +44,9 @@ import { loadRecovery, decodeDocument } from './io/native';
 import { setMode } from './ops/object';
 import { loadFonts } from './io/fonts';
 import { registerModules } from './modules';
+import { restoreAssistant } from './assistant';
 
-// The reference application is Z-up; three.js defaults to Y-up for helpers.
+// The app is Z-up; three.js defaults to Y-up for helpers.
 Object3D.DEFAULT_UP.set(0, 0, 1);
 
 setApp(new App(startupDocument()));
@@ -79,6 +81,7 @@ onImageReady(() => {
 
 const shell = new Shell(root);
 setShell(shell);
+restoreAssistant();
 installKeyboard();
 installTooltips(document.body);
 addEventListener('pointerdown', (e) => pointerDownOutsideMenus(e.target), true);
@@ -109,7 +112,7 @@ void loadFonts(() => {
 // Recover the last autosaved session (if any) without blocking startup. If the user already
 // changed something before the stored session finished loading, their work wins.
 const startRevision = app.revision;
-// `?factory-startup` skips session recovery (like the reference application's --factory-startup flag)
+// `?factory-startup` skips session recovery
 const factoryStartup = new URLSearchParams(location.search).has('factory-startup');
 const recovered = (factoryStartup ? Promise.resolve(null) : loadRecovery())
   .then((rec) => {

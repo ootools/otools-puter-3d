@@ -3,6 +3,7 @@ import type { DocumentData, ObjectData, Mode, ID } from '../data/types';
 import { startupDocument } from '../data/defaults';
 import { Depsgraph } from '../eval/depsgraph';
 import { UndoStack } from './undo';
+import { prefs } from './prefs';
 import { modeHandlers } from '../ops/modes';
 
 export type OpResult = 'FINISHED' | 'CANCELLED' | 'RUNNING_MODAL' | 'PASS_THROUGH' | void;
@@ -92,6 +93,9 @@ export interface Report {
 }
 
 export const operators = new Map<string, Operator>();
+
+/** Run before each undo step is stored (e.g. to write editor-side copies back into the document). */
+export const undoPushHooks: (() => void)[] = [];
 export function registerOperator(op: Operator) {
   operators.set(op.idname, op);
 }
@@ -109,6 +113,16 @@ function notifyOperator(idname: string, props: Record<string, unknown>) {
       // listeners must never break operator execution
     }
   }
+}
+
+/** Turn exceptions into report messages; modules can add friendlier wording for their errors. */
+export const errorDescribers: ((e: unknown) => string | null)[] = [];
+function describeError(e: unknown): string {
+  for (const f of errorDescribers) {
+    const m = f(e);
+    if (m) return m;
+  }
+  return e instanceof Error ? e.message : String(e);
 }
 
 export function defaultProps(op: Operator): Record<string, unknown> {
@@ -167,6 +181,11 @@ export class App {
   }
 
   /** Synchronously evaluate and notify (used by tests and modal operators). */
+  /** Apply scheduled changes right away (so a shortcut acts on the current frame's state). */
+  flushPending() {
+    if (this.pending.size) this.flush();
+  }
+
   flush() {
     this.scheduled = false;
     const kinds = new Set(this.pending);
@@ -197,7 +216,15 @@ export class App {
     return this.doc.scene;
   }
 
+  /**
+   * Object that stands in for the active object while a pinned Properties editor draws or handles
+   * an event (set and cleared by that editor), so its buttons and operators act on the pinned object.
+   */
+  contextObject: ObjectData | null = null;
+
   get activeObject(): ObjectData | null {
+    const c = this.contextObject;
+    if (c && this.doc.objects[c.id] === c) return c;
     const id = this.doc.scene.active_object;
     return id ? this.doc.objects[id] ?? null : null;
   }
@@ -268,7 +295,7 @@ export class App {
     try {
       result = opts.invoke !== false && op.invoke ? op.invoke(ctx, full) : op.exec ? op.exec(ctx, full) : 'CANCELLED';
     } catch (e) {
-      this.report('ERROR', `${op.label}: ${e instanceof Error ? e.message : String(e)}`);
+      this.report('ERROR', `${op.label}: ${describeError(e)}`);
       // restore last good state
       const cur = this.undo.current();
       if (cur && op.undo !== false) this.setDocument(cur, false);
@@ -300,7 +327,7 @@ export class App {
       this.undo.replaceTop(this.doc, op.label);
       this.lastOp = { ...last, props: merged };
     } catch (e) {
-      this.report('ERROR', e instanceof Error ? e.message : String(e));
+      this.report('ERROR', describeError(e));
       const cur = this.undo.current();
       if (cur) this.setDocument(cur, false);
     }
@@ -327,6 +354,7 @@ export class App {
   }
 
   pushUndo(label: string) {
+    for (const f of undoPushHooks) f();
     this.undo.push(this.doc, label);
     this.dirty = true;
   }
@@ -340,6 +368,16 @@ export class App {
       const ob = this.activeObject;
       if (ob) modeHandlers[d.mode]?.enter?.(ob);
     }
+  }
+
+  /** Go back to an undo mark (`undo.mark()`), dropping the steps after it, e.g. a failed script's partial changes. */
+  revertUndo(mark: object | null): boolean {
+    if (this.modal) return false;
+    const d = this.undo.revertTo(mark);
+    if (!d) return false;
+    this.restoreUndo(d);
+    this.lastOp = null;
+    return true;
   }
 
   undoStep() {
@@ -377,6 +415,8 @@ export class App {
 
   setFrame(frame: number, subframe = 0) {
     const s = this.doc.scene;
+    // Preferences ▸ Animation ▸ Allow Negative Frames
+    if (!prefs.use_negative_frames && frame < 0) (frame = 0), (subframe = 0);
     s.frame_current = Math.round(frame);
     s.frame_subframe = subframe;
     this.changed('frame');

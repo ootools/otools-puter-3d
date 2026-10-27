@@ -6,12 +6,14 @@ import { Matrix4, Quaternion, Vector3 } from 'three';
 import type RAPIERNS from '@dimforge/rapier3d-compat';
 import type { DocumentData, ObjectData } from '../data/types';
 import type { Depsgraph } from '../eval/depsgraph';
+import type { EvalMesh } from '../eval/types';
 import { meshSignature, baseEvalMesh } from '../eval/depsgraph';
 import { frameOf, getCache, motionKey, objectWorldAt, outOfTime, strHash, type FrameCache } from './common';
 import { collectEffectors, effectorForce, fieldsKey } from './fields';
 import { triangulate } from './colliders';
 import type { ObjectPhysics, RigidBodyConstraintData, RigidBodyWorldX, RigidBodyX } from './types';
 import { fps } from './meshsim';
+import { createJoint } from './rbjoints';
 
 type Rapier = typeof RAPIERNS;
 let RAPIER: Rapier | null = null;
@@ -41,11 +43,37 @@ interface Body {
   kinematic: boolean;
   scale: Vector3;
   mass: number;
+  collider: RAPIERNS.Collider;
+  /** the collision shape follows the deforming mesh */
+  deform: boolean;
+  /** positions the current shape was made from */
+  shapeFrom: Float32Array | null;
+  /** deactivation: thresholds and frames spent below them */
+  sleepLin: number;
+  sleepAng: number;
+  slow: number;
 }
 
 interface Live {
   world: RAPIERNS.World;
   bodies: Body[];
+  /** contact filter for collision collections (null when every body uses the first one only) */
+  hooks: RAPIERNS.PhysicsHooks | null;
+  /** the engine only runs contact filters when stepping with an event queue */
+  events: RAPIERNS.EventQueue | null;
+  /** breakable joints and the impulse that breaks them */
+  breakable: { joint: RAPIERNS.ImpulseJoint; b1: Body; b2: Body; threshold: number; broken: boolean }[];
+  /** collision collection mask per collider handle */
+  masks: Map<number, number>;
+}
+
+/** Bit mask of a rigid body's collision collections (first collection when unset). */
+export function collectionMask(rb: RigidBodyX): number {
+  const c = rb.collision_collections;
+  if (!c || !c.length) return 1;
+  let m = 0;
+  for (let i = 0; i < 20; i++) if (c[i]) m |= 1 << i;
+  return m;
 }
 
 /** Frame state: per body tx ty tz qx qy qz qw (order = cache.order). */
@@ -53,20 +81,38 @@ interface RBCache extends FrameCache<Float32Array, Live> {
   order?: string[];
 }
 
+/** Objects in a collection (and its children). */
+function inCollection(doc: DocumentData, cid: string | null | undefined): Set<string> | null {
+  const c = cid ? doc.collections[cid] : undefined;
+  if (!c) return null;
+  const out = new Set<string>();
+  const visit = (id: string, depth: number) => {
+    const cc = doc.collections[id];
+    if (!cc || depth > 32) return;
+    for (const o of cc.objects) out.add(o);
+    for (const ch of cc.children) visit(ch, depth + 1);
+  };
+  visit(c.id, 0);
+  return out;
+}
+
 export function rigidBodyObjects(doc: DocumentData): ObjectData[] {
   const out: ObjectData[] = [];
+  // the world's collection limits which rigid bodies take part (all of them without one)
+  const only = inCollection(doc, doc.scene.rigidbody_world?.collection);
   for (const id of doc.object_order) {
     const ob = doc.objects[id];
-    if (ob?.rigid_body && ob.type === 'MESH' && ob.data && doc.meshes[ob.data]) out.push(ob);
+    if (ob?.rigid_body && ob.type === 'MESH' && ob.data && doc.meshes[ob.data] && (!only || only.has(ob.id))) out.push(ob);
   }
   return out;
 }
 
 export function constraintObjects(doc: DocumentData): ObjectPhysics[] {
   const out: ObjectPhysics[] = [];
+  const only = inCollection(doc, (doc.scene.rigidbody_world as RigidBodyWorldX | null)?.constraints);
   for (const id of doc.object_order) {
     const ob = doc.objects[id] as ObjectPhysics | undefined;
-    if (ob?.rigid_body_constraint?.enabled) out.push(ob);
+    if (ob?.rigid_body_constraint?.enabled && (!only || only.has(ob.id))) out.push(ob);
   }
   return out;
 }
@@ -90,9 +136,21 @@ export function rigidBodyHash(doc: DocumentData): string {
 
 const damping = (d: number) => -Math.log(1 - Math.min(0.999, Math.max(0, d)));
 
-function shapeDesc(R: Rapier, ob: ObjectData, rb: RigidBodyX, doc: DocumentData, scale: Vector3, dynamic: boolean): RAPIERNS.ColliderDesc {
+/** The mesh a body's collision shape is made from (its Source: base mesh, deformed or final). */
+function sourceMesh(ob: ObjectData, rb: RigidBodyX, doc: DocumentData, graph: Depsgraph | null): EvalMesh {
   const me = doc.meshes[ob.data!];
-  const em = baseEvalMesh(me);
+  const base = baseEvalMesh(me);
+  const src = rb.mesh_source ?? 'DEFORM';
+  if (src === 'BASE' || !graph) return base;
+  const ev = graph.get(ob.id)?.mesh;
+  if (!ev || !ev.positions.length) return base;
+  // Deform keeps the base topology (modifiers that add or remove geometry are ignored)
+  if (src === 'DEFORM' && ev.positions.length !== base.positions.length) return base;
+  return ev;
+}
+
+function shapeDesc(R: Rapier, ob: ObjectData, rb: RigidBodyX, doc: DocumentData, scale: Vector3, dynamic: boolean, graph: Depsgraph | null = null, mesh?: EvalMesh): RAPIERNS.ColliderDesc {
+  const em = mesh ?? sourceMesh(ob, rb, doc, graph);
   const P = em.positions;
   const n = P.length / 3;
   const sp = new Float32Array(P.length);
@@ -156,7 +214,17 @@ function decompose(m: Matrix4) {
   return { p, q, s };
 }
 
-function buildWorld(R: Rapier, doc: DocumentData): Live {
+/** Friction, bounciness, margin, mass and collision collections of a collider. */
+function colliderProps(R: Rapier, cd: RAPIERNS.ColliderDesc, rb: RigidBodyX, dynamic: boolean) {
+  cd.setFriction(Math.max(0, rb.friction)).setRestitution(Math.max(0, rb.restitution));
+  cd.setFrictionCombineRule(R.CoefficientCombineRule.Multiply).setRestitutionCombineRule(R.CoefficientCombineRule.Multiply);
+  if (rb.use_margin) cd.setContactSkin(Math.max(0, rb.collision_margin));
+  if (dynamic) cd.setMass(Math.max(1e-3, rb.mass));
+  if (collectionMask(rb) !== 1) cd.setActiveHooks(R.ActiveHooks.FILTER_CONTACT_PAIRS);
+  return cd;
+}
+
+function buildWorld(R: Rapier, doc: DocumentData, graph: Depsgraph | null = null): Live {
   const w = doc.scene.rigidbody_world as RigidBodyWorldX;
   const gw = w.effector_weights_gravity ?? 1;
   const g = doc.scene.use_gravity ? doc.scene.gravity : [0, 0, 0];
@@ -164,8 +232,12 @@ function buildWorld(R: Rapier, doc: DocumentData): Live {
   const substeps = Math.max(1, Math.round(w.substeps_per_frame));
   world.timestep = Math.max(1e-6, (w.time_scale || 0) / fps(doc) / substeps);
   world.integrationParameters.numSolverIterations = Math.max(1, Math.round(w.solver_iterations));
+  // split impulse: overlaps are pushed apart gently, without the push turning into a bounce
+  if (w.use_split_impulse) world.integrationParameters.contact_natural_frequency = 8;
   const bodies: Body[] = [];
   const byId = new Map<string, Body>();
+  const masks = new Map<number, number>();
+  const breakable: Live['breakable'] = [];
   for (const ob of rigidBodyObjects(doc)) {
     const rb = ob.rigid_body as RigidBodyX;
     const { p, q, s } = decompose(objectWorldAt(doc, ob, w.frame_start));
@@ -174,14 +246,27 @@ function buildWorld(R: Rapier, doc: DocumentData): Live {
     const desc = dynamic ? R.RigidBodyDesc.dynamic() : kinematic ? R.RigidBodyDesc.kinematicPositionBased() : R.RigidBodyDesc.fixed();
     desc.setTranslation(p.x, p.y, p.z).setRotation({ x: q.x, y: q.y, z: q.z, w: q.w });
     desc.setLinearDamping(damping(rb.linear_damping)).setAngularDamping(damping(rb.angular_damping)).setCanSleep(!!rb.use_deactivation);
+    if (dynamic && rb.use_deactivation && rb.use_start_deactivated) desc.setSleeping(true);
     const body = world.createRigidBody(desc);
-    const cd = shapeDesc(R, ob, rb, doc, new Vector3(s.x, s.y, s.z), dynamic);
-    cd.setFriction(Math.max(0, rb.friction)).setRestitution(Math.max(0, rb.restitution));
-    cd.setFrictionCombineRule(R.CoefficientCombineRule.Multiply).setRestitutionCombineRule(R.CoefficientCombineRule.Multiply);
-    if (rb.use_margin) cd.setContactSkin(Math.max(0, rb.collision_margin));
-    if (dynamic) cd.setMass(Math.max(1e-3, rb.mass));
-    world.createCollider(cd, body);
-    const b: Body = { id: ob.id, body, dynamic, kinematic, scale: s.clone(), mass: rb.mass };
+    const mesh = sourceMesh(ob, rb, doc, graph);
+    const cd = colliderProps(R, shapeDesc(R, ob, rb, doc, new Vector3(s.x, s.y, s.z), dynamic, graph, mesh), rb, dynamic);
+    const mask = collectionMask(rb);
+    const collider = world.createCollider(cd, body);
+    masks.set(collider.handle, mask);
+    const b: Body = {
+      id: ob.id,
+      body,
+      dynamic,
+      kinematic,
+      scale: s.clone(),
+      mass: rb.mass,
+      collider,
+      deform: !!rb.use_deform && (rb.mesh_source ?? 'DEFORM') !== 'BASE',
+      shapeFrom: mesh.positions,
+      sleepLin: rb.deactivate_linear_velocity ?? 0.4,
+      sleepAng: rb.deactivate_angular_velocity ?? 0.5,
+      slow: 0,
+    };
     bodies.push(b);
     byId.set(ob.id, b);
   }
@@ -192,26 +277,23 @@ function buildWorld(R: Rapier, doc: DocumentData): Live {
       b2 = c.object2 ? byId.get(c.object2) : undefined;
     if (!b1 || !b2 || b1 === b2) continue;
     const cm = decompose(objectWorldAt(doc, ob, w.frame_start));
-    const local = (b: Body) => {
-      const t = b.body.translation(),
-        r = b.body.rotation();
-      const qi = new Quaternion(r.x, r.y, r.z, r.w).invert();
-      const a = cm.p.clone().sub(new Vector3(t.x, t.y, t.z)).applyQuaternion(qi);
-      const frame = qi.clone().multiply(cm.q);
-      const axis = new Vector3(0, 0, 1).applyQuaternion(frame);
-      return { a: { x: a.x, y: a.y, z: a.z }, frame: { x: frame.x, y: frame.y, z: frame.z, w: frame.w }, axis: { x: axis.x, y: axis.y, z: axis.z } };
-    };
-    const l1 = local(b1),
-      l2 = local(b2);
-    let jd: RAPIERNS.JointData;
-    if (c.type === 'FIXED') jd = R.JointData.fixed(l1.a, l1.frame, l2.a, l2.frame);
-    else if (c.type === 'POINT') jd = R.JointData.spherical(l1.a, l2.a);
-    else if (c.type === 'HINGE') jd = R.JointData.revoluteWithAxes(l1.a, l2.a, l1.axis, l2.axis);
-    else jd = R.JointData.prismatic(l1.a, l2.a, l1.axis);
-    const joint = world.createImpulseJoint(jd, b1.body, b2.body, true);
+    const joint = createJoint(R, world, c, b1, b2, cm.p, cm.q, world.timestep);
     joint.setContactsEnabled(!c.disable_collisions);
+    // a constraint can ask for more solver iterations than the world uses
+    if (c.use_override_solver_iterations) {
+      const extra = Math.max(0, Math.round(Number(c.solver_iterations ?? 10)) - world.integrationParameters.numSolverIterations);
+      for (const b of [b1, b2]) if (b.dynamic) b.body.setAdditionalSolverIterations(Math.max(b.body.additionalSolverIterations(), extra));
+    }
+    if (c.use_breaking) breakable.push({ joint, b1, b2, threshold: Math.max(0, Number(c.breaking_threshold ?? 10)), broken: false });
   }
-  return { world, bodies };
+  const filtered = [...masks.values()].some((m) => m !== 1);
+  const hooks: RAPIERNS.PhysicsHooks | null = filtered
+    ? {
+        filterContactPair: (c1, c2) => ((masks.get(c1) ?? 1) & (masks.get(c2) ?? 1) ? R.SolverFlags.COMPUTE_IMPULSE : null),
+        filterIntersectionPair: () => true,
+      }
+    : null;
+  return { world, bodies, hooks, events: hooks ? new R.EventQueue(false) : null, breakable, masks };
 }
 
 function snapshot(live: Live): Float32Array {
@@ -234,6 +316,20 @@ function stepWorld(doc: DocumentData, live: Live, frame: number, graph: Depsgrap
       const ob = doc.objects[b.id];
       return { b, a: decompose(objectWorldAt(doc, ob, frame - 1)), c: decompose(objectWorldAt(doc, ob, frame)) };
     });
+  // deforming collision shapes follow their (evaluated) mesh
+  if (graph && RAPIER)
+    for (const b of live.bodies) {
+      if (!b.deform) continue;
+      const ob = doc.objects[b.id];
+      const rb = ob?.rigid_body as RigidBodyX | undefined;
+      const mesh = ob && rb ? sourceMesh(ob, rb, doc, graph) : null;
+      if (!ob || !rb || !mesh || mesh.positions === b.shapeFrom) continue;
+      live.world.removeCollider(b.collider, false);
+      const cd = colliderProps(RAPIER, shapeDesc(RAPIER, ob, rb, doc, b.scale, b.dynamic, graph, mesh), rb, b.dynamic);
+      b.collider = live.world.createCollider(cd, b.body);
+      live.masks.set(b.collider.handle, collectionMask(rb));
+      b.shapeFrom = mesh.positions;
+    }
   const effs = collectEffectors({ doc, graph }, frame - 1);
   const dyn = effs.length ? live.bodies.filter((b) => b.dynamic) : [];
   const f = [0, 0, 0];
@@ -251,11 +347,62 @@ function stepWorld(doc: DocumentData, live: Live, frame: number, graph: Depsgrap
       const p = b.body.translation(),
         v = b.body.linvel();
       f[0] = f[1] = f[2] = 0;
-      effectorForce(effs, p.x, p.y, p.z, v.x, v.y, v.z, frame - 1 + t, f);
+      effectorForce(effs, p.x, p.y, p.z, v.x, v.y, v.z, frame - 1 + t, f, 1, null, (w as { effector_weights_types?: Record<string, number> }).effector_weights_types ?? null);
       b.body.resetForces(false);
       if (f[0] || f[1] || f[2]) b.body.addForce({ x: f[0], y: f[1], z: f[2] }, true);
     }
-    live.world.step();
+    // velocities before the step: the change beyond gravity is the impulse the solver applied
+    const watch = live.breakable.length ? breakWatch(live, doc) : null;
+    live.world.step(live.events ?? undefined, live.hooks ?? undefined);
+    if (watch) breakJoints(live, watch);
+  }
+  // deactivation: bodies slower than their thresholds for a while go to sleep
+  for (const b of live.bodies) {
+    if (!b.dynamic || !b.body.isEnabled() || b.body.isSleeping()) continue;
+    const ob = doc.objects[b.id];
+    if (!(ob?.rigid_body as RigidBodyX | undefined)?.use_deactivation) continue;
+    const v = b.body.linvel(),
+      a = b.body.angvel();
+    if (Math.hypot(v.x, v.y, v.z) < b.sleepLin && Math.hypot(a.x, a.y, a.z) < b.sleepAng) {
+      if (++b.slow >= 5) b.body.sleep();
+    } else b.slow = 0;
+  }
+}
+
+interface BreakWatch {
+  v: Map<Body, { x: number; y: number; z: number }>;
+  g: [number, number, number];
+  dt: number;
+}
+
+function breakWatch(live: Live, doc: DocumentData): BreakWatch {
+  const w = doc.scene.rigidbody_world as RigidBodyWorldX;
+  const gw = w.effector_weights_gravity ?? 1;
+  const g = doc.scene.use_gravity ? doc.scene.gravity : [0, 0, 0];
+  const v = new Map<Body, { x: number; y: number; z: number }>();
+  for (const b of live.breakable)
+    if (!b.broken) for (const body of [b.b1, b.b2]) if (body.dynamic && !v.has(body)) v.set(body, { ...body.body.linvel() });
+  return { v, g: [g[0] * gw, g[1] * gw, g[2] * gw], dt: live.world.timestep };
+}
+
+/** Remove joints whose bodies received more than their breaking impulse in the last step. */
+function breakJoints(live: Live, w: BreakWatch) {
+  for (const b of live.breakable) {
+    if (b.broken) continue;
+    let impulse = 0;
+    for (const body of [b.b1, b.b2]) {
+      const before = w.v.get(body);
+      if (!before) continue;
+      const after = body.body.linvel();
+      const dx = after.x - before.x - w.g[0] * w.dt,
+        dy = after.y - before.y - w.g[1] * w.dt,
+        dz = after.z - before.z - w.g[2] * w.dt;
+      impulse = Math.max(impulse, body.mass * Math.hypot(dx, dy, dz));
+    }
+    if (impulse > b.threshold) {
+      live.world.removeImpulseJoint(b.joint, true);
+      b.broken = true;
+    }
   }
 }
 
@@ -270,6 +417,7 @@ export function rigidBodyCache(): RBCache {
 export function freeRigidBodyLive() {
   const c = rigidBodyCache();
   c.live?.world.free();
+  c.live?.events?.free();
   c.live = null;
 }
 
@@ -286,7 +434,7 @@ export function simulateRigidBodies(doc: DocumentData, ft: number, graph: Depsgr
   if (!cache.live || cache.last < w.frame_start) {
     freeRigidBodyLive();
     cache.frames.clear();
-    cache.live = buildWorld(RAPIER, doc);
+    cache.live = buildWorld(RAPIER, doc, graph);
     cache.order = cache.live.bodies.map((b) => b.id);
     cache.frames.set(w.frame_start, snapshot(cache.live));
     cache.last = w.frame_start;

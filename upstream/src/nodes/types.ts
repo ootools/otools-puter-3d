@@ -4,7 +4,7 @@ import type { DocumentData, NodeData, NodeTreeData, SocketValue } from '../data/
 
 export type TreeType = NodeTreeData['type'];
 
-/** Socket data types (reference names, with FLOAT for 'VALUE'). */
+/** Socket data types (`bpy` names, with FLOAT for 'VALUE'). */
 export type SocketType =
   | 'FLOAT'
   | 'INT'
@@ -22,6 +22,8 @@ export type SocketType =
   | 'IMAGE'
   | 'MATERIAL'
   | 'TEXTURE'
+  | 'FONT'
+  | 'SOUND'
   | 'CLOSURE'
   | 'BUNDLE'
   | 'CUSTOM';
@@ -67,6 +69,8 @@ export interface SocketDef {
   items?: string[];
   /** VECTOR sockets: number of components shown (default 3) */
   dimensions?: number;
+  /** tooltip text (group interface sockets) */
+  description?: string;
 }
 
 export type NodePropType =
@@ -107,6 +111,8 @@ export interface NodePropDef {
   noLabel?: boolean;
   /** only drawn when the predicate holds */
   visible?: (node: NodeData) => boolean;
+  /** enum items that depend on the tree the node is in (defaults to `items`) */
+  itemsFor?: (tree?: NodeTreeData) => [string, string][] | undefined;
 }
 
 /** A collapsible panel of sockets/props inside a node (e.g. Principled BSDF ▸ Subsurface). */
@@ -117,6 +123,8 @@ export interface NodePanelDef {
   /** props drawn at the top of the panel */
   props?: string[];
   closed?: boolean;
+  /** boolean input shown as a checkbox in the panel header */
+  toggle?: string;
 }
 
 /** Context passed to dynamic socket resolvers (group nodes need the document). */
@@ -160,10 +168,14 @@ export interface NodeTypeDef {
   socketLabel?: (node: NodeData, socket: SocketDef, isOutput: boolean) => string | undefined;
   /** dynamic node label shown in the header (e.g. the Math operation) */
   dynamicLabel?: (node: NodeData) => string;
+  /** header color class that depends on the node's settings (e.g. Mix: color, vector or value) */
+  dynamicCategory?: (node: NodeData) => NodeClass;
   /** fully dynamic sockets (group nodes, group input/output) */
-  dynamicSockets?: (node: NodeData, ctx: SocketContext) => { inputs: SocketDef[]; outputs: SocketDef[] };
+  dynamicSockets?: (node: NodeData, ctx: SocketContext) => { inputs: SocketDef[]; outputs: SocketDef[]; panels?: NodePanelDef[] };
   /** initialize props of a newly created node */
   init?: (node: NodeData) => void;
+  /** after the node is added interactively: add companion nodes (zone outputs) and return them */
+  onAdd?: (tree: NodeTreeData, node: NodeData) => NodeData[];
   /** custom body UI (color ramps, curves, image selector) drawn after props */
   drawBody?: (ctx: NodeDrawContext) => Child;
   /** extra height for custom body UI in node units */
@@ -183,7 +195,7 @@ export interface NodeTypeDef {
 export type NodeClass =
   'input' | 'output' | 'shader' | 'texture' | 'color' | 'vector' | 'converter' | 'group' | 'layout' | 'geometry' | 'attribute' | 'distort' | 'matte' | 'filter' | 'script' | 'interface' | 'pattern';
 
-/** Raw interface data (generated from the reference app). */
+/** Raw interface data (generated node interface tables). */
 export type RawSocket = [
   name: string,
   identifier: string,
@@ -231,4 +243,6 @@ export interface MenuCategory {
   items: (MenuEntry | MenuCategory | 'SEPARATOR')[];
   /** only shown for these trees (e.g. object vs world shader) */
   poll?: (ctx: { treeType: TreeType; shaderType?: 'OBJECT' | 'WORLD' }) => boolean;
+  /** top-level categories: draw a separator above this one in the Add menu */
+  separatorBefore?: boolean;
 }
