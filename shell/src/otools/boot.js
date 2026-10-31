@@ -17,6 +17,7 @@ import { installI18n } from './i18n.js';
 import { installDomTranslation } from './dom-i18n.js';
 import { installThemeSync } from './theme-sync.js';
 import { APP } from './app.js';
+import { installOpenFileBridge } from './openfile.js';
 import { usingHost, libraryDir } from './local.js';
 import { installMcpBridge } from './mcp.js';
 import { d3McpTools } from './mcp-tools.js';
@@ -44,6 +45,10 @@ export function boot() {
   // 领域级工具（读/改当前场景对象）在 `otools/mcp-tools.js`；它们直接 import 的
   // `app`（app/app.ts 的活绑定）在 setApp 之后自动可用，无需入口传句柄。
   installMcpBridge({ extraTools: d3McpTools() });
+
+  // 宿主投递的「打开文件」：必须在界面入口订阅之前接住（宿主对 webview 的
+  // 敲门可能早于 overlay 入口执行），桥会把投递暂存到有人订阅为止。
+  installOpenFileBridge();
 
   if (typeof document !== 'undefined') {
     document.documentElement.dataset.otoolsPlugin = APP.id;

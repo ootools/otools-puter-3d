@@ -8,6 +8,8 @@
  * 其余启动流程一行未改。
  */
 import './otools/boot.js';
+import { onHostOpenFiles } from './otools/openfile.js';
+import { readFile, base64ToBlob } from './otools/host.js';
 // Application entry point.
 import '@fontsource/inter/400.css';
 import '@fontsource/inter/500.css';
@@ -48,7 +50,7 @@ import './ops/transform';
 import './ops/wm';
 import './ops/data';
 import './io/files';
-import { onFileStatus, scheduleAutosave, autosave, projectUiState } from './io/files';
+import { onFileStatus, scheduleAutosave, autosave, projectUiState, openFile } from './io/files';
 import { loadRecovery, decodeDocument } from './io/native';
 import { setMode } from './ops/object';
 import { loadFonts } from './io/fonts';
@@ -141,6 +143,28 @@ const recovered = (factoryStartup ? Promise.resolve(null) : loadRecovery())
   })
   .catch(() => {});
 (window as unknown as { appReady: Promise<void> }).appReady = recovered;
+
+/**
+ * 宿主的「打开方式」：系统里双击已绑定扩展名的场景/模型文件 → 用本插件打开。
+ *
+ * 排在上面的会话恢复之后：恢复出来的文档会替换整个场景，先打开的文件会被它盖掉。
+ * 投递本身由 `openfile.js` 的桥暂存，这里订阅时会把早到的文件补上。
+ */
+onHostOpenFiles((files) => {
+  void (async () => {
+    await recovered;
+    for (const file of files) {
+      try {
+        const record = await readFile(file.path);
+        if (!record) continue;
+        const blob = base64ToBlob(record.dataBase64, record.mime);
+        await openFile(new File([blob], file.name, { type: record.mime }), 'open');
+      } catch (error) {
+        app.report('ERROR', `Could not open ${file.name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  })();
+});
 
 addEventListener('visibilitychange', () => {
   if (document.hidden) void autosave();
